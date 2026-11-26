@@ -38,7 +38,11 @@ pub struct Delivered {
 }
 
 /// The record a staged listen is sent as.
-fn record(staged: &Staged, actor: Option<crate::Id>) -> Result<ListenRecord, Error> {
+fn record(
+    staged: &Staged,
+    actor: Option<crate::Id>,
+    handoff_mono_ms: Option<i64>,
+) -> Result<ListenRecord, Error> {
     let ended = staged
         .ended
         .as_ref()
@@ -73,6 +77,7 @@ fn record(staged: &Staged, actor: Option<crate::Id>) -> Result<ListenRecord, Err
         end_reason: ended.end_reason.as_str().to_owned(),
         ended_at_ms: ended.ended_at_ms,
         ended_mono_ms: ended.ended_mono_ms,
+        handoff_mono_ms,
         context_kind: started.context_kind.as_str().to_owned(),
         context_ref: started.context_ref,
         shuffle: started.shuffle,
@@ -149,7 +154,14 @@ pub fn deliver_listens_to(
                     Some(row) => server.session_public_id(row)?,
                     None => None,
                 };
-                record(&staged, actor)
+                let pause = if staged.ended.as_ref().is_some_and(|end| {
+                    end.end_reason == ritornel_domain::history::EndReason::Shutdown
+                }) {
+                    server.handoff_pause(delivery.listen_id)?
+                } else {
+                    None
+                };
+                record(&staged, actor, pause)
             })
             .and_then(|record| ingest(&record, stamps()));
         match sent {

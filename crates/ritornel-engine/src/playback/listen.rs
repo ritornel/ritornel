@@ -230,6 +230,8 @@ pub(crate) struct Recorder {
     fresh: bool,
     /// The listen closed last, and why.
     last: Option<(Id, EndReason)>,
+    /// A delayed release closes the listen at the pause that handed it off.
+    pub(super) handoff_end: Option<(Id, (i64, i64))>,
 }
 
 impl Recorder {
@@ -353,6 +355,11 @@ impl Recorder {
 
     fn close(&mut self, reason: EndReason, (wall, mono): (i64, i64)) {
         if let Some(mut listen) = self.open.take() {
+            let (wall, mono) = self
+                .handoff_end
+                .take()
+                .filter(|(id, _)| *id == listen.started.listen_id)
+                .map_or((wall, mono), |(_, time)| time);
             listen.ended = Some(Ended {
                 end_position_ms: listen.position_ms,
                 end_reason: reason,

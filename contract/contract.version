@@ -2,4 +2,4 @@
 # `mise run contract`. scripts/check-contract.sh refuses a wire that differs
 # from main's under main's version: raise CONTRACT_VERSION, once, for it.
 version 6
-digest 16569ddd6ec8d964
+digest 9685d07daeb79d8d

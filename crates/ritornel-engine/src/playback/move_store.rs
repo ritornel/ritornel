@@ -1,0 +1,185 @@
+//! Durable move intent and the source releases still owed by the hub.
+
+use crate::{
+    Command, Error, ServerStore,
+    jobs::{receipt, record_receipt},
+};
+use ritornel_contract::{Id, PlaybackMoveParams, Receipt, ReceiptStatus};
+use serde::{Deserialize, Serialize};
+
+/// A load that may have reached the destination and whose source still needs release.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+pub struct PendingMove {
+    pub movement: PlaybackMoveParams,
+    pub attempt: Id,
+}
+
+impl ServerStore {
+    /// Reserve the caller's key before touching either player.
+    pub fn begin_move(&self, command: Command) -> Result<Receipt, Error> {
+        self.transact(move |tx, now, _| {
+            if let Some(saved) = receipt(tx, &command)? {
+                return Ok(serde_json::from_str(&saved)?);
+            }
+            let result = Receipt {
+                command_id: command.id,
+                status: ReceiptStatus::Accepted,
+                revision: None,
+            };
+            record_receipt(
+                tx,
+                &command,
+                "playback.move",
+                &serde_json::to_string(&result)?,
+                now,
+            )?;
+            Ok(result)
+        })
+    }
+
+    /// Remember whom to check before sending load. A lost answer is resolved
+    /// by asking for its receipt, without replaying audio on either player.
+    pub fn expect_load(&self, pending: PendingMove) -> Result<(), Error> {
+        self.transact(move |tx, _, _| {
+            tx.execute(
+                "INSERT INTO server_setting(key,value_json) VALUES (?1,?2)",
+                (
+                    format!("move.{}", pending.movement.idempotency_key),
+                    serde_json::to_string(&pending)?,
+                ),
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn accepted_load(&self, movement: PlaybackMoveParams) -> Result<Receipt, Error> {
+        let result = Receipt {
+            command_id: movement.idempotency_key,
+            status: ReceiptStatus::Done,
+            revision: None,
+        };
+        self.transact(move |tx, _, _| {
+            tx.execute(
+                "UPDATE command_receipt SET result_json=?2
+                 WHERE command_id=?1 AND method='playback.move'",
+                (
+                    movement.idempotency_key.as_bytes(),
+                    serde_json::to_string(&result)?,
+                ),
+            )?;
+            Ok(result)
+        })
+    }
+
+    pub fn pending_moves(&self) -> Result<Vec<PendingMove>, Error> {
+        self.read(|db| {
+            let mut q = db.prepare(
+                "SELECT value_json FROM server_setting WHERE key GLOB 'move.*' ORDER BY key",
+            )?;
+            q.query_map([], |r| r.get::<_, String>(0))?
+                .map(|row| Ok(serde_json::from_str(&row?)?))
+                .collect()
+        })
+    }
+
+    pub fn forget_move(&self, pending: PendingMove) -> Result<(), Error> {
+        self.transact(move |tx, _, _| {
+            tx.execute(
+                "DELETE FROM server_setting WHERE key=?1 AND json_extract(value_json,'$.attempt')=?2",
+                (format!("move.{}", pending.movement.idempotency_key), pending.attempt.to_string()),
+            )?;
+            Ok(())
+        })
+    }
+
+    // A delayed release and a shutdown can race. Keep both instants so the
+    // local restart and the moved listen can each use the relevant one.
+    pub(super) fn save_handoff_pause(&self, id: Id, mono: i64) -> Result<(), Error> {
+        self.transact(move |tx, _, _| {
+            tx.execute(
+                "INSERT OR REPLACE INTO server_setting(key,value_json) VALUES(?1,?2)",
+                (format!("handoff.shutdown.{id}"), mono.to_string()),
+            )?;
+            Ok(())
+        })
+    }
+
+    pub(super) fn handoff_pause(&self, id: Id) -> Result<Option<i64>, Error> {
+        use rusqlite::OptionalExtension;
+        self.read(|db| {
+            Ok(db
+                .query_row(
+                    "SELECT CAST(value_json AS INTEGER) FROM server_setting WHERE key=?1",
+                    [format!("handoff.shutdown.{id}")],
+                    |row| row.get(0),
+                )
+                .optional()?)
+        })
+    }
+
+    pub(super) fn forget_take(&self, take: Command) -> Result<(), Error> {
+        self.transact(move |tx, _, _| {
+            tx.execute(
+                "DELETE FROM server_setting WHERE key=?1",
+                [format!("handoff.take.{}", take.id)],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Only the current take retains its queue snapshot. Older take receipts
+    /// still identify retries after that queue has changed or been released.
+    pub(super) fn taken(
+        &self,
+        command: Command,
+    ) -> Result<Option<ritornel_contract::HandoffResult>, Error> {
+        use rusqlite::OptionalExtension;
+        self.read(|db| {
+            let saved: Option<String> = db
+                .query_row(
+                    "SELECT value_json FROM server_setting WHERE key=?1",
+                    [format!("handoff.take.{}", command.id)],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            saved
+                .map(|s| serde_json::from_str(&s).map_err(Error::from))
+                .transpose()
+        })
+    }
+}
+
+pub(super) fn record_player_receipt(
+    tx: &rusqlite::Transaction<'_>,
+    command: &Command,
+    method: &str,
+    result: &str,
+    now: i64,
+) -> Result<(), Error> {
+    // Resuming and pausing again can leave the same queue and position.
+    // A deferred release must still leave that playback alone.
+    let takes = method == "link.handoff.take";
+    if takes
+        || (method.starts_with("playback.") && !matches!(method, "playback.pause" | "playback.set"))
+        || method.starts_with("queue.")
+        || method == "link.handoff.load"
+    {
+        tx.execute(
+            "DELETE FROM server_setting WHERE key GLOB 'handoff.take.*'",
+            [],
+        )?;
+    }
+    if takes {
+        tx.execute(
+            "INSERT INTO server_setting(key,value_json) VALUES(?1,?2)",
+            (format!("handoff.take.{}", command.id), result),
+        )?;
+    }
+    record_receipt(
+        tx,
+        command,
+        method,
+        if takes { "null" } else { result },
+        now,
+    )
+}

@@ -45,6 +45,7 @@ use crate::timekeeping::Timekeeper;
 use crate::{Clock, Command, Entropy, Error, Id, ServerStore, new_id};
 
 mod edits;
+mod handoff;
 
 pub use edits::{AddTracks, Order, Place, QueuePage, Settings};
 
@@ -381,6 +382,8 @@ pub struct Player {
     output_failing: Option<OutputFailing>,
     /// The listen a resume of the current entry continues.
     resume_listen: Option<Id>,
+    start_handoff: bool,
+    taken_at: Option<(Id, (i64, i64))>,
     /// Why the next track loaded starts.
     start_reason: StartReason,
     listener: Option<Id>,
@@ -493,6 +496,8 @@ impl Player {
             save_failing: None,
             output_failing: None,
             resume_listen: session.resume_listen,
+            start_handoff: false,
+            taken_at: None,
             start_reason: StartReason::UserPick,
             listener,
             queue_revision: session.queue_revision,
@@ -799,6 +804,7 @@ impl Player {
     /// output have run on into it meanwhile, it is the entry left, and the
     /// place saved is in it.
     fn leave(&mut self, server: &ServerStore, reason: EndReason, events: &mut Vec<PlayerEvent>) {
+        self.start_handoff = false;
         let before = self.recorder.last_closed();
         self.recorder.note(reason);
         if self.loaded.is_some() {
@@ -1101,6 +1107,7 @@ impl Player {
             .replace(entries, Some(start), shuffled, &mut random)?;
         self.leave(server, EndReason::Replaced, &mut events);
         let change = Change {
+            listener: None,
             command: None,
             expected: None,
             queue: write,
@@ -1140,24 +1147,41 @@ impl Player {
         }
         let mut events = Vec::new();
         self.sync(server, &mut events);
+        self.pause_output(server, &mut events, None)?;
+        self.receipt(server, request, events)
+    }
+
+    fn pause_output(
+        &mut self,
+        server: &ServerStore,
+        events: &mut Vec<PlayerEvent>,
+        expected: Option<Id>,
+    ) -> Result<(), Error> {
         match self.status {
             Status::Playing => {
                 self.renderer.pause();
+                self.take_in(events);
+                if expected.is_some_and(|id| {
+                    self.ran_out.is_some() || self.entry().is_none_or(|e| e.entry_id != id)
+                }) {
+                    self.renderer.play();
+                    return Err(Error::Invalid("the source advanced while pausing"));
+                }
                 self.recorder.paused();
                 self.status = Status::Paused;
-                self.sync(server, &mut events);
-                self.changed(&mut events);
+                self.sync(server, events);
+                self.changed(events);
             }
             // Nothing plays yet. A fetch under way goes on, and play opens
             // the entry from where it waits.
             Status::Buffering => {
                 self.status = Status::Paused;
                 self.paused_buffering = true;
-                self.changed(&mut events);
+                self.changed(events);
             }
             Status::Paused | Status::Stopped => {}
         }
-        self.receipt(server, request, events)
+        Ok(())
     }
 
     /// Plays again after a pause, or after a stop from the entry's
@@ -1174,6 +1198,7 @@ impl Player {
         }
         let mut events = Vec::new();
         self.sync(server, &mut events);
+        self.taken_at = None;
         match (self.status, &self.loaded) {
             (Status::Playing | Status::Buffering, _) => {}
             (Status::Paused, Some(_)) => {
@@ -1260,6 +1285,7 @@ impl Player {
         library: Option<&dyn Catalog>,
         events: &mut Vec<PlayerEvent>,
     ) -> Result<(), Error> {
+        self.taken_at = None;
         self.seeks += 1;
         let Some(loaded) = self.loaded.clone() else {
             // Nothing is open to say how long it is, but the library may
@@ -1366,6 +1392,22 @@ impl Player {
     ) -> Result<Vec<PlayerEvent>, Error> {
         let mut events = Vec::new();
         self.sync(server, &mut events);
+        if self.start_handoff {
+            match self.status {
+                Status::Buffering => {
+                    let library = library.ok_or(no_library())?;
+                    self.find_listener(server, library)?;
+                    self.start(server, library, &mut events)?;
+                    self.changed(&mut events);
+                }
+                Status::Paused => {
+                    self.display = self.read_display(library);
+                    self.changed(&mut events);
+                }
+                _ => {}
+            }
+            self.start_handoff = false;
+        }
         if let Some(limit) = self.setup.fail_at_position_ms
             && self.status == Status::Playing
             && self.position() >= limit
@@ -1844,6 +1886,12 @@ impl Player {
         let mut events = Vec::new();
         self.sync(server, &mut events);
         self.renderer.pause();
+        if let Some((id, (_, mono))) = self
+            .taken_at
+            .filter(|(id, _)| Some(*id) == self.open_listen())
+        {
+            server.save_handoff_pause(id, mono)?;
+        }
         self.leave(server, EndReason::Shutdown, &mut events);
         if self.current.is_some() {
             self.status = Status::Paused;

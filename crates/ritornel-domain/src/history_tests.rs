@@ -34,6 +34,7 @@ fn listen(observation: i64, key: u8, ms_played: i64) -> Listen {
         started_at_ms,
         ended_at_ms,
         started_mono_ms: 5_000_000 + (started_at_ms - T0),
+        handoff_mono_ms: None,
         ended_mono_ms: Some(5_000_000 + (ended_at_ms - T0)),
         boot: BOOT,
         continues: None,
@@ -286,14 +287,38 @@ fn a_resume_stays_in_the_window_when_its_senders_wall_clock_jumped_two_days_ahea
 }
 
 #[test]
-fn a_continuation_from_another_endpoint_or_of_a_listen_not_there_joins_nothing() {
+fn a_move_joins_across_endpoints_and_a_missing_predecessor_stands_alone() {
     let first = listen(1, 1, 100_000);
     let mut elsewhere = listen(2, 2, 100_000);
     elsewhere.endpoint = 2;
     elsewhere.continues = Some(first.source_key.clone());
     let mut orphan = listen(3, 3, 100_000);
     orphan.continues = Some(vec![0xee; 16]);
-    assert_eq!(plays(&[first, elsewhere, orphan]).len(), 3);
+    assert_eq!(plays(&[first, elsewhere, orphan]).len(), 2);
+}
+
+#[test]
+fn a_move_uses_dates_across_players_and_requires_an_unambiguous_predecessor() {
+    let source = listen(1, 1, 100_000);
+    let mut dest = listen(2, 2, 100_000);
+    dest.endpoint = 2;
+    dest.continues = Some(source.source_key.clone());
+    let gap = dest.started_at_ms - source.ended_at_ms;
+    for (offset, count) in [
+        (-SKEW_TOLERANCE_MS - 1, 2),
+        (-SKEW_TOLERANCE_MS, 1),
+        (CHAIN_WINDOW_MS, 1),
+        (CHAIN_WINDOW_MS + 1, 2),
+    ] {
+        let moved = later(&dest, offset - gap);
+        assert_eq!(chains(&[source.clone(), moved]).len(), count);
+    }
+    let mut same_key = source.clone();
+    same_key.endpoint = 3;
+    same_key.observation = 3;
+    assert_eq!(chains(&[source.clone(), same_key, dest.clone()]).len(), 3);
+    dest.listener += 1;
+    assert_eq!(chains(&[source, dest]).len(), 2);
 }
 
 #[test]
@@ -1156,4 +1181,22 @@ fn equal_second_returning_echoes_pair_one_to_one_deterministically() {
     assert!(!with_dup[0].excluded);
     assert_eq!(with_dup[1].observations, vec![(40, Role::Primary)]);
     assert!(with_dup[1].excluded);
+}
+
+#[test]
+fn a_move_and_a_local_restart_use_different_ends_of_a_listen_held_through_shutdown() {
+    let mut source = listen(1, 1, 100_000);
+    source.end_reason = EndReason::Shutdown;
+    source.handoff_mono_ms = source.ended_mono_ms;
+    source.ended_mono_ms = source.ended_mono_ms.map(|m| m + 2 * CHAIN_WINDOW_MS);
+    source.ended_at_ms += 2 * CHAIN_WINDOW_MS;
+    let mut next = listen(2, 2, 100_000);
+    next.continues = Some(source.source_key.clone());
+    next.endpoint = 2;
+    assert_eq!(chains(&[source.clone(), next.clone()]).len(), 1);
+    let delay = source.ended_at_ms - next.started_at_ms;
+    let mut after_shutdown = later(&next, delay + 1_000);
+    assert_eq!(chains(&[source.clone(), after_shutdown.clone()]).len(), 2);
+    after_shutdown.endpoint = source.endpoint;
+    assert_eq!(chains(&[source, after_shutdown]).len(), 1);
 }

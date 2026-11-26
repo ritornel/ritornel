@@ -187,7 +187,7 @@ impl Drop for Killed {
 }
 
 /// One track of forty seconds of tone, as 16-bit WAV at 8 kHz.
-fn long_track(folder: &Path) {
+pub(super) fn long_track(folder: &Path) {
     let (rate, seconds): (u32, u32) = (8000, 40);
     let frames = rate * seconds;
     let data = frames * 2;

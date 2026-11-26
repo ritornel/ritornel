@@ -125,7 +125,7 @@ pub(super) fn refused(error: ritornel_engine::Error) -> RpcError {
     }
 }
 
-fn no_player() -> RpcError {
+pub(super) fn no_player() -> RpcError {
     RpcError::new(
         ErrorCode::Unsupported,
         "this server has no audio output, so it has no player",
@@ -299,7 +299,7 @@ impl Core {
     }
 
     /// Runs `work` on the player with the stores, and sends what changed.
-    fn with_player<T>(
+    pub(super) fn with_player<T>(
         &self,
         stores: &Stores,
         work: impl FnOnce(

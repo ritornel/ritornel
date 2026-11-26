@@ -66,8 +66,11 @@ pub(crate) struct PlayerCall {
 }
 
 impl PlayerCall {
-    pub(crate) async fn answer(mut self) -> Option<PlayerAnswer> {
-        tokio::time::timeout(crate::bounds::PLAYER_CALL_WAIT, &mut self.response)
+    pub(crate) async fn answer_within(
+        mut self,
+        within: std::time::Duration,
+    ) -> Option<PlayerAnswer> {
+        tokio::time::timeout(within, &mut self.response)
             .await
             .ok()?
             .ok()

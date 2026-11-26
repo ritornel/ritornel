@@ -164,6 +164,7 @@ impl Library {
             end_position_ms: ms_played,
             end_reason: "finished".to_owned(),
             ended_at_ms: start + ms_played,
+            handoff_mono_ms: None,
             ended_mono_ms: Some(start - T0 + 1_000_000 + ms_played),
             context_kind: "album".to_owned(),
             context_ref: None,
@@ -662,6 +663,7 @@ fn a_play_follows_its_file_when_a_rescan_binds_the_file_elsewhere() {
         end_position_ms: 500,
         end_reason: "finished".to_owned(),
         ended_at_ms: T0 + 500,
+        handoff_mono_ms: None,
         ended_mono_ms: Some(1_500),
         context_kind: "album".to_owned(),
         context_ref: None,
@@ -2817,80 +2819,97 @@ fn migrating_a_saved_schema_1_library_preserves_rows_and_enables_recording_corre
     assert_eq!(dry, 0);
 }
 
-#[test]
-fn a_predecessor_arriving_late_does_not_schedule_its_play_again() {
-    use crate::Settled;
-    let at = library();
-    let account = at
-        .library
-        .ensure_service_account("lastfm", "someone")
-        .unwrap();
-    let start = T0 + 10 * MINUTE;
-    let mut crashed = at.listen(3, 1, start, 155_000);
-    crashed.end_reason = "crash".to_owned();
+/// Both a local recovery and a move can deliver the second half first.
+fn continued_listens(at: &Library, start: i64, moved: bool) -> (ListenRecord, ListenRecord) {
+    let mut previous = at.listen(3, 1, start, 155_000);
+    previous.end_reason = if moved { "stopped" } else { "crash" }.to_owned();
     let mut resumed = at.listen(4, 1, start + 4 * MINUTE, 200_000);
-    resumed.continues = Some(crashed.listen_id);
-    resumed.start_position_ms = 155_000;
-    // The resumed listen arrives first, counts and is sent.
-    at.send(&resumed, PlayRule::CURRENT);
-    assert_eq!(
-        at.library.plan_deliveries(account, start - MINUTE).unwrap(),
-        1
-    );
-    for due in at.library.take_due_deliveries(account, 0, 50).unwrap() {
+    if moved {
+        resumed.played_on_server = Id::from_bytes([0xab; 16]);
         at.library
-            .settle_deliveries(vec![(
-                due.delivery,
-                Settled::Accepted {
-                    artist: due.artist.clone(),
-                    title: due.title.clone(),
-                },
-            )])
+            .register_server(resumed.played_on_server, "Room")
             .unwrap();
     }
-    // Its predecessor arrives and leads the play from then on: the play was
-    // sent, and is not sent again.
-    at.send(&crashed, PlayRule::CURRENT);
-    assert_eq!(
-        at.library.plan_deliveries(account, start - MINUTE).unwrap(),
-        0
-    );
+    resumed.start_reason = "resume".to_owned();
+    resumed.continues = Some(previous.listen_id);
+    resumed.start_position_ms = 155_000;
+    (previous, resumed)
+}
+
+#[test]
+fn a_predecessor_arriving_late_does_not_schedule_its_play_again() {
+    for moved in [false, true] {
+        use crate::Settled;
+        let at = library();
+        let account = at
+            .library
+            .ensure_service_account("lastfm", "someone")
+            .unwrap();
+        let start = T0 + 10 * MINUTE;
+        let (previous, resumed) = continued_listens(&at, start, moved);
+        // The resumed listen arrives first, counts and is sent.
+        at.send(&resumed, PlayRule::CURRENT);
+        assert_eq!(
+            at.library.plan_deliveries(account, start - MINUTE).unwrap(),
+            1
+        );
+        for due in at.library.take_due_deliveries(account, 0, 50).unwrap() {
+            at.library
+                .settle_deliveries(vec![(
+                    due.delivery,
+                    Settled::Accepted {
+                        artist: due.artist.clone(),
+                        title: due.title.clone(),
+                    },
+                )])
+                .unwrap();
+        }
+        // Its predecessor arrives and leads the play from then on: the play was
+        // sent, and is not sent again.
+        at.send(&previous, PlayRule::CURRENT);
+        assert_eq!(at.count("SELECT count(*) FROM play_event"), 1);
+        assert_eq!(at.rebuild(PlayRule::CURRENT, true).changed, 0);
+        assert_eq!(
+            at.library.plan_deliveries(account, start - MINUTE).unwrap(),
+            0
+        );
+    }
 }
 
 #[test]
 fn a_play_waiting_to_be_sent_when_its_predecessor_arrives_is_sent_once_from_it() {
-    let at = library();
-    let account = at
-        .library
-        .ensure_service_account("lastfm", "someone")
-        .unwrap();
-    let start = T0 + 10 * MINUTE;
-    let mut crashed = at.listen(3, 1, start, 155_000);
-    crashed.end_reason = "crash".to_owned();
-    let mut resumed = at.listen(4, 1, start + 4 * MINUTE, 200_000);
-    resumed.continues = Some(crashed.listen_id);
-    resumed.start_position_ms = 155_000;
-    at.send(&resumed, PlayRule::CURRENT);
-    assert_eq!(
-        at.library.plan_deliveries(account, start - MINUTE).unwrap(),
-        1
-    );
-    // Not yet sent when the predecessor arrives: the waiting one is
-    // withdrawn at its turn, and the play goes once, at its true start.
-    at.send(&crashed, PlayRule::CURRENT);
-    assert_eq!(
-        at.library.plan_deliveries(account, start - MINUTE).unwrap(),
-        1
-    );
-    let due = at.library.take_due_deliveries(account, 0, 50).unwrap();
-    assert_eq!(
-        due.iter().map(|d| d.timestamp_s).collect::<Vec<_>>(),
-        [start / 1000]
-    );
-    assert_eq!(
-        at.count("SELECT count(*) FROM history_delivery WHERE state = 'withdrawn'"),
-        1
-    );
+    for moved in [false, true] {
+        let at = library();
+        let account = at
+            .library
+            .ensure_service_account("lastfm", "someone")
+            .unwrap();
+        let start = T0 + 10 * MINUTE;
+        let (previous, resumed) = continued_listens(&at, start, moved);
+        at.send(&resumed, PlayRule::CURRENT);
+        assert_eq!(
+            at.library.plan_deliveries(account, start - MINUTE).unwrap(),
+            1
+        );
+        // Not yet sent when the predecessor arrives: the waiting one is
+        // withdrawn at its turn, and the play goes once, at its true start.
+        at.send(&previous, PlayRule::CURRENT);
+        assert_eq!(at.count("SELECT count(*) FROM play_event"), 1);
+        assert_eq!(at.rebuild(PlayRule::CURRENT, true).changed, 0);
+        assert_eq!(
+            at.library.plan_deliveries(account, start - MINUTE).unwrap(),
+            1
+        );
+        let due = at.library.take_due_deliveries(account, 0, 50).unwrap();
+        assert_eq!(
+            due.iter().map(|d| d.timestamp_s).collect::<Vec<_>>(),
+            [start / 1000]
+        );
+        assert_eq!(
+            at.count("SELECT count(*) FROM history_delivery WHERE state = 'withdrawn'"),
+            1
+        );
+    }
 }
 
 #[test]

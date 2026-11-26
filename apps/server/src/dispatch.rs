@@ -57,6 +57,7 @@ mod calls;
 mod churn;
 mod corrections;
 mod export;
+mod handoff;
 mod history;
 mod imports;
 mod lastfm;
@@ -122,6 +123,7 @@ impl Stores {
 pub(crate) struct Core {
     server_id: Id,
     players: players::Players,
+    moves: handoff::Moves,
     schema_version: i64,
     dir: DataDir,
     /// What can change about this server while it runs.
@@ -313,6 +315,7 @@ impl Core {
             signer,
             invites: crate::link::Invites::default(),
             players,
+            moves: Default::default(),
             link_sessions,
             private_port: std::sync::OnceLock::new(),
             runtime,
@@ -929,6 +932,15 @@ impl Core {
             }
         }
         match method {
+            methods::LinkHandoff::NAME => {
+                return Err(RpcError::new(
+                    ErrorCode::Forbidden,
+                    "only the verified hub can hand off a queue",
+                ));
+            }
+            methods::PlaybackMove::NAME => {
+                return run::<methods::PlaybackMove>(params, |p| self.move_playback(p));
+            }
             EventsSubscribe::NAME => {
                 return run::<EventsSubscribe>(params, |p| {
                     self.change_subscription(session, p, true)

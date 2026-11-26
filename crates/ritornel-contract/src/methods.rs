@@ -274,6 +274,10 @@ methods! {
     PlaybackGet: "playback.get", Query, needs_full: false,
     PlaybackGetParams => PlaybackState;
 
+    /// `playback.move`: pauses a place, loads its queue on another and releases the source.
+    PlaybackMove: "playback.move", Command, needs_full: false,
+    PlaybackMoveParams => Receipt;
+
     /// `playback.play`: replaces the queue with what it names and plays it.
     PlaybackPlay: "playback.play", Command, needs_full: false,
     PlaybackPlayParams => PlaybackChanged;
@@ -574,6 +578,10 @@ methods! {
     LinkEvent: "link.event", Session, needs_full: true,
     LinkPlayerEvent => NoParams;
 
+    /// `link.handoff`: one step of a move, accepted only from the player's hub.
+    LinkHandoff: "link.handoff", Session, needs_full: true,
+    LinkHandoffParams => HandoffResult;
+
     /// `link.ping`: on a hub, a satellite's word, every few seconds, that
     /// it is there and whether it plays. A satellite that plays keeps the
     /// hub's machine awake; the ping alone does not.
@@ -705,6 +713,7 @@ mod tests {
                 "artist.get",
                 "media.token",
                 "playback.get",
+                "playback.move",
                 "playback.play",
                 "playback.pause",
                 "playback.resume",
@@ -760,6 +769,7 @@ mod tests {
                 "link.copies",
                 "link.listen",
                 "link.event",
+                "link.handoff",
                 "link.ping",
                 "server.settings",
                 "server.setSettings",
@@ -835,6 +845,7 @@ mod tests {
                 "link.copies",
                 "link.listen",
                 "link.event",
+                "link.handoff",
                 "link.ping",
                 "server.settings",
                 "server.setSettings",

@@ -2996,3 +2996,417 @@ async fn player_subscriptions_follow_their_target_through_the_hub_and_a_restart(
     })
     .await;
 }
+
+/// A hub with a real player and a track long enough to stay current throughout the move.
+async fn move_hub(scratch: &Scratch) -> (Server, Client, ritornel_contract::Id) {
+    let hub = start_playing_with(scratch, "hub", 1, None).await;
+    let mut c = client(scratch, "hub", &hub).await;
+    c.create_library(key()).await.unwrap();
+    super::launch::long_track(&scratch.0.0.join("music"));
+    scan(scratch, &mut c).await;
+    let tone = c
+        .list_open(&songs())
+        .await
+        .unwrap()
+        .rows
+        .into_iter()
+        .find_map(|r| match r {
+            Row::Song(s) if s.duration_ms == Some(40_000) => Some(s.appearance_id),
+            _ => None,
+        })
+        .unwrap();
+    (hub, c, tone)
+}
+
+async fn move_track(c: &Client, id: ritornel_contract::Id) -> serde_json::Value {
+    use serde_json::json;
+    c.call_raw("playback.play", json!({"idempotencyKey":key(),"source":{"type":"tracks","ids":[id,id,id]},"shuffle":true,"context":{"kind":"query"}})).await.unwrap();
+    loop {
+        let s = c.call_raw("playback.get", json!({})).await.unwrap();
+        if s["status"] == "playing" && s["positionMs"].as_u64().unwrap() > 0 {
+            return s;
+        }
+    }
+}
+
+async fn wait_empty(c: &Client) {
+    while c
+        .call::<PlaybackGet>(&PlaybackGetParams::default())
+        .await
+        .unwrap()
+        .queue_length
+        != 0
+    {
+        tokio::task::yield_now().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn moving_music_between_three_players_keeps_queue_order_position_and_one_receipt() {
+    use serde_json::json;
+    bounded(async {
+        let scratch = Scratch::new();
+        let (hub, mut h, tone) = move_hub(&scratch).await;
+        let desk = start_playing_with(&scratch, "desk", 1, None).await;
+        let d = client(&scratch, "desk", &desk).await;
+        join(&d, &invite(&hub, &h).await).await.unwrap();
+        wait_for_player(&mut h, desk.server_id()).await;
+        let other = start_playing_with(&scratch, "other", 1, None).await;
+        let o = client(&scratch, "other", &other).await;
+        join(&o, &invite(&hub, &h).await).await.unwrap();
+        wait_for_player(&mut h, other.server_id()).await;
+        for c in [&h, &d] {
+            let refused = c.call_raw("link.handoff", json!({})).await.unwrap_err();
+            assert_eq!(code(&refused), Some(ErrorCode::Forbidden));
+        }
+
+        move_track(&d, tone).await;
+        let original = move_track(&h, tone).await;
+        h.call_raw(
+            "playback.set",
+            json!({"idempotencyKey":key(),"repeat":"one"}),
+        )
+        .await
+        .unwrap();
+        let queue = |order| json!({"order":order});
+        let ordered = h.call_raw("queue.window", queue("play")).await.unwrap()["entries"].clone();
+        let move_to =
+            |from, to, entry| json!({"idempotencyKey":key(),"from":from,"to":to,"entryId":entry});
+        let stale = move_to(hub.server_id(), desk.server_id(), json!(key()));
+        assert_eq!(
+            code(&h.call_raw("playback.move", stale).await.unwrap_err()),
+            Some(ErrorCode::Invalid)
+        );
+        let same = move_to(
+            hub.server_id(),
+            hub.server_id(),
+            original["entryId"].clone(),
+        );
+        assert_eq!(
+            code(&h.call_raw("playback.move", same).await.unwrap_err()),
+            Some(ErrorCode::Invalid)
+        );
+        let first = move_to(
+            hub.server_id(),
+            desk.server_id(),
+            original["entryId"].clone(),
+        );
+        let receipt = o.call_raw("playback.move", first.clone()).await.unwrap();
+        assert_eq!(receipt["status"], "done");
+        assert_eq!(h.call_raw("playback.move", first).await.unwrap(), receipt);
+        wait_empty(&h).await;
+        // A transferred position alone does not prove the destination has
+        // rendered a frame. Wait for the continued listen to open there.
+        let desk_db =
+            rusqlite::Connection::open(scratch.data_dir("desk").join("server.db")).unwrap();
+        while !desk_db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM listen_staging WHERE continues_listen_id IS NOT NULL
+             AND ended_at_utc_ms IS NULL)",
+                [],
+                |r| r.get::<_, bool>(0),
+            )
+            .unwrap()
+        {
+            tokio::task::yield_now().await;
+        }
+        d.call_raw("playback.pause", json!({"idempotencyKey":key()}))
+            .await
+            .unwrap();
+        // Seeking while paused gives the source a known position after the
+        // last output callback has given up the playing span.
+        d.call_raw(
+            "playback.seek",
+            json!({"idempotencyKey": key(), "entryId": original["entryId"], "positionMs": 12_000}),
+        )
+        .await
+        .unwrap();
+        let paused = d.call_raw("playback.get", json!({})).await.unwrap();
+        assert_eq!(paused["positionMs"], 12_000);
+        let second = move_to(
+            desk.server_id(),
+            other.server_id(),
+            paused["entryId"].clone(),
+        );
+        d.call_raw("playback.move", second).await.unwrap();
+        wait_empty(&d).await;
+        let moved = o.call_raw("playback.get", json!({})).await.unwrap();
+        for field in [
+            "status",
+            "positionMs",
+            "entryId",
+            "repeat",
+            "shuffle",
+            "queueLength",
+        ] {
+            assert_eq!(moved[field], paused[field], "{field}");
+        }
+        assert_eq!(moved["status"], "paused");
+        assert_eq!(
+            o.call_raw("queue.window", queue("play")).await.unwrap()["entries"],
+            ordered
+        );
+        let db = rusqlite::Connection::open(scratch.data_dir("other").join("server.db")).unwrap();
+        let query: i64 = db
+            .query_row(
+                "SELECT count(*) FROM queue_entry WHERE context_kind='query'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(query, 3);
+
+        // Both the hub and Desk have released their part of the moved
+        // listen. Desk also closed the listen it was playing beforehand.
+        let history =
+            rusqlite::Connection::open(scratch.data_dir("hub").join("library.db")).unwrap();
+        while history
+            .query_row("SELECT count(*) FROM observation_listen", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap()
+            < 3
+        {
+            tokio::task::yield_now().await;
+        }
+        let joined: i64 = history
+            .query_row(
+                "SELECT count(*) FROM (SELECT p.play_event_id FROM play_event_observation p
+             JOIN history_observation o ON o.id=p.observation_id GROUP BY p.play_event_id
+             HAVING count(DISTINCT o.endpoint_id)=2 AND count(*)=2)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(joined, 1);
+        let replaced: i64 = history
+            .query_row(
+                "SELECT count(*) FROM observation_listen WHERE end_reason='replaced'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(replaced, 1);
+    })
+    .await;
+}
+
+async fn scripted_peer(
+    scratch: &Scratch,
+    hub: &Server,
+) -> (
+    Client,
+    tokio::sync::mpsc::Receiver<ritornel_contract::Request>,
+) {
+    use serde_json::json;
+    let token: String = rusqlite::Connection::open(scratch.data_dir("desk").join("server.db"))
+        .unwrap()
+        .query_row("SELECT token FROM hub_link", [], |r| r.get(0))
+        .unwrap();
+    let mut c = Client::connect_peer(hub.endpoint(), &Credential::new(&token))
+        .await
+        .unwrap();
+    let requests = c.take_requests().unwrap();
+    c.call_raw(
+        "server.hello",
+        json!({"kind":"server","name":"Desk","version":"1","contractVersion":CONTRACT_VERSION,
+        "presence":{"hasPlayer":true,"sendsNowPlaying":false,"player":{"status":"paused"}}}),
+    )
+    .await
+    .unwrap();
+    (c, requests)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn refused_load_preserves_the_source_and_an_unanswered_release_retries_on_reconnect() {
+    use ritornel_contract::{Request, Response, RpcError};
+    use serde_json::json;
+    bounded(async {
+        let scratch = Scratch::new();
+        let (hub, mut h, tone) = move_hub(&scratch).await;
+        let desk = start(&scratch, "desk").await;
+        let id = desk.server_id();
+        let d = client(&scratch, "desk", &desk).await;
+        join(&d, &invite(&hub, &h).await).await.unwrap();
+        drop(d);
+        desk.stop().await.unwrap();
+        let (peer, mut requests) = scripted_peer(&scratch, &hub).await;
+        wait_for_player(&mut h, id).await;
+        let entry = move_track(&h, tone).await["entryId"].clone();
+        let outbound =
+            json!({"idempotencyKey":key(),"entryId":entry,"from":hub.server_id(),"to":id});
+        let respond = |c: &Client, r: Request, outcome| {
+            c.respond(Response {
+                id: Some(r.id),
+                outcome,
+            })
+            .unwrap()
+        };
+        let (result, snapshot) = tokio::join!(h.call_raw("playback.move", outbound), async {
+            let r = requests.recv().await.unwrap();
+            assert_eq!(r.method, "link.handoff");
+            let snapshot = r.params.as_ref().unwrap()["snapshot"].clone();
+            respond(
+                &peer,
+                r,
+                Err(RpcError::new(ErrorCode::Invalid, "cannot accept queue")),
+            );
+            snapshot
+        });
+        assert_eq!(code(&result.unwrap_err()), Some(ErrorCode::Invalid));
+        let state = h.call_raw("playback.get", json!({})).await.unwrap();
+        assert_eq!(state["status"], "paused");
+        assert_eq!(state["queueLength"], 3);
+        let db = rusqlite::Connection::open(scratch.data_dir("hub").join("server.db")).unwrap();
+        let open: i64 = db
+            .query_row(
+                "SELECT count(*) FROM listen_staging WHERE ended_at_utc_ms IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(open, 1);
+
+        let inbound =
+            json!({"idempotencyKey":key(),"entryId":entry,"from":id,"to":hub.server_id()});
+        let (receipt, ()) = tokio::join!(h.call_raw("playback.move", inbound.clone()), async {
+            loop {
+                let r = requests.recv().await.unwrap();
+                if r.params.as_ref().unwrap()["step"] == "take" {
+                    respond(&peer, r, Ok(json!({"step":"taken","snapshot":snapshot})));
+                    break;
+                }
+                respond(&peer, r, Ok(json!({"step":"notLoaded"})));
+            }
+        });
+        let receipt = receipt.unwrap();
+        loop {
+            let r = requests.recv().await.unwrap();
+            if r.params.as_ref().unwrap()["step"] == "release" {
+                break;
+            }
+            respond(&peer, r, Ok(json!({"step":"notLoaded"})));
+        }
+        drop(peer);
+        drop(db);
+        drop(h);
+        hub.stop().await.unwrap();
+        let hub = start_playing_with(&scratch, "hub", 1, None).await;
+        let h = client(&scratch, "hub", &hub).await;
+        let (again, mut requests) = scripted_peer(&scratch, &hub).await;
+        loop {
+            let r = requests.recv().await.unwrap();
+            if r.params.as_ref().unwrap()["step"] == "release" {
+                assert_eq!(r.params.as_ref().unwrap()["movement"], inbound);
+                respond(&again, r, Ok(json!({"step":"released"})));
+                break;
+            }
+            respond(&again, r, Ok(json!({"step":"notLoaded"})));
+        }
+        assert_eq!(h.call_raw("playback.move", inbound).await.unwrap(), receipt);
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lost_load_answer_is_confirmed_before_the_hub_releases_the_source() {
+    recover_lost_load(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_missing_player_retires_the_load_attempt_and_leaves_the_source_intact() {
+    recover_lost_load(false).await;
+}
+
+async fn recover_lost_load(destination_kept_queue: bool) {
+    use ritornel_contract::Response;
+    use serde_json::json;
+    bounded(async {
+        let scratch = Scratch::new();
+        let (hub, mut controller, tone) = move_hub(&scratch).await;
+        let desk = start(&scratch, "desk").await;
+        let id = desk.server_id();
+        let c = client(&scratch, "desk", &desk).await;
+        join(&c, &invite(&hub, &controller).await).await.unwrap();
+        drop(c);
+        desk.stop().await.unwrap();
+        let (peer, mut requests) = scripted_peer(&scratch, &hub).await;
+        wait_for_player(&mut controller, id).await;
+        let state = move_track(&controller, tone).await;
+        let movement = json!({
+            "idempotencyKey": key(), "entryId": state["entryId"], "from": hub.server_id(), "to": id
+        });
+        let (lost, attempt) = tokio::join!(
+            controller.call_raw("playback.move", movement.clone()),
+            async {
+                let load = requests.recv().await.unwrap().params.unwrap();
+                assert_eq!(load["step"], "load");
+                assert!(load["snapshot"].is_object());
+                drop(peer);
+                load["attempt"].clone()
+            }
+        );
+        assert_eq!(code(&lost.unwrap_err()), Some(ErrorCode::Unavailable));
+        let paused = controller
+            .call::<PlaybackGet>(&PlaybackGetParams::default())
+            .await
+            .unwrap();
+        assert_eq!(paused.queue_length, 3);
+        let (again, mut requests) = scripted_peer(&scratch, &hub).await;
+        let probe = requests.recv().await.unwrap();
+        let params = probe.params.unwrap();
+        assert_eq!(params["attempt"], attempt);
+        assert!(params["snapshot"].is_null());
+        let outcome = if destination_kept_queue {
+            Ok(json!({"step": "loaded"}))
+        } else {
+            Err(
+                ritornel_contract::RpcError::new(ErrorCode::Unsupported, "the player was removed")
+                    .with_detail("reason", "no_player"),
+            )
+        };
+        let answer = Response {
+            id: Some(probe.id),
+            outcome,
+        };
+        if destination_kept_queue {
+            let (retry, ()) = tokio::join!(
+                controller.call_raw("playback.move", movement.clone()),
+                async {
+                    tokio::task::yield_now().await;
+                    again.respond(answer).unwrap();
+                }
+            );
+            assert_eq!(retry.unwrap()["status"], "done");
+        } else {
+            again.respond(answer).unwrap();
+            let db = rusqlite::Connection::open(scratch.data_dir("hub").join("server.db")).unwrap();
+            while db
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM server_setting WHERE key GLOB 'move.*')",
+                    [],
+                    |r| r.get::<_, bool>(0),
+                )
+                .unwrap()
+            {
+                tokio::task::yield_now().await;
+            }
+            let source = controller
+                .call::<PlaybackGet>(&PlaybackGetParams::default())
+                .await
+                .unwrap();
+            assert_eq!(source.queue_length, paused.queue_length);
+            assert_eq!(source.status, paused.status);
+            return;
+        }
+        wait_empty(&controller).await;
+        assert_eq!(
+            controller
+                .call_raw("playback.move", movement)
+                .await
+                .unwrap()["status"],
+            "done"
+        );
+    })
+    .await;
+}
