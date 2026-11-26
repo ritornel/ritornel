@@ -39,6 +39,7 @@ fn serve(data_dir: &Path, extra: &[&str]) -> Command {
         .env_remove("RITORNEL_LOG_LEVEL")
         .env_remove("RITORNEL_BACKUP_DIR")
         .env_remove("RITORNEL_NAME")
+        .env_remove("RITORNEL_VOLUME_CURVE")
         // Never the API key and secret of whoever runs the tests.
         .env_remove("SCROBL_API_KEY")
         .env_remove("SCROBL_API_SECRET")
@@ -180,6 +181,7 @@ fn without_listen_flag(data_dir: &Path, variables: &[(&str, &str)]) -> Command {
         .env_remove("RITORNEL_LOG_LEVEL")
         .env_remove("RITORNEL_BACKUP_DIR")
         .env_remove("RITORNEL_NAME")
+        .env_remove("RITORNEL_VOLUME_CURVE")
         .envs(variables.iter().copied())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -563,6 +565,7 @@ fn the_data_directory_can_come_from_the_environment() {
         .env_remove("RITORNEL_LOG_LEVEL")
         .env_remove("RITORNEL_BACKUP_DIR")
         .env_remove("RITORNEL_NAME")
+        .env_remove("RITORNEL_VOLUME_CURVE")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

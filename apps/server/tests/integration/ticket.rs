@@ -618,6 +618,7 @@ impl Process {
             .env_remove("RITORNEL_LOG_LEVEL")
             .env_remove("RITORNEL_BACKUP_DIR")
             .env_remove("RITORNEL_NAME")
+            .env_remove("RITORNEL_VOLUME_CURVE")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

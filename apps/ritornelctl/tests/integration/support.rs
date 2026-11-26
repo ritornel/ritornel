@@ -246,8 +246,8 @@ pub(crate) fn server_binary() -> PathBuf {
 /// A `ritornel-server serve` command on `data_dir` and a system-picked port,
 /// clearing ambient settings and credentials (`RITORNEL_DATA_DIR`,
 /// `RITORNEL_LISTEN`, `RITORNEL_LOG_LEVEL`, `RITORNEL_BACKUP_DIR`,
-/// `RITORNEL_NAME`, `RITORNEL_CACHE_SIZE`, `SCROBL_API_KEY`, and
-/// `SCROBL_API_SECRET`).
+/// `RITORNEL_NAME`, `RITORNEL_CACHE_SIZE`, `RITORNEL_VOLUME_CURVE`,
+/// `SCROBL_API_KEY`, and `SCROBL_API_SECRET`).
 pub(crate) fn server_command(data_dir: &Path) -> Command {
     let mut command = Command::new(server_binary());
     command
@@ -261,6 +261,7 @@ pub(crate) fn server_command(data_dir: &Path) -> Command {
         .env_remove("RITORNEL_BACKUP_DIR")
         .env_remove("RITORNEL_NAME")
         .env_remove("RITORNEL_CACHE_SIZE")
+        .env_remove("RITORNEL_VOLUME_CURVE")
         .env_remove("SCROBL_API_KEY")
         .env_remove("SCROBL_API_SECRET")
         .stdin(Stdio::null())

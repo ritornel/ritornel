@@ -948,17 +948,39 @@ fn a_square_wave_played_at_its_album_gain_and_resampled_never_goes_over_full_sca
 
 #[test]
 fn the_volume_scales_what_is_handed_to_the_output_from_the_first_frame() {
-    let (mut renderer, tap) = AudioRenderer::tapped(AS_IS, 50).unwrap();
-    renderer.set_volume(0.5);
-    renderer
-        .load(&fixture("a.flac"), facts(&fixture("a.flac")), 0, 1)
-        .unwrap();
-    renderer.play();
-    until(&mut renderer, &mut Vec::new(), |said| {
-        ended(said, 1).is_some()
-    });
-    let halved: Vec<f32> = s16("a.flac.s16le").iter().map(|s| s * 0.5).collect();
-    assert_eq!(*tap.lock().unwrap(), halved);
+    for curve in [super::VolumeCurve::Cubic, super::VolumeCurve::Log] {
+        let (mut renderer, tap) = AudioRenderer::tapped_with_curve(AS_IS, 50, curve).unwrap();
+        renderer.set_volume(0.5);
+        renderer
+            .load(&fixture("a.flac"), facts(&fixture("a.flac")), 0, 1)
+            .unwrap();
+        renderer.play();
+        until(&mut renderer, &mut Vec::new(), |said| {
+            ended(said, 1).is_some()
+        });
+        let gain = curve.gain(0.5);
+        let scaled: Vec<f32> = s16("a.flac.s16le").iter().map(|s| s * gain).collect();
+        assert_eq!(*tap.lock().unwrap(), scaled, "{curve:?}");
+    }
+}
+
+#[test]
+fn on_demand_keeps_its_volume_curve_when_opened_and_reopened() {
+    let track = fixture("a.flac");
+    let mut renderer =
+        super::OnDemand::new(Output::Null { speed: 50 }).with_volume_curve(super::VolumeCurve::Log);
+    renderer.load(&track, facts(&track), 0, 1).unwrap();
+    assert_eq!(
+        renderer.opened.as_ref().unwrap().volume_curve,
+        super::VolumeCurve::Log
+    );
+    assert!(renderer.close());
+    assert!(renderer.opened.is_none());
+    renderer.load(&track, facts(&track), 0, 2).unwrap();
+    assert_eq!(
+        renderer.opened.as_ref().unwrap().volume_curve,
+        super::VolumeCurve::Log
+    );
 }
 
 #[test]
@@ -1688,6 +1710,7 @@ fn an_output_that_goes_away_mid_track_saves_where_it_was_heard_and_play_goes_on_
     let device = Arc::clone(&opened.shared);
     let renderer = super::OnDemand {
         output,
+        volume_curve: super::VolumeCurve::default(),
         opened: Some(opened),
         gain: ReplayGain::Off,
         volume: 1.0,
@@ -1740,6 +1763,7 @@ fn on_demand_held(
     held.stall_after = stall_after;
     let renderer = super::OnDemand {
         output: Output::Null { speed: 4 },
+        volume_curve: super::VolumeCurve::default(),
         opened: Some(held),
         gain: ReplayGain::Off,
         volume: 1.0,
@@ -1908,6 +1932,7 @@ fn an_output_closed_while_paused_is_let_go_and_play_carries_the_listen_on_throug
     let device = Arc::clone(&opened.shared);
     let renderer = super::OnDemand {
         output: Output::Null { speed: 4 },
+        volume_curve: super::VolumeCurve::default(),
         opened: Some(opened),
         gain: ReplayGain::Off,
         volume: 1.0,
@@ -2001,6 +2026,7 @@ fn a_stale_output_with_nothing_loaded_is_let_go_and_a_load_opens_a_fresh_one() {
     let device = Arc::clone(&held.shared);
     let mut renderer = super::OnDemand {
         output: Output::Null { speed: 4 },
+        volume_curve: super::VolumeCurve::default(),
         opened: Some(held),
         gain: ReplayGain::Off,
         volume: 1.0,

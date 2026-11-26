@@ -4,7 +4,7 @@
 //! ritornel-server serve [--data-dir <dir>] [--listen <address>] [--owned]
 //!                       [--log-level <level>] [--output <output>]
 //!                       [--backup-dir <dir>] [--name <name>]
-//!                       [--cache-size <size>]
+//!                       [--cache-size <size>] [--volume-curve <curve>]
 //! ritornel-server service install [--data-dir <dir>]
 //! ritornel-server service uninstall | status
 //! ```
@@ -29,7 +29,7 @@ Usage:
   ritornel-server serve [--data-dir <dir>] [--listen <address>] [--owned]
                         [--log-level <level>] [--output <output>]
                         [--backup-dir <dir>] [--name <name>]
-                        [--cache-size <size>]
+                        [--cache-size <size>] [--volume-curve <curve>]
   ritornel-server service install [--data-dir <dir>]
   ritornel-server service uninstall | status
 
@@ -87,6 +87,9 @@ Options:
                         from its hub, in MiB or GiB, such as 8 GiB. The
                         oldest goes first once it holds more. The default
                         is 2 GiB
+  --volume-curve <curve>
+                        How player volume maps to output gain: cubic or
+                        log. The default is cubic
   -h, --help            Show this help
   -V, --version         Show the version
 
@@ -104,6 +107,7 @@ Environment:
   RITORNEL_TRANSCODE_CACHE_SIZE  Cache budget when --transcode-cache-size is not given
   RITORNEL_TRANSCODE_PROFILES    Named profiles when --transcode-profiles is not given
   RITORNEL_CACHE_SIZE   The cache's size, when --cache-size is not given
+  RITORNEL_VOLUME_CURVE The volume curve, when --volume-curve is not given
 
 A setting is read from its flag, then its environment variable, then
 config.toml in the data directory, then its default.
@@ -163,6 +167,8 @@ pub(crate) struct ServeArgs {
     pub(crate) name: Option<String>,
     #[arg(long, value_parser = NonEmptyStringValueParser::new())]
     pub(crate) cache_size: Option<String>,
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub(crate) volume_curve: Option<String>,
     #[arg(long)]
     pub(crate) transcode_workers: Option<String>,
     #[arg(long)]
@@ -215,6 +221,11 @@ fn usage(error: &clap::Error) -> Error {
             if option.starts_with("--cache-size") =>
         {
             "--cache-size needs a size"
+        }
+        ErrorKind::InvalidValue | ErrorKind::ValueValidation
+            if option.starts_with("--volume-curve") =>
+        {
+            "--volume-curve needs a curve"
         }
         _ => "the command line is wrong; try `ritornel-server --help`",
     })
@@ -314,6 +325,7 @@ mod tests {
             backup_dir: None,
             name: Some("Workbench Speakers".to_owned()),
             cache_size: Some("8 GiB".to_owned()),
+            volume_curve: Some("log".to_owned()),
             transcode_workers: None,
             transcode_cache_size: None,
             transcode_profiles: None,
@@ -332,6 +344,8 @@ mod tests {
                 "Workbench Speakers",
                 "--cache-size",
                 "8 GiB",
+                "--volume-curve",
+                "log",
             ][..],
             &[
                 "serve",
@@ -344,6 +358,8 @@ mod tests {
                 "Workbench Speakers",
                 "--cache-size",
                 "8 GiB",
+                "--volume-curve",
+                "log",
                 "--listen",
                 "127.0.0.1:5000",
             ],
@@ -355,6 +371,7 @@ mod tests {
                 "--listen=127.0.0.1:5000",
                 "--name=Workbench Speakers",
                 "--cache-size=8 GiB",
+                "--volume-curve=log",
             ],
         ] {
             assert_eq!(parse(args(line)).unwrap().command, expected, "{line:?}");
@@ -418,6 +435,10 @@ mod tests {
             (&["serve", "--name", "--owned"], "--name needs a name"),
             (&["serve", "--cache-size", ""], "--cache-size needs a size"),
             (
+                &["serve", "--volume-curve", ""],
+                "--volume-curve needs a curve",
+            ),
+            (
                 &["serve", "--log-level", "--owned"],
                 "--log-level needs a level",
             ),
@@ -476,6 +497,16 @@ mod tests {
         assert_eq!(
             err,
             "ritornel-server: --log-level must be error, warn, info, debug or trace\n"
+        );
+        let (code, out, err) = program(
+            &["serve", "--data-dir", dir, "--volume-curve", "linear"],
+            &[],
+        );
+        assert_eq!(code, EXIT_FAILED);
+        assert_eq!(out, "");
+        assert_eq!(
+            err,
+            "ritornel-server: --volume-curve must be cubic or log\n"
         );
         // It got as far as the lock and let it go again.
         assert!(!scratch.path().join("server.json").exists());

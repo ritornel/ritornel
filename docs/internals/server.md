@@ -198,6 +198,7 @@ Settings resolve in order: **CLI flag → `RITORNEL_*` environment variable → 
 | Transcode cache budget | `--transcode-cache-size` | `RITORNEL_TRANSCODE_CACHE_SIZE` | `10 GiB` |
 | Named encoder profiles | `--transcode-profiles` | `RITORNEL_TRANSCODE_PROFILES` | Built-in profiles |
 | Cache of masters a satellite pulls | `--cache-size` | `RITORNEL_CACHE_SIZE` | `2 GiB` |
+| Player volume curve (`cubic` or `log`) | `--volume-curve` | `RITORNEL_VOLUME_CURVE` | `cubic` |
 
 The name setting is described under "Server name" above.
 

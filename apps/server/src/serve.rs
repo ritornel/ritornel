@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Sender};
 
-use ritornel_engine::playback::Output;
+use ritornel_engine::playback::{Output, VolumeCurve};
 use ritornel_engine::{Clock, Entropy, OsEntropy, ScanSettings, SystemClock, new_id};
 use tracing::{error, info};
 
@@ -50,6 +50,7 @@ pub(crate) fn serve(args: &ServeArgs, env: Env<'_>, out: &mut dyn Write) -> Resu
         backup_dir: args.backup_dir.clone(),
         name: args.name.clone(),
         cache_size: args.cache_size.clone(),
+        volume_curve: args.volume_curve.clone(),
         transcode_workers: args.transcode_workers.clone(),
         transcode_cache_size: args.transcode_cache_size.clone(),
         transcode_profiles: args.transcode_profiles.clone(),
@@ -75,7 +76,7 @@ pub(crate) fn serve(args: &ServeArgs, env: Env<'_>, out: &mut dyn Write) -> Resu
     let jobs = Run {
         boot_id: Some(boot_id),
         scan: test_hooks(env),
-        playback: playback(args.output.as_deref(), env),
+        playback: playback(args.output.as_deref(), settings.volume_curve, env),
         lastfm: lastfm(env),
         // For the tests alone: a loopback address to send every
         // MusicBrainz request to, with no pause between them.
@@ -220,7 +221,7 @@ fn test_hooks(env: Env<'_>) -> ScanSettings {
 /// - `RITORNEL_TEST_NO_MEDIA_SESSION`: the player is not shown in the
 ///   system's media session, so a test that plays leaves the media keys
 ///   where they were.
-fn playback(output: Option<&str>, env: Env<'_>) -> PlaybackRun {
+fn playback(output: Option<&str>, volume_curve: VolumeCurve, env: Env<'_>) -> PlaybackRun {
     let number = |name: &str| env(name).and_then(|value| value.to_str()?.parse::<i64>().ok());
     let speed = number("RITORNEL_TEST_NULL_OUTPUT_SPEED")
         .and_then(|speed| u32::try_from(speed).ok())
@@ -233,6 +234,7 @@ fn playback(output: Option<&str>, env: Env<'_>) -> PlaybackRun {
     };
     PlaybackRun {
         output,
+        volume_curve,
         fail_at_position_ms: number("RITORNEL_TEST_FAIL_AT_POSITION_MS"),
         fail_saves_after_ms: number("RITORNEL_TEST_FAIL_SAVES_AFTER_MS"),
         fail_after_ingest: env("RITORNEL_TEST_FAIL_AFTER_INGEST").is_some(),
