@@ -215,7 +215,7 @@ mod enabled {
                         .collect(),
                     unsigned(library.imported_count(session.account).map_err(refused)?),
                     zones_set,
-                    library.held_for_import().map_err(refused)?,
+                    library.held_for_import(session.account).map_err(refused)?,
                 ))
             })
             .unwrap_or_default();
@@ -267,6 +267,22 @@ mod enabled {
             }
         }
 
+        /// Whether `account` is still held after a backup restore and has not
+        /// yet tried an import since the restored library was opened.
+        fn awaiting_restore_import(
+            stores: &Stores,
+            account: ritornel_contract::Id,
+            last_ended_ms: Option<i64>,
+        ) -> bool {
+            let Ok(Some(held)) = Self::library(stores, |library| {
+                library.held_for_import(account).map_err(refused)
+            }) else {
+                return false;
+            };
+            let boundary = held.since_ms.unwrap_or(held.taken_at_ms);
+            last_ended_ms.is_none_or(|ended| ended < boundary)
+        }
+
         /// Starts an import if `trigger` makes one due and none is queued
         /// or running. See "Last.fm" in docs/internals/history.md.
         pub(crate) fn import_if_due(&self, trigger: Trigger) -> Auto {
@@ -285,7 +301,8 @@ mod enabled {
                     Ok(last) => last.and_then(|job| job.finished_at_ms),
                     Err(failed) => return Auto::Failed(failed.to_string()),
                 };
-                if !due(trigger, last, self.clock.now_ms()) {
+                let waiting_restore = Self::awaiting_restore_import(stores, session.account, last);
+                if !waiting_restore && !due(trigger, last, self.clock.now_ms()) {
                     return Auto::NotDue;
                 }
                 let started = ritornel_engine::new_id(self.clock.now_ms(), &*self.entropy)
@@ -325,11 +342,19 @@ mod enabled {
                 last.as_ref().and_then(|job| job.finished_at_ms),
                 self.clock.now_ms(),
             );
-            // Never imported, or overdue: the thread starts one within a
-            // minute.
+            let waiting_restore = session.is_some_and(|session| {
+                Self::awaiting_restore_import(stores, session.account, ended)
+            });
+            // Never imported, waiting on a post-restore import, or overdue:
+            // the thread starts one within a minute.
             let after = |interval| {
-                (off.is_none() && !running)
-                    .then(|| ended.map_or(now, |ended| (ended + ms(interval)).max(now)))
+                (off.is_none() && !running).then(|| {
+                    if waiting_restore {
+                        now
+                    } else {
+                        ended.map_or(now, |ended| (ended + ms(interval)).max(now))
+                    }
+                })
             };
             ImportSchedule {
                 next: after(IMPORT_EVERY),
@@ -943,5 +968,92 @@ mod tests {
         let (core, _scratch, cli) = hub(&clock);
         let listed = call(&core, &cli, "sources.list", json!({})).unwrap();
         assert_eq!(listed["sources"], json!([]));
+    }
+
+    #[test]
+    fn restore_holds_are_reported_and_auto_imported_per_account() {
+        let clock = Arc::new(SetClock::at(T0));
+        let (core, scratch, cli) = hub(&clock);
+        let sign_in_as = |name: &str, key_str: &str| {
+            core.with_library(|server, library| {
+                let account = library.ensure_service_account(SERVICE, name).unwrap();
+                server
+                    .save_service_session(SERVICE, account, name, &ServiceKey::new(key_str), false)
+                    .unwrap();
+                account
+            })
+            .unwrap()
+        };
+        let end_for = |name: &str, state: JobState, failure: Option<&str>| {
+            core.with_stores(|stores| {
+                let job = stores.server().active_job(SYNC_JOB, name).unwrap().unwrap();
+                stores
+                    .server()
+                    .finish_job(job.id, state, failure.map(str::to_owned))
+                    .unwrap();
+            })
+            .unwrap();
+        };
+
+        // Account A ("someone") and Account B ("another") both exist; Account B
+        // synced 10 minutes before the backup.
+        let first = sign_in_as("someone", "k1");
+        let second = sign_in_as("another", "k2");
+        assert!(matches!(tick(&core, true), Auto::Started(_)));
+        end_for("another", JobState::Succeeded, None);
+
+        // Switch back to Account A, turn scrobbling on for both accounts, and
+        // simulate a backup + restore 10 minutes later.
+        sign_in_as("someone", "k1");
+        let mut on = key(0x61);
+        on["on"] = json!(true);
+        call(&core, &cli, "lastfm.setScrobbling", on).unwrap();
+
+        let backup_at = T0 + 10 * MINUTE;
+        let restored_at = T0 + 15 * MINUTE;
+        clock.set(restored_at);
+        assert!(
+            ritornel_engine::backup::hold_sending(
+                &scratch.path().join("data").join("library.db"),
+                backup_at,
+            )
+            .unwrap()
+        );
+        core.with_library(|_, library| library.opened_restored(Some(first)).unwrap())
+            .unwrap();
+
+        // Account A is held; releasing Account A clears only Account A.
+        let status_a_held = call(&core, &cli, "lastfm.status", json!({})).unwrap();
+        assert_eq!(status_a_held["waitingForImportSince"], json!(restored_at));
+        assert!(
+            core.with_library(|_, library| library.release_hold(first).unwrap())
+                .unwrap()
+        );
+        let status_a_free = call(&core, &cli, "lastfm.status", json!({})).unwrap();
+        assert_eq!(status_a_free["waitingForImportSince"], Value::Null);
+
+        // Switching to Account B shows Account B is still held and schedules an
+        // immediate import even though B synced only 15 minutes earlier.
+        sign_in_as("another", "k2");
+        let mut on_b = key(0x62);
+        on_b["on"] = json!(true);
+        call(&core, &cli, "lastfm.setScrobbling", on_b).unwrap();
+        let status_b = call(&core, &cli, "lastfm.status", json!({})).unwrap();
+        assert_eq!(status_b["waitingForImportSince"], json!(restored_at));
+        assert_eq!(status_b["import"]["next"], json!(restored_at));
+
+        // A timer tick starts B's post-restore import immediately.
+        assert!(matches!(tick(&core, false), Auto::Started(_)));
+        // If that attempt fails, normal backoff applies (no tight retry loop).
+        end_for("another", JobState::Failed, Some("offline"));
+        assert_eq!(tick(&core, false), Auto::NotDue);
+
+        // Once B reconciles and releases its hold, B is no longer waiting.
+        assert!(
+            core.with_library(|_, library| library.release_hold(second).unwrap())
+                .unwrap()
+        );
+        let status_b_free = call(&core, &cli, "lastfm.status", json!({})).unwrap();
+        assert_eq!(status_b_free["waitingForImportSince"], Value::Null);
     }
 }

@@ -11,7 +11,7 @@
 //! eligible when its turn comes is `withdrawn`, with why, and is never
 //! sent. Because it is recorded before it
 //! is sent, its echo, when the import brings it back, is matched to it
-//! exactly (`history_store::echo_of`).
+//! exactly (`history_store::echo_candidates`).
 //!
 //! Eligible to scrobble: counted, dated, a trusted clock, `observed`, not
 //! excluded, with no observation from that same account, and recent enough
@@ -19,11 +19,14 @@
 //! service's, and equals play rule 1 today because a play counts by that
 //! rule.
 
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+
 use rusqlite::{Connection, OptionalExtension};
 
+use ritornel_domain::history::PlayRule;
 use ritornel_domain::scrobble::same_track;
 
-use crate::history_store::rederive_delivery;
+use crate::history_store::{rederive_delivery, rederive_delivery_by};
 use crate::{Error, Id, LibraryStore, WriteRequest};
 
 /// What a write that records or settles deliveries is called.
@@ -112,13 +115,13 @@ fn endpoint_of(connection: &Connection, account: Id) -> Result<(i64, i64), Error
 /// Why a play is not sent when the account has it from another player.
 pub(crate) const ALREADY_SCROBBLED: &str = "the account already has this play from another player";
 
-/// Whether the account already has a scrobble of this track within a
+/// Whether the account already has an active scrobble of this track within a
 /// second of `seconds` that is not an echo of ours: one another player
 /// sent. Matched by normalised artist and title, as an echo is. An import
-/// that is part of a play some listen here made, as its echo or beside it,
-/// is that play's, and says nothing of another. This is not cross-source
-/// grouping by a window of time; it only keeps a play from being scrobbled
-/// twice.
+/// that is excluded (such as a `shifted_read` duplicate) or that is already
+/// part of a play some listen here made, as its echo or beside it, says
+/// nothing of another play. This is not cross-source grouping by a window of
+/// time; it only keeps a play from being scrobbled twice.
 fn already_scrobbled(
     connection: &Connection,
     endpoint: i64,
@@ -130,11 +133,16 @@ fn already_scrobbled(
         "SELECT i.artist, i.title FROM observation_import i
          JOIN history_observation o ON o.id = i.observation_id
          WHERE o.endpoint_id = ?1 AND i.played_at_utc_ms BETWEEN ?2 AND ?3
-           AND NOT EXISTS (SELECT 1 FROM play_event_observation x
-                           JOIN play_event_observation y ON y.play_event_id = x.play_event_id
-                           JOIN history_observation yo
-                             ON yo.id = y.observation_id AND yo.kind = 'listen'
-                           WHERE x.observation_id = i.observation_id)",
+           AND NOT EXISTS (
+             SELECT 1 FROM play_event_observation x
+             JOIN play_event pe ON pe.id = x.play_event_id
+             WHERE x.observation_id = i.observation_id
+               AND (pe.excluded = 1
+                    OR EXISTS (SELECT 1 FROM play_event_observation y
+                               JOIN history_observation yo
+                                 ON yo.id = y.observation_id AND yo.kind = 'listen'
+                               WHERE y.play_event_id = pe.id))
+           )",
     )?;
     let found: Vec<(String, String)> = statement
         .query_map(
@@ -147,17 +155,47 @@ fn already_scrobbled(
         .any(|(their_artist, their_title)| same_track(artist, title, their_artist, their_title)))
 }
 
-/// Why a pending delivery may not be sent now, if it may not: the
-/// eligibility rule asked again of its play as it is now, of its age
-/// against what Last.fm takes, and of the time scrobbling was last turned
-/// on.
-fn not_eligible(
+/// A play's scrobble metadata snapshot, used when refreshing a never-attempted
+/// pending delivery or reconciling one after a backup restore.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Snapshot {
+    timestamp_s: i64,
+    artist: String,
+    title: String,
+    album: Option<String>,
+    album_artist: Option<String>,
+    track_number: Option<i64>,
+    duration_ms: Option<i64>,
+}
+
+/// What checking a pending delivery right before sending comes to.
+enum PendingCheck {
+    /// Its play is no longer eligible (or its track names changed after an
+    /// earlier send attempt): withdraw it and never send.
+    Withdraw(&'static str),
+    /// Eligible to send at `timestamp_s` with the queued snapshot as stored.
+    Send { timestamp_s: i64 },
+    /// Eligible to send after refreshing the never-attempted delivery's stored
+    /// snapshot in place.
+    Refresh(Snapshot),
+}
+
+/// Checks a pending delivery against its play as it is now, its age against
+/// what Last.fm takes, and `from_ms`, the time scrobbling was last turned on.
+///
+/// When metadata changed before any send attempt (`attempts == 0`), the
+/// delivery is refreshed in place instead of withdrawn so edits never drop
+/// unsent plays; once an attempt has been made (`attempts > 0`), changed
+/// track names (`artist`, `title`, `album`, `album_artist`, `track_number`)
+/// still withdraw the delivery so a play whose prior attempt may have reached
+/// the service is never re-sent under different track metadata.
+fn check_pending(
     connection: &Connection,
     delivery: i64,
     endpoint: i64,
     from_ms: i64,
     now_ms: i64,
-) -> Result<Option<&'static str>, Error> {
+) -> Result<PendingCheck, Error> {
     struct PlayNow {
         counts: bool,
         excluded: bool,
@@ -172,6 +210,7 @@ fn not_eligible(
         album: Option<String>,
         album_artist: Option<String>,
         track_number: Option<i64>,
+        duration_ms: Option<i64>,
     }
     let play: Option<PlayNow> = connection
         .prepare_cached(&format!(
@@ -185,7 +224,7 @@ fn not_eligible(
                             WHERE y.play_event_id = pe.id AND other.endpoint_id = ?2
                               AND other.id <> d.id
                               AND other.state NOT IN ('pending', 'withdrawn')),
-                    pe.recording_id, {NAMES}
+                    pe.recording_id, {NAMES}, pe.track_duration_ms
              FROM history_delivery d
              JOIN play_event_observation peo
                ON peo.observation_id = d.observation_id AND peo.role = 'primary'
@@ -210,65 +249,134 @@ fn not_eligible(
                 album: row.get(10)?,
                 album_artist: row.get(11)?,
                 track_number: row.get(12)?,
+                duration_ms: row.get(13)?,
             })
         })
         .optional()?;
-    let (seconds, artist, title, album, album_artist, track_number): (
-        i64,
-        String,
-        String,
-        Option<String>,
-        Option<String>,
-        Option<i64>,
-    ) = connection
+    struct Queued {
+        attempts: i64,
+        snapshot: Snapshot,
+    }
+    let queued = connection
         .prepare_cached(
-            "SELECT sent_timestamp_s, artist, title, album, album_artist, track_number
+            "SELECT attempts, sent_timestamp_s, artist, title, album, album_artist,
+                    track_number, duration_ms
              FROM history_delivery WHERE id = ?1",
         )?
         .query_row([delivery], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-                row.get(5)?,
-            ))
+            Ok(Queued {
+                attempts: row.get(0)?,
+                snapshot: Snapshot {
+                    timestamp_s: row.get(1)?,
+                    artist: row.get(2)?,
+                    title: row.get(3)?,
+                    album: row.get(4)?,
+                    album_artist: row.get(5)?,
+                    track_number: row.get(6)?,
+                    duration_ms: row.get(7)?,
+                },
+            })
         })?;
-    if already_scrobbled(connection, endpoint, seconds, &artist, &title)? {
-        return Ok(Some(ALREADY_SCROBBLED));
+    let (check_seconds, check_artist, check_title) = play
+        .as_ref()
+        .filter(|_| queued.attempts == 0)
+        .and_then(|play| {
+            Some((
+                play.at?.div_euclid(1000),
+                play.artist.as_deref()?,
+                play.title.as_deref()?,
+            ))
+        })
+        .unwrap_or((
+            queued.snapshot.timestamp_s,
+            queued.snapshot.artist.as_str(),
+            queued.snapshot.title.as_str(),
+        ));
+    if already_scrobbled(
+        connection,
+        endpoint,
+        check_seconds,
+        check_artist,
+        check_title,
+    )? {
+        return Ok(PendingCheck::Withdraw(ALREADY_SCROBBLED));
     }
     let Some(play) = play else {
-        return Ok(Some("its play is no longer derived from this listen"));
+        return Ok(PendingCheck::Withdraw(
+            "its play is no longer derived from this listen",
+        ));
     };
     let Some(at) = play.at else {
-        return Ok(Some("its play has no date"));
+        return Ok(PendingCheck::Withdraw("its play has no date"));
     };
-    Ok(if !play.counts {
-        Some("its play no longer counts")
-    } else if play.excluded {
-        Some("its play is excluded")
-    } else if play.clock != "hub_age" || play.evidence != "observed" {
-        Some("its play is not dated by a trusted clock")
-    } else if play.account_has_it {
-        Some("the account already has this play")
-    } else if play.sent_from_another {
-        Some("its play was sent from another of its listens")
-    } else if play.recording_id.is_none() {
-        Some("its play is no longer bound to a recording")
-    } else if play.artist.as_deref() != Some(artist.as_str())
-        || play.title.as_deref() != Some(title.as_str())
-        || play.album != album
-        || play.album_artist != album_artist
-        || play.track_number != track_number
-    {
-        Some("its play's track changed since it was queued")
-    } else if at < now_ms - SEND_WITHIN_MS {
-        Some("its play is too old for Last.fm to take")
-    } else if at < from_ms {
-        Some("its play is from before scrobbling was turned on")
-    } else {
-        None
+    if !play.counts {
+        return Ok(PendingCheck::Withdraw("its play no longer counts"));
+    }
+    if play.excluded {
+        return Ok(PendingCheck::Withdraw("its play is excluded"));
+    }
+    if play.clock != "hub_age" || play.evidence != "observed" {
+        return Ok(PendingCheck::Withdraw(
+            "its play is not dated by a trusted clock",
+        ));
+    }
+    if play.account_has_it {
+        return Ok(PendingCheck::Withdraw("the account already has this play"));
+    }
+    if play.sent_from_another {
+        return Ok(PendingCheck::Withdraw(
+            "its play was sent from another of its listens",
+        ));
+    }
+    if play.recording_id.is_none() {
+        return Ok(PendingCheck::Withdraw(
+            "its play is no longer bound to a recording",
+        ));
+    }
+    let play_seconds = at.div_euclid(1000);
+    let names_changed = play.artist.as_deref() != Some(queued.snapshot.artist.as_str())
+        || play.title.as_deref() != Some(queued.snapshot.title.as_str())
+        || play.album != queued.snapshot.album
+        || play.album_artist != queued.snapshot.album_artist
+        || play.track_number != queued.snapshot.track_number;
+    if queued.attempts > 0 && names_changed {
+        return Ok(PendingCheck::Withdraw(
+            "its play's track changed since it was queued",
+        ));
+    }
+    if at < now_ms - SEND_WITHIN_MS {
+        return Ok(PendingCheck::Withdraw(
+            "its play is too old for Last.fm to take",
+        ));
+    }
+    if at < from_ms {
+        return Ok(PendingCheck::Withdraw(
+            "its play is from before scrobbling was turned on",
+        ));
+    }
+    if queued.attempts == 0 {
+        let Some(current) = (match (play.artist, play.title) {
+            (Some(artist), Some(title)) => Some(Snapshot {
+                timestamp_s: play_seconds,
+                artist,
+                title,
+                album: play.album,
+                album_artist: play.album_artist,
+                track_number: play.track_number,
+                duration_ms: play.duration_ms,
+            }),
+            _ => None,
+        }) else {
+            return Ok(PendingCheck::Withdraw(
+                "its play's track changed since it was queued",
+            ));
+        };
+        if current != queued.snapshot {
+            return Ok(PendingCheck::Refresh(current));
+        }
+    }
+    Ok(PendingCheck::Send {
+        timestamp_s: queued.snapshot.timestamp_s,
     })
 }
 
@@ -300,17 +408,30 @@ pub struct Playing {
     pub track_number: Option<i64>,
 }
 
-/// One eligible play, as it would be sent.
-type Eligible = (
-    i64,
-    i64,
-    String,
-    String,
-    Option<String>,
-    Option<String>,
-    Option<i64>,
-    Option<i64>,
-);
+/// One unplanned listen play, as it would be sent or reconciled.
+struct UnplannedListen {
+    observation: i64,
+    at_ms: i64,
+    clock_basis: String,
+    time_precision_ms: i64,
+    artist: String,
+    title: String,
+    album: Option<String>,
+    album_artist: Option<String>,
+    track_number: Option<i64>,
+    duration_ms: Option<i64>,
+}
+
+/// Which clock bases `unplanned_listens` accepts.
+#[derive(Clone, Copy)]
+enum ClockScope {
+    /// Normal planning for outward sends: trusted `hub_age` plays only.
+    HubAgeOnly,
+    /// Post-restore reconciliation: also include `server_wall` plays because
+    /// a staged/outbox listen closed after a reboot falls back to `server_wall`
+    /// even though the pre-restore server may have dated it `hub_age` and sent it.
+    HubAgeOrWall,
+}
 
 /// The plays eligible to be sent to the account's endpoint that have no
 /// delivery there yet, played from `from_ms` on. A play that comes to be
@@ -324,9 +445,30 @@ fn eligible(
     endpoint: i64,
     listener: i64,
     from_ms: i64,
-) -> Result<Vec<Eligible>, Error> {
+) -> Result<Vec<UnplannedListen>, Error> {
+    unplanned_listens(
+        connection,
+        endpoint,
+        listener,
+        from_ms,
+        ClockScope::HubAgeOnly,
+    )
+}
+
+fn unplanned_listens(
+    connection: &Connection,
+    endpoint: i64,
+    listener: i64,
+    from_ms: i64,
+    scope: ClockScope,
+) -> Result<Vec<UnplannedListen>, Error> {
+    let clock_clause = match scope {
+        ClockScope::HubAgeOnly => "pe.clock_basis = 'hub_age'",
+        ClockScope::HubAgeOrWall => "pe.clock_basis IN ('hub_age', 'server_wall')",
+    };
     let mut statement = connection.prepare(&format!(
-        "SELECT peo.observation_id, pe.event_at_utc_ms, {NAMES}, pe.track_duration_ms
+        "SELECT peo.observation_id, pe.event_at_utc_ms, pe.clock_basis, pe.time_precision_ms,
+                {NAMES}, pe.track_duration_ms
          FROM play_event pe
          JOIN play_event_observation peo ON peo.play_event_id = pe.id AND peo.role = 'primary'
          JOIN history_observation o ON o.id = peo.observation_id AND o.kind = 'listen'
@@ -335,7 +477,7 @@ fn eligible(
          {NAME_JOINS}
          WHERE pe.listener_id = ?1 AND pe.event_at_utc_ms >= ?3
            AND pe.counts = 1 AND pe.excluded = 0 AND pe.evidence_class = 'observed'
-           AND pe.clock_basis = 'hub_age'
+           AND {clock_clause}
            AND NOT EXISTS (SELECT 1 FROM play_event_observation x
                            JOIN history_observation xo ON xo.id = x.observation_id
                            WHERE x.play_event_id = pe.id AND xo.endpoint_id = ?2)
@@ -344,35 +486,51 @@ fn eligible(
                            WHERE y.play_event_id = pe.id AND d.endpoint_id = ?2
                              AND (d.observation_id = peo.observation_id
                                   OR d.state NOT IN ('pending', 'withdrawn')))
-         ORDER BY pe.event_at_utc_ms"
+         ORDER BY pe.event_at_utc_ms, peo.observation_id"
     ))?;
+    struct RowData {
+        observation: i64,
+        at_ms: i64,
+        clock_basis: String,
+        time_precision_ms: i64,
+        title: Option<String>,
+        artist: Option<String>,
+        album: Option<String>,
+        album_artist: Option<String>,
+        track_number: Option<i64>,
+        duration_ms: Option<i64>,
+    }
     let rows = statement.query_map((listener, endpoint, from_ms), |row| {
-        Ok((
-            row.get(0)?,
-            row.get(1)?,
-            row.get::<_, Option<String>>(2)?,
-            row.get::<_, Option<String>>(3)?,
-            row.get(4)?,
-            row.get(5)?,
-            row.get(6)?,
-            row.get(7)?,
-        ))
+        Ok(RowData {
+            observation: row.get(0)?,
+            at_ms: row.get(1)?,
+            clock_basis: row.get(2)?,
+            time_precision_ms: row.get(3)?,
+            title: row.get(4)?,
+            artist: row.get(5)?,
+            album: row.get(6)?,
+            album_artist: row.get(7)?,
+            track_number: row.get(8)?,
+            duration_ms: row.get(9)?,
+        })
     })?;
     let mut found = Vec::new();
     for row in rows {
-        let (observation, at, title, artist, album, album_artist, number, duration) = row?;
+        let row = row?;
         // A play whose track shows no artist or no title cannot be sent.
-        if let (Some(title), Some(artist)) = (title, artist) {
-            found.push((
-                observation,
-                at,
+        if let (Some(title), Some(artist)) = (row.title, row.artist) {
+            found.push(UnplannedListen {
+                observation: row.observation,
+                at_ms: row.at_ms,
+                clock_basis: row.clock_basis,
+                time_precision_ms: row.time_precision_ms,
                 artist,
                 title,
-                album,
-                album_artist,
-                number,
-                duration,
-            ));
+                album: row.album,
+                album_artist: row.album_artist,
+                track_number: row.track_number,
+                duration_ms: row.duration_ms,
+            });
         }
     }
     Ok(found)
@@ -441,24 +599,35 @@ impl LibraryStore {
             move |write| {
                 let connection = write.connection();
                 let (endpoint, listener) = endpoint_of(connection, account)?;
+                // While a restore hold is active for this account, defer the
+                // `already_scrobbled` withdrawal check until `release_hold`
+                // clears the hold: batches committed mid-sync before
+                // `release_hold` runs may be echoes of plays the pre-restore
+                // server sent after the backup, which `release_hold` reconciles
+                // as `accepted` instead of leaving separate from the listen.
+                let is_held = held_of(connection, account)?.is_some();
                 // Read again inside the transaction: what was eligible a
                 // moment ago and is still.
                 let found = eligible(connection, endpoint, listener, from_ms)?;
                 let mut pending = 0;
-                for (observation, at, artist, title, album, album_artist, number, duration) in
-                    &found
-                {
+                for play in &found {
                     // A play another player already scrobbled to the account
                     // is recorded as withdrawn, so that it is not looked at
                     // again, and is never sent.
-                    let seconds = at.div_euclid(1000);
-                    let (state, detail) =
-                        if already_scrobbled(connection, endpoint, seconds, artist, title)? {
-                            ("withdrawn", Some(ALREADY_SCROBBLED))
-                        } else {
-                            pending += 1;
-                            ("pending", None)
-                        };
+                    let seconds = play.at_ms.div_euclid(1000);
+                    let (state, detail) = if !is_held
+                        && already_scrobbled(
+                            connection,
+                            endpoint,
+                            seconds,
+                            &play.artist,
+                            &play.title,
+                        )? {
+                        ("withdrawn", Some(ALREADY_SCROBBLED))
+                    } else {
+                        pending += 1;
+                        ("pending", None)
+                    };
                     connection
                         .prepare_cached(
                             "INSERT INTO history_delivery
@@ -468,15 +637,15 @@ impl LibraryStore {
                              VALUES (?1, ?2, ?13, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, ?12)",
                         )?
                         .execute(rusqlite::params![
-                            observation,
+                            play.observation,
                             endpoint,
                             seconds,
-                            artist,
-                            title,
-                            album,
-                            album_artist,
-                            number,
-                            duration,
+                            play.artist,
+                            play.title,
+                            play.album,
+                            play.album_artist,
+                            play.track_number,
+                            play.duration_ms,
                             write.now_ms(),
                             write.rev(),
                             detail,
@@ -493,9 +662,11 @@ impl LibraryStore {
     /// oldest first and each of its own second, and marks them `sending`
     /// in the same transaction, before anything is sent. Each is checked
     /// again there against its play as it is now and against `from_ms`,
-    /// the time scrobbling was last turned on: one that may no longer be
-    /// sent is `withdrawn`, with why, and is never sent. With none due it
-    /// writes nothing.
+    /// the time scrobbling was last turned on: a never-attempted delivery
+    /// whose metadata changed is refreshed in place, while one that may no
+    /// longer be sent (or changed after an earlier attempt) is `withdrawn`,
+    /// with why, and is never sent. While the account is held after a backup
+    /// restore, or with none due, it writes nothing.
     pub fn take_due_deliveries(
         &self,
         account: Id,
@@ -503,28 +674,19 @@ impl LibraryStore {
         limit: usize,
     ) -> Result<Vec<Due>, Error> {
         let now = self.clock_now_ms();
-        let due = move |connection: &Connection| -> Result<Vec<Due>, Error> {
+        let due = move |connection: &Connection| -> Result<Vec<i64>, Error> {
             let (endpoint, _) = endpoint_of(connection, account)?;
+            if held_of(connection, account)?.is_some() {
+                return Ok(Vec::new());
+            }
             let mut statement = connection.prepare_cached(
-                "SELECT id, artist, title, album, album_artist, track_number, duration_ms,
-                        sent_timestamp_s
+                "SELECT id
                  FROM history_delivery
                  WHERE endpoint_id = ?1 AND state = 'pending'
                    AND (next_attempt_at_ms IS NULL OR next_attempt_at_ms <= ?2)
                  ORDER BY sent_timestamp_s, id",
             )?;
-            let rows = statement.query_map((endpoint, now), |row| {
-                Ok(Due {
-                    delivery: row.get(0)?,
-                    artist: row.get(1)?,
-                    title: row.get(2)?,
-                    album: row.get(3)?,
-                    album_artist: row.get(4)?,
-                    track_number: row.get(5)?,
-                    duration_ms: row.get(6)?,
-                    timestamp_s: row.get(7)?,
-                })
-            })?;
+            let rows = statement.query_map((endpoint, now), |row| row.get(0))?;
             Ok(rows.collect::<Result<_, _>>()?)
         };
         if self.read(due)?.is_empty() {
@@ -542,40 +704,71 @@ impl LibraryStore {
                 let (endpoint, _) = endpoint_of(connection, account)?;
                 let mut seconds = std::collections::BTreeSet::new();
                 let mut taken = Vec::new();
-                for row in due(connection)? {
+                for delivery in due(connection)? {
                     if taken.len() == limit {
                         break;
                     }
-                    if let Some(why) =
-                        not_eligible(connection, row.delivery, endpoint, from_ms, now)?
-                    {
-                        connection
-                            .prepare_cached(
-                                "UPDATE history_delivery
-                                 SET state = 'withdrawn', detail = ?2, updated_at_ms = ?3,
-                                     rev = ?4
-                                 WHERE id = ?1",
-                            )?
-                            .execute((row.delivery, why, write.now_ms(), write.rev()))?;
-                        continue;
-                    }
+                    let (timestamp_s, refresh) =
+                        match check_pending(connection, delivery, endpoint, from_ms, now)? {
+                            PendingCheck::Withdraw(why) => {
+                                connection
+                                    .prepare_cached(
+                                        "UPDATE history_delivery
+                                         SET state = 'withdrawn', detail = ?2, updated_at_ms = ?3,
+                                             rev = ?4
+                                         WHERE id = ?1",
+                                    )?
+                                    .execute((delivery, why, write.now_ms(), write.rev()))?;
+                                continue;
+                            }
+                            PendingCheck::Send { timestamp_s } => (timestamp_s, None),
+                            PendingCheck::Refresh(snapshot) => {
+                                (snapshot.timestamp_s, Some(snapshot))
+                            }
+                        };
                     // The service ties an answer to a play by its time alone.
-                    if !seconds.insert(row.timestamp_s) {
+                    if !seconds.insert(timestamp_s) {
                         continue;
                     }
                     // Sent by this server, the hub: the row says so, for the
                     // day a satellite may send one itself.
-                    connection
-                        .prepare_cached(
-                            "UPDATE history_delivery
-                             SET state = 'sending', attempts = attempts + 1, updated_at_ms = ?2,
-                                 rev = ?3,
-                                 sent_by_server_id = (SELECT id FROM server WHERE public_id = ?4)
-                             WHERE id = ?1",
-                        )?
-                        .execute((row.delivery, write.now_ms(), write.rev(), hub.as_bytes()))?;
-                    rederive_delivery(write, row.delivery)?;
-                    taken.push(row.delivery);
+                    if let Some(snapshot) = refresh {
+                        connection
+                            .prepare_cached(
+                                "UPDATE history_delivery
+                                 SET state = 'sending', attempts = attempts + 1,
+                                     sent_timestamp_s = ?2, artist = ?3, title = ?4,
+                                     album = ?5, album_artist = ?6, track_number = ?7,
+                                     duration_ms = ?8, updated_at_ms = ?9, rev = ?10,
+                                     sent_by_server_id = (SELECT id FROM server WHERE public_id = ?11)
+                                 WHERE id = ?1",
+                            )?
+                            .execute(rusqlite::params![
+                                delivery,
+                                snapshot.timestamp_s,
+                                snapshot.artist,
+                                snapshot.title,
+                                snapshot.album,
+                                snapshot.album_artist,
+                                snapshot.track_number,
+                                snapshot.duration_ms,
+                                write.now_ms(),
+                                write.rev(),
+                                hub.as_bytes(),
+                            ])?;
+                    } else {
+                        connection
+                            .prepare_cached(
+                                "UPDATE history_delivery
+                                 SET state = 'sending', attempts = attempts + 1, updated_at_ms = ?2,
+                                     rev = ?3,
+                                     sent_by_server_id = (SELECT id FROM server WHERE public_id = ?4)
+                                 WHERE id = ?1",
+                            )?
+                            .execute((delivery, write.now_ms(), write.rev(), hub.as_bytes()))?;
+                    }
+                    rederive_delivery(write, delivery)?;
+                    taken.push(delivery);
                 }
                 Ok(serde_json::to_string(&taken)?)
             },
@@ -687,37 +880,227 @@ impl LibraryStore {
     }
 }
 
-/// The setting that holds back every scrobble of a library restored from
-/// a backup until an import has run. The service may have taken plays
-/// after the backup was taken, which the library restored still has
-/// waiting; an import brings them back, and they are then not sent again.
-/// It is written into the backup's copy, never into the library copied,
-/// so it is there only once that copy is put back. See [`hold_sending`].
+/// The legacy global setting key written by older backups before restore
+/// holds were scoped per account. Retained for reading and expanding older
+/// backups cleanly on open or release.
 pub(crate) const HELD_SETTING: &str = "scrobbling.held_until_import";
 
-/// Writes [`HELD_SETTING`] into the library at `connection`, a backup's
-/// copy, taken at `taken_at_ms`, if it has plays waiting to be sent: with
-/// none, there is nothing to send twice. Its revision is the copy's last,
-/// since the copy is not a write of the library's own. Whether it did.
+/// Prefix for account-scoped restore reconciliation holds in
+/// `library_setting`: `scrobbling.held_until_import.<account-public-id>`.
+const HELD_PREFIX: &str = "scrobbling.held_until_import.";
+
+/// Exclusive upper bound for range queries over [`HELD_PREFIX`] keys
+/// (`'/'` immediately follows `'.'` in ASCII, avoiding SQLite `LIKE`
+/// wildcard issues on `'_'`).
+const HELD_PREFIX_END: &str = "scrobbling.held_until_import/";
+
+/// Prefix for bounded post-restore reconciliation windows in `library_setting`:
+/// `scrobbling.restored.<account-public-id>`. Kept for `SEND_WITHIN_MS` after
+/// `release_hold` so satellite listens or deferred local outbox listens that
+/// arrive after the first sync still reconcile against imported scrobbles.
+const RESTORED_PREFIX: &str = "scrobbling.restored.";
+
+/// Exclusive upper bound for range queries over [`RESTORED_PREFIX`] keys.
+const RESTORED_PREFIX_END: &str = "scrobbling.restored/";
+
+/// Detail recorded on deliveries reconciled as already present at the
+/// service after a backup restore.
+const RESTORED_DETAIL: &str = "the service had it already when the library was restored";
+
+fn held_key(account: Id) -> String {
+    format!("{HELD_PREFIX}{account}")
+}
+
+fn restored_key(account: Id) -> String {
+    format!("{RESTORED_PREFIX}{account}")
+}
+
+fn service_accounts(connection: &Connection) -> Result<Vec<Id>, Error> {
+    let mut statement =
+        connection.prepare_cached("SELECT public_id FROM service_account ORDER BY id")?;
+    let rows = statement.query_map([], |row| Ok(Id::from_bytes(row.get(0)?)))?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+fn held_row(connection: &Connection, key: &str) -> Result<Option<Held>, Error> {
+    Ok(connection
+        .query_row(
+            "SELECT json_extract(value_json, '$.takenAtMs'),
+                    json_extract(value_json, '$.sinceMs')
+             FROM library_setting WHERE key = ?1",
+            [key],
+            |row| {
+                Ok(Held {
+                    taken_at_ms: row.get(0)?,
+                    since_ms: row.get(1)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+fn held_of(connection: &Connection, account: Id) -> Result<Option<Held>, Error> {
+    if let Some(held) = held_row(connection, &held_key(account))? {
+        return Ok(Some(held));
+    }
+    held_row(connection, HELD_SETTING)
+}
+
+fn any_held(connection: &Connection) -> Result<Option<Held>, Error> {
+    let mut statement = connection.prepare_cached(
+        "SELECT json_extract(value_json, '$.takenAtMs'),
+                json_extract(value_json, '$.sinceMs')
+         FROM library_setting
+         WHERE key = ?1 OR (key >= ?2 AND key < ?3)
+         ORDER BY key",
+    )?;
+    let rows: Vec<Held> = statement
+        .query_map((HELD_SETTING, HELD_PREFIX, HELD_PREFIX_END), |row| {
+            Ok(Held {
+                taken_at_ms: row.get(0)?,
+                since_ms: row.get(1)?,
+            })
+        })?
+        .collect::<Result<_, _>>()?;
+    let Some(first) = rows.first().copied() else {
+        return Ok(None);
+    };
+    let taken_at_ms = rows
+        .iter()
+        .map(|held| held.taken_at_ms)
+        .min()
+        .unwrap_or(first.taken_at_ms);
+    let since_ms = if rows.iter().any(|held| held.since_ms.is_none()) {
+        None
+    } else {
+        rows.iter().filter_map(|held| held.since_ms).min()
+    };
+    Ok(Some(Held {
+        taken_at_ms,
+        since_ms,
+    }))
+}
+
+/// Upserts a per-account hold row at `key`, keeping the earliest `takenAtMs`
+/// and earliest `sinceMs` across any existing row and the incoming values.
+fn upsert_hold(
+    connection: &Connection,
+    key: &str,
+    taken_at_ms: i64,
+    since_ms: Option<i64>,
+    rev: i64,
+) -> Result<(), Error> {
+    let existing = held_row(connection, key)?;
+    let taken = existing.map_or(taken_at_ms, |held| held.taken_at_ms.min(taken_at_ms));
+    let since = match (existing.and_then(|held| held.since_ms), since_ms) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) | (None, Some(a)) => Some(a),
+        (None, None) => None,
+    };
+    let value = match since {
+        Some(since_ms) => serde_json::json!({ "takenAtMs": taken, "sinceMs": since_ms }),
+        None => serde_json::json!({ "takenAtMs": taken }),
+    };
+    connection
+        .prepare_cached(
+            "INSERT INTO library_setting (key, value_json, rev)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json, rev = excluded.rev",
+        )?
+        .execute((key, value.to_string(), rev))?;
+    Ok(())
+}
+
+/// Expands a legacy global [`HELD_SETTING`] row into per-account holds for
+/// every `service_account`, preserving the earliest `takenAtMs` and any
+/// `sinceMs`, then deletes the global key.
+fn expand_legacy_hold(write: &crate::library_store::Write<'_>) -> Result<(), Error> {
+    let connection = write.connection();
+    let Some(legacy) = held_row(connection, HELD_SETTING)? else {
+        return Ok(());
+    };
+    let accounts = service_accounts(connection)?;
+    if accounts.is_empty() {
+        return Ok(());
+    }
+    for account in accounts {
+        upsert_hold(
+            connection,
+            &held_key(account),
+            legacy.taken_at_ms,
+            legacy.since_ms,
+            write.rev(),
+        )?;
+    }
+    connection.execute("DELETE FROM library_setting WHERE key = ?1", [HELD_SETTING])?;
+    Ok(())
+}
+
+/// Writes per-account restore holds into the library at `connection`, a
+/// backup's copy taken at `taken_at_ms`, for every `service_account` present:
+/// a library with any account may have pending deliveries, unplanned listens,
+/// staged listens in `server.db`, or listens sitting in a satellite's outbox
+/// that the service accepts after the backup is taken. With no service
+/// accounts, nothing is written. Its revision is the copy's last, since the
+/// copy is not a write of the library's own. Returns whether any hold was
+/// written.
 pub(crate) fn hold_sending(connection: &Connection, taken_at_ms: i64) -> Result<bool, Error> {
     // A file the server would not open as a library is copied as it is.
     let is_library: bool = connection.query_row(
-        "SELECT count(*) = 2 FROM sqlite_schema
-         WHERE type = 'table' AND name IN ('library_setting', 'history_delivery')",
+        "SELECT count(*) = 3 FROM sqlite_schema
+         WHERE type = 'table'
+           AND name IN ('library_setting', 'history_delivery', 'service_account')",
         [],
         |row| row.get(0),
     )?;
     if !is_library {
         return Ok(false);
     }
-    Ok(connection.execute(
-        "INSERT INTO library_setting (key, value_json, rev)
-         SELECT ?1, json_object('takenAtMs', ?2),
-                (SELECT coalesce(max(rev), 0) FROM library_revision)
-         WHERE EXISTS (SELECT 1 FROM history_delivery WHERE state = 'pending')
-         ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json, rev = excluded.rev",
-        (HELD_SETTING, taken_at_ms),
-    )? > 0)
+    let accounts = service_accounts(connection)?;
+    if accounts.is_empty() {
+        return Ok(false);
+    }
+    let rev: i64 = connection.query_row(
+        "SELECT coalesce(max(rev), 0) FROM library_revision",
+        [],
+        |row| row.get(0),
+    )?;
+    let legacy_taken = held_row(connection, HELD_SETTING)?.map(|held| held.taken_at_ms);
+    let base_taken = legacy_taken.map_or(taken_at_ms, |legacy| legacy.min(taken_at_ms));
+    let mut earliest_taken = base_taken;
+    for account in accounts {
+        let key = held_key(account);
+        let existing_taken = held_row(connection, &key)?.map(|held| held.taken_at_ms);
+        let effective_taken =
+            existing_taken.map_or(base_taken, |existing| existing.min(base_taken));
+        earliest_taken = earliest_taken.min(effective_taken);
+        // On a fresh backup copy, clear any prior `sinceMs` so the restored
+        // server stamps its own start time when opened.
+        connection
+            .prepare_cached(
+                "INSERT INTO library_setting (key, value_json, rev)
+                 VALUES (?1, json_object('takenAtMs', ?2), ?3)
+                 ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json, rev = excluded.rev",
+            )?
+            .execute((&key, effective_taken, rev))?;
+    }
+    // Also write the legacy global hold key so older binaries (or a revert)
+    // still hold scrobbling on restore; newer binaries expand and remove it
+    // on first open (`opened_restored` / `release_hold`).
+    connection
+        .prepare_cached(
+            "INSERT INTO library_setting (key, value_json, rev)
+             VALUES (?1, json_object('takenAtMs', ?2), ?3)
+             ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json, rev = excluded.rev",
+        )?
+        .execute((HELD_SETTING, earliest_taken, rev))?;
+    // Clear any post-restore window from an earlier restore so a restore of
+    // this new backup reconciles cleanly after its own import finishes.
+    connection.execute(
+        "DELETE FROM library_setting WHERE key >= ?1 AND key < ?2",
+        (RESTORED_PREFIX, RESTORED_PREFIX_END),
+    )?;
+    Ok(true)
 }
 
 /// Scrobbling held back after a restore, until an import has run.
@@ -730,63 +1113,483 @@ pub struct Held {
     pub since_ms: Option<i64>,
 }
 
-fn held(connection: &Connection) -> Result<Option<Held>, Error> {
-    Ok(connection
+/// An active, non-excluded import observation not yet corroborating any listen.
+struct UnmatchedImport {
+    observation: i64,
+    seconds: i64,
+    artist: String,
+    title: String,
+}
+
+/// Active, non-excluded whole-second imports on `endpoint` within
+/// `[min_s, max_s]` that do not already corroborate any listen play.
+fn unmatched_imports_in(
+    connection: &Connection,
+    endpoint: i64,
+    min_s: i64,
+    max_s: i64,
+) -> Result<Vec<UnmatchedImport>, Error> {
+    let min_ms = min_s.saturating_mul(1000);
+    let max_ms = max_s.saturating_mul(1000);
+    let mut statement = connection.prepare_cached(
+        "SELECT o.id, i.played_at_utc_ms, i.artist, i.title
+         FROM observation_import i
+         JOIN history_observation o ON o.id = i.observation_id
+         WHERE o.endpoint_id = ?1
+           AND i.played_at_utc_ms BETWEEN ?2 AND ?3
+           AND i.played_at_utc_ms % 1000 = 0
+           AND NOT EXISTS (
+             SELECT 1 FROM play_event_observation x
+             JOIN play_event pe ON pe.id = x.play_event_id
+             WHERE x.observation_id = i.observation_id
+               AND (pe.excluded = 1
+                    OR EXISTS (SELECT 1 FROM play_event_observation y
+                               JOIN history_observation yo
+                                 ON yo.id = y.observation_id AND yo.kind = 'listen'
+                               WHERE y.play_event_id = pe.id))
+           )
+         ORDER BY o.id",
+    )?;
+    let rows = statement.query_map((endpoint, min_ms, max_ms), |row| {
+        let at_ms: i64 = row.get(1)?;
+        Ok(UnmatchedImport {
+            observation: row.get(0)?,
+            seconds: at_ms.div_euclid(1000),
+            artist: row.get(2)?,
+            title: row.get(3)?,
+        })
+    })?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// The current track snapshot of a delivery's play, when that delivery's
+/// listen still leads a counted, non-excluded, bound, dated play.
+fn current_play_snapshot(
+    connection: &Connection,
+    delivery: i64,
+) -> Result<Option<Snapshot>, Error> {
+    let found = connection
+        .prepare_cached(&format!(
+            "SELECT pe.event_at_utc_ms, {NAMES}, pe.track_duration_ms
+             FROM history_delivery d
+             JOIN play_event_observation peo
+               ON peo.observation_id = d.observation_id AND peo.role = 'primary'
+             JOIN play_event pe ON pe.id = peo.play_event_id
+             JOIN recording r ON r.id = pe.recording_id
+             LEFT JOIN track_appearance ta ON ta.id = pe.appearance_id
+             {NAME_JOINS}
+             WHERE d.id = ?1 AND pe.counts = 1 AND pe.excluded = 0
+               AND pe.event_at_utc_ms IS NOT NULL"
+        ))?
+        .query_row([delivery], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+                row.get::<_, Option<i64>>(6)?,
+            ))
+        })
+        .optional()?;
+    Ok(found.and_then(
+        |(at, title, artist, album, album_artist, track_number, duration_ms)| {
+            Some(Snapshot {
+                timestamp_s: at.div_euclid(1000),
+                artist: artist?,
+                title: title?,
+                album,
+                album_artist,
+                track_number,
+                duration_ms,
+            })
+        },
+    ))
+}
+
+/// One candidate play to reconcile during `release_hold`.
+enum ReconcileCandidate {
+    Pending {
+        delivery: i64,
+        queued_s: i64,
+        queued_artist: String,
+        queued_title: String,
+        refresh: Option<Snapshot>,
+    },
+    Unplanned(UnplannedListen),
+}
+
+/// Deterministic maximum bipartite matching between restore candidates and
+/// unmatched imports. Maximizes total matched plays first, breaking ties by
+/// each candidate's ordered edge preference (refreshed metadata over queued
+/// metadata; closer timestamp over farther; earlier import observation first).
+fn match_reconcile_candidates(
+    edges: &[Vec<(usize, Option<Snapshot>)>],
+) -> BTreeMap<usize, (usize, Option<Snapshot>)> {
+    let mut matched_import: HashMap<usize, (usize, Option<Snapshot>)> = HashMap::new();
+
+    fn augment(
+        u: usize,
+        edges: &[Vec<(usize, Option<Snapshot>)>],
+        seen: &mut BTreeSet<usize>,
+        matched_import: &mut HashMap<usize, (usize, Option<Snapshot>)>,
+    ) -> bool {
+        let Some(adj) = edges.get(u) else {
+            return false;
+        };
+        for (imp, refresh) in adj {
+            if !matched_import.contains_key(imp) && seen.insert(*imp) {
+                matched_import.insert(*imp, (u, refresh.clone()));
+                return true;
+            }
+        }
+        for (imp, refresh) in adj {
+            if !seen.insert(*imp) {
+                continue;
+            }
+            if let Some((prev, _)) = matched_import.get(imp).cloned()
+                && augment(prev, edges, seen, matched_import)
+            {
+                matched_import.insert(*imp, (u, refresh.clone()));
+                return true;
+            }
+        }
+        false
+    }
+
+    for u in 0..edges.len() {
+        if edges.get(u).is_some_and(|adj| !adj.is_empty()) {
+            let mut seen = BTreeSet::new();
+            augment(u, edges, &mut seen, &mut matched_import);
+        }
+    }
+
+    matched_import
+        .into_iter()
+        .map(|(imp, (u, refresh))| (u, (imp, refresh)))
+        .collect()
+}
+
+/// Tolerance in whole seconds for matching an unplanned listen during restore
+/// reconciliation: exact second for `hub_age`, bounded by `time_precision_ms`
+/// (5 seconds) for `server_wall` listens whose dating can shift after a reboot.
+fn restore_tolerance_s(clock_basis: &str, time_precision_ms: i64) -> i64 {
+    if clock_basis == "server_wall" {
+        (time_precision_ms / 1000).max(0)
+    } else {
+        0
+    }
+}
+
+/// Inserts an `accepted` delivery row for an unplanned listen reconciled
+/// against an imported scrobble during or after restore, and returns its row ID.
+fn insert_reconciled_delivery(
+    write: &crate::library_store::Write<'_>,
+    listen: &UnplannedListen,
+    endpoint: i64,
+    import: &UnmatchedImport,
+) -> Result<i64, Error> {
+    let connection = write.connection();
+    connection
+        .prepare_cached(
+            "INSERT INTO history_delivery
+               (observation_id, endpoint_id, state, sent_timestamp_s, artist,
+                title, album, album_artist, track_number, duration_ms,
+                accepted_artist, accepted_title, created_at_ms, updated_at_ms,
+                rev, detail)
+             VALUES (?1, ?2, 'accepted', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                     ?12, ?12, ?13, ?14)",
+        )?
+        .execute(rusqlite::params![
+            listen.observation,
+            endpoint,
+            import.seconds,
+            listen.artist,
+            listen.title,
+            listen.album,
+            listen.album_artist,
+            listen.track_number,
+            listen.duration_ms,
+            import.artist,
+            import.title,
+            write.now_ms(),
+            write.rev(),
+            RESTORED_DETAIL,
+        ])?;
+    Ok(connection.last_insert_rowid())
+}
+
+/// Records a bounded post-restore reconciliation window for `account` so late
+/// satellite listens or deferred local outbox listens arriving after
+/// `release_hold` still reconcile against already-imported scrobbles, and
+/// prunes any expired windows.
+fn record_restored_window(
+    write: &crate::library_store::Write<'_>,
+    account: Id,
+    taken_at_ms: i64,
+) -> Result<(), Error> {
+    let connection = write.connection();
+    let now = write.now_ms();
+    let key = restored_key(account);
+    let existing: Option<(i64, i64)> = connection
         .query_row(
             "SELECT json_extract(value_json, '$.takenAtMs'),
-                    json_extract(value_json, '$.sinceMs')
+                    json_extract(value_json, '$.reconciledAtMs')
              FROM library_setting WHERE key = ?1",
-            [HELD_SETTING],
-            |row| {
-                Ok(Held {
-                    taken_at_ms: row.get(0)?,
-                    since_ms: row.get(1)?,
-                })
-            },
+            [&key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
-        .optional()?)
+        .optional()?;
+    let (taken, reconciled) = existing.map_or((taken_at_ms, now), |(prev_taken, prev_rec)| {
+        (prev_taken.min(taken_at_ms), prev_rec.max(now))
+    });
+    let value = serde_json::json!({
+        "takenAtMs": taken,
+        "reconciledAtMs": reconciled,
+    });
+    connection.execute(
+        "INSERT INTO library_setting (key, value_json, rev)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json, rev = excluded.rev",
+        (&key, value.to_string(), write.rev()),
+    )?;
+    prune_expired_restored_windows(connection, now)?;
+    Ok(())
+}
+
+fn prune_expired_restored_windows(connection: &Connection, now_ms: i64) -> Result<(), Error> {
+    let cutoff = now_ms.saturating_sub(SEND_WITHIN_MS);
+    connection.execute(
+        "DELETE FROM library_setting
+         WHERE key >= ?1 AND key < ?2
+           AND json_extract(value_json, '$.reconciledAtMs') < ?3",
+        (RESTORED_PREFIX, RESTORED_PREFIX_END, cutoff),
+    )?;
+    Ok(())
+}
+
+/// Reconciles a newly ingested listen against any active post-restore window
+/// (for satellites reconnecting or deferred local outbox rows delivered after
+/// `release_hold`). Runs inside the listen-ingest transaction before
+/// `plan_deliveries` can observe the listen.
+pub(crate) fn reconcile_late_listen(
+    write: &crate::library_store::Write<'_>,
+    observation: i64,
+    rule: PlayRule,
+) -> Result<(), Error> {
+    let connection = write.connection();
+    let windows: Vec<(String, i64, i64)> = connection
+        .prepare_cached(
+            "SELECT key,
+                    json_extract(value_json, '$.takenAtMs'),
+                    json_extract(value_json, '$.reconciledAtMs')
+             FROM library_setting
+             WHERE key >= ?1 AND key < ?2
+             ORDER BY key",
+        )?
+        .query_map((RESTORED_PREFIX, RESTORED_PREFIX_END), |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .collect::<Result<_, _>>()?;
+    if windows.is_empty() {
+        return Ok(());
+    }
+    let now = write.now_ms();
+    let cutoff = now.saturating_sub(SEND_WITHIN_MS);
+    let mut had_expired = false;
+    for (key, taken_at_ms, reconciled_at_ms) in windows {
+        if reconciled_at_ms < cutoff {
+            had_expired = true;
+            continue;
+        }
+        let Some(suffix) = key.strip_prefix(RESTORED_PREFIX) else {
+            continue;
+        };
+        let Ok(account) = suffix.parse::<Id>() else {
+            continue;
+        };
+        // If a newer backup hold is active for this account, wait for its
+        // `release_hold` instead of reconciling prematurely.
+        if held_of(connection, account)?.is_some() {
+            continue;
+        }
+        let Ok((endpoint, listener)) = endpoint_of(connection, account) else {
+            continue;
+        };
+        let min_at_ms = taken_at_ms.saturating_sub(SEND_WITHIN_MS);
+        let listen = connection
+            .prepare_cached(&format!(
+                "SELECT primary_peo.observation_id, pe.event_at_utc_ms, pe.clock_basis,
+                        pe.time_precision_ms, {NAMES}, pe.track_duration_ms
+                 FROM play_event_observation mine
+                 JOIN play_event pe ON pe.id = mine.play_event_id
+                 JOIN play_event_observation primary_peo
+                   ON primary_peo.play_event_id = pe.id AND primary_peo.role = 'primary'
+                 JOIN history_observation o
+                   ON o.id = primary_peo.observation_id AND o.kind = 'listen'
+                 JOIN recording r ON r.id = pe.recording_id
+                 LEFT JOIN track_appearance ta ON ta.id = pe.appearance_id
+                 {NAME_JOINS}
+                 WHERE mine.observation_id = ?1
+                   AND pe.listener_id = ?2
+                   AND pe.event_at_utc_ms BETWEEN ?4 AND ?5
+                   AND pe.counts = 1 AND pe.excluded = 0 AND pe.evidence_class = 'observed'
+                   AND pe.clock_basis IN ('hub_age', 'server_wall')
+                   AND NOT EXISTS (SELECT 1 FROM play_event_observation x
+                                   JOIN history_observation xo ON xo.id = x.observation_id
+                                   WHERE x.play_event_id = pe.id AND xo.endpoint_id = ?3)
+                   AND NOT EXISTS (SELECT 1 FROM history_delivery d
+                                   JOIN play_event_observation y
+                                     ON y.observation_id = d.observation_id
+                                   WHERE y.play_event_id = pe.id AND d.endpoint_id = ?3)"
+            ))?
+            .query_row(
+                (observation, listener, endpoint, min_at_ms, reconciled_at_ms),
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, Option<i64>>(8)?,
+                        row.get::<_, Option<i64>>(9)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            primary_obs,
+            at_ms,
+            clock_basis,
+            time_precision_ms,
+            Some(title),
+            Some(artist),
+            album,
+            album_artist,
+            track_number,
+            duration_ms,
+        )) = listen
+        else {
+            continue;
+        };
+        let play_s = at_ms.div_euclid(1000);
+        let tolerance_s = restore_tolerance_s(&clock_basis, time_precision_ms);
+        let imports = unmatched_imports_in(
+            connection,
+            endpoint,
+            play_s.saturating_sub(tolerance_s),
+            play_s.saturating_add(tolerance_s),
+        )?;
+        let matched = imports
+            .into_iter()
+            .filter(|imp| same_track(&artist, &title, &imp.artist, &imp.title))
+            .min_by_key(|imp| (imp.seconds.abs_diff(play_s), imp.observation));
+        if let Some(import) = matched {
+            let candidate = UnplannedListen {
+                observation: primary_obs,
+                at_ms,
+                clock_basis,
+                time_precision_ms,
+                artist,
+                title,
+                album,
+                album_artist,
+                track_number,
+                duration_ms,
+            };
+            let delivery = insert_reconciled_delivery(write, &candidate, endpoint, &import)?;
+            rederive_delivery_by(write, delivery, rule)?;
+        }
+    }
+    if had_expired {
+        prune_expired_restored_windows(connection, now)?;
+    }
+    Ok(())
 }
 
 impl LibraryStore {
-    /// Whether scrobbling is held back until an import has run, as it is
-    /// in a library restored from a backup.
-    pub fn held_for_import(&self) -> Result<Option<Held>, Error> {
-        self.read(held)
+    /// Whether scrobbling for `account` is held back until an import has run
+    /// for that account, as it is in a library restored from a backup.
+    pub fn held_for_import(&self, account: Id) -> Result<Option<Held>, Error> {
+        self.read(move |connection| held_of(connection, account))
     }
 
-    /// At start: a library restored from a backup is held from now on, if
-    /// it was not already. Returns the hold, if there is one.
-    pub fn opened_restored(&self) -> Result<Option<Held>, Error> {
-        match self.held_for_import()? {
-            Some(Held { since_ms: None, .. }) => {}
-            other => return Ok(other),
+    /// Whether any account's scrobbling is held back until an import has run.
+    pub fn any_held_for_import(&self) -> Result<Option<Held>, Error> {
+        self.read(any_held)
+    }
+
+    /// At start: every account held in a library restored from a backup is
+    /// stamped as held from now on, if it was not already (and any legacy
+    /// global hold is expanded to per-account holds).
+    ///
+    /// Returns the hold relevant to this startup: if `active_account` is
+    /// `Some`, that account's hold (if still active); if `active_account` is
+    /// `None`, the earliest hold only when this open newly stamped or expanded
+    /// a hold. That keeps dormant holds on unused accounts persisted without
+    /// reporting a restore on every subsequent start.
+    pub fn opened_restored(&self, active_account: Option<Id>) -> Result<Option<Held>, Error> {
+        let needs_write = self.read(|connection| {
+            let has_legacy_to_expand = held_row(connection, HELD_SETTING)?.is_some()
+                && !service_accounts(connection)?.is_empty();
+            let has_unstamped: bool = connection.query_row(
+                "SELECT EXISTS (
+                   SELECT 1 FROM library_setting
+                   WHERE (key = ?1 OR (key >= ?2 AND key < ?3))
+                     AND json_extract(value_json, '$.sinceMs') IS NULL
+                 )",
+                (HELD_SETTING, HELD_PREFIX, HELD_PREFIX_END),
+                |row| row.get(0),
+            )?;
+            Ok(has_legacy_to_expand || has_unstamped)
+        })?;
+        if needs_write {
+            self.write(
+                WriteRequest {
+                    method: DELIVERY_METHOD,
+                    command: None,
+                    client: None,
+                },
+                |write| {
+                    expand_legacy_hold(write)?;
+                    write.connection().execute(
+                        "UPDATE library_setting
+                         SET value_json = json_set(value_json, '$.sinceMs', ?4), rev = ?5
+                         WHERE (key = ?1 OR (key >= ?2 AND key < ?3))
+                           AND json_extract(value_json, '$.sinceMs') IS NULL",
+                        (
+                            HELD_SETTING,
+                            HELD_PREFIX,
+                            HELD_PREFIX_END,
+                            write.now_ms(),
+                            write.rev(),
+                        ),
+                    )?;
+                    Ok(String::new())
+                },
+            )?;
         }
-        self.write(
-            WriteRequest {
-                method: DELIVERY_METHOD,
-                command: None,
-                client: None,
-            },
-            |write| {
-                write.connection().execute(
-                    "UPDATE library_setting
-                     SET value_json = json_set(value_json, '$.sinceMs', ?2), rev = ?3
-                     WHERE key = ?1 AND json_extract(value_json, '$.sinceMs') IS NULL",
-                    (HELD_SETTING, write.now_ms(), write.rev()),
-                )?;
-                Ok(String::new())
-            },
-        )?;
-        self.held_for_import()
+        match active_account {
+            Some(account) => self.held_for_import(account),
+            None if needs_write => self.any_held_for_import(),
+            None => Ok(None),
+        }
     }
 
-    /// An import from the account has run and brought back what the
-    /// service has: scrobbling is held back no longer. First, each play
-    /// still waiting that the service took after the backup, which the
-    /// import brought back at the very second it was to be sent with and
-    /// under the names it was to be sent with, is recorded as accepted, so
-    /// that the import joins its play as its echo and it is not sent again.
-    /// Whether scrobbling was held.
+    /// An import from `account` has run and brought back what the service
+    /// has: scrobbling for `account` is held back no longer (other accounts'
+    /// holds stay untouched). First, pending deliveries and unplanned listens
+    /// for `account` within `SEND_WITHIN_MS` of the backup are matched
+    /// 1-to-1 against active, non-excluded returning imports so every matched
+    /// play is recorded as accepted and joins its echo without being sent
+    /// again. A bounded post-restore window is kept so late-arriving satellite
+    /// or deferred outbox listens still reconcile on ingest. Returns whether
+    /// `account` was held.
     pub fn release_hold(&self, account: Id) -> Result<bool, Error> {
         self.release_hold_with(account, None)
     }
@@ -809,10 +1612,10 @@ impl LibraryStore {
         if let Some(cancel) = &cancel {
             cancel.check()?;
         }
-        if self.held_for_import()?.is_none() {
+        if self.held_for_import(account)?.is_none() {
             return Ok(false);
         }
-        self.write_guarded(
+        let written = self.write_guarded(
             WriteRequest {
                 method: DELIVERY_METHOD,
                 command: None,
@@ -820,69 +1623,275 @@ impl LibraryStore {
             },
             cancel,
             move |write| {
+                expand_legacy_hold(write)?;
                 let connection = write.connection();
-                let (endpoint, _) = endpoint_of(connection, account)?;
-                let waiting: Vec<(i64, i64, String, String)> = connection
+                let Some(held) = held_of(connection, account)? else {
+                    return Ok("0".to_owned());
+                };
+                let (endpoint, listener) = endpoint_of(connection, account)?;
+
+                // 1. Gather all pending deliveries (on primary listens) and
+                //    unplanned counted listens before mutating any row so
+                //    equal-second and edited-metadata plays match globally.
+                let waiting: Vec<(i64, i64, i64, String, String)> = connection
                     .prepare(
-                        "SELECT id, sent_timestamp_s, artist, title FROM history_delivery
-                         WHERE endpoint_id = ?1 AND state = 'pending'
-                         ORDER BY sent_timestamp_s, id",
+                        "SELECT d.id, d.attempts, d.sent_timestamp_s, d.artist, d.title
+                         FROM history_delivery d
+                         JOIN play_event_observation peo
+                           ON peo.observation_id = d.observation_id AND peo.role = 'primary'
+                         WHERE d.endpoint_id = ?1 AND d.state = 'pending'
+                           AND NOT EXISTS (
+                             SELECT 1 FROM play_event_observation x
+                             JOIN history_observation xo ON xo.id = x.observation_id
+                             WHERE x.play_event_id = peo.play_event_id
+                               AND xo.endpoint_id = ?1
+                           )
+                         ORDER BY d.sent_timestamp_s, d.id",
                     )?
                     .query_map([endpoint], |row| {
-                        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
                     })?
                     .collect::<Result<_, _>>()?;
-                for (delivery, seconds, artist, title) in waiting {
-                    // An import already part of a play some listen made is
-                    // that play's.
-                    let found: Vec<(String, String)> = connection
-                        .prepare_cached(
-                            "SELECT i.artist, i.title FROM observation_import i
-                             JOIN history_observation o ON o.id = i.observation_id
-                             WHERE o.endpoint_id = ?1 AND i.played_at_utc_ms = ?2
-                               AND NOT EXISTS (
-                                 SELECT 1 FROM play_event_observation x
-                                 JOIN play_event_observation y
-                                   ON y.play_event_id = x.play_event_id
-                                 JOIN history_observation yo
-                                   ON yo.id = y.observation_id AND yo.kind = 'listen'
-                                 WHERE x.observation_id = i.observation_id)
-                             ORDER BY o.id",
-                        )?
-                        .query_map((endpoint, seconds * 1000), |row| {
-                            Ok((row.get(0)?, row.get(1)?))
-                        })?
-                        .collect::<Result<_, _>>()?;
-                    let Some((took_artist, took_title)) =
-                        found.into_iter().find(|(their_artist, their_title)| {
-                            same_track(&artist, &title, their_artist, their_title)
+
+                let mut candidates = Vec::with_capacity(waiting.len());
+                for (delivery, attempts, queued_s, queued_artist, queued_title) in waiting {
+                    let refresh = if attempts == 0 {
+                        current_play_snapshot(connection, delivery)?.filter(|current| {
+                            current.timestamp_s != queued_s
+                                || !same_track(
+                                    &current.artist,
+                                    &current.title,
+                                    &queued_artist,
+                                    &queued_title,
+                                )
                         })
-                    else {
-                        continue;
+                    } else {
+                        None
                     };
-                    connection
-                        .prepare_cached(
-                            "UPDATE history_delivery
-                             SET state = 'accepted', accepted_artist = ?2, accepted_title = ?3,
-                                 detail = ?4, next_attempt_at_ms = NULL, updated_at_ms = ?5,
-                                 rev = ?6
-                             WHERE id = ?1",
-                        )?
-                        .execute(rusqlite::params![
-                            delivery,
-                            took_artist,
-                            took_title,
-                            "the service had it already when the library was restored",
-                            write.now_ms(),
-                            write.rev(),
-                        ])?;
+                    candidates.push(ReconcileCandidate::Pending {
+                        delivery,
+                        queued_s,
+                        queued_artist,
+                        queued_title,
+                        refresh,
+                    });
+                }
+
+                let unplanned = unplanned_listens(
+                    connection,
+                    endpoint,
+                    listener,
+                    held.taken_at_ms.saturating_sub(SEND_WITHIN_MS),
+                    ClockScope::HubAgeOrWall,
+                )?;
+                candidates.extend(unplanned.into_iter().map(ReconcileCandidate::Unplanned));
+
+                // 2. Fetch active, non-excluded unmatched imports covering the
+                //    candidate time range and compute a maximum 1-to-1 matching.
+                let mut bounds: Option<(i64, i64)> = None;
+                let mut widen = |lo: i64, hi: i64| {
+                    bounds = Some(match bounds {
+                        Some((cur_lo, cur_hi)) => (cur_lo.min(lo), cur_hi.max(hi)),
+                        None => (lo, hi),
+                    });
+                };
+                for candidate in &candidates {
+                    match candidate {
+                        ReconcileCandidate::Pending {
+                            queued_s, refresh, ..
+                        } => {
+                            widen(*queued_s, *queued_s);
+                            if let Some(snapshot) = refresh {
+                                widen(snapshot.timestamp_s, snapshot.timestamp_s);
+                            }
+                        }
+                        ReconcileCandidate::Unplanned(listen) => {
+                            let play_s = listen.at_ms.div_euclid(1000);
+                            let tol =
+                                restore_tolerance_s(&listen.clock_basis, listen.time_precision_ms);
+                            widen(play_s.saturating_sub(tol), play_s.saturating_add(tol));
+                        }
+                    }
+                }
+
+                let mut touched = Vec::new();
+                if let Some((min_s, max_s)) = bounds {
+                    let imports = unmatched_imports_in(connection, endpoint, min_s, max_s)?;
+                    let mut by_second: BTreeMap<i64, Vec<usize>> = BTreeMap::new();
+                    for (idx, imp) in imports.iter().enumerate() {
+                        by_second.entry(imp.seconds).or_default().push(idx);
+                    }
+
+                    let edges: Vec<Vec<(usize, Option<Snapshot>)>> = candidates
+                        .iter()
+                        .map(|candidate| match candidate {
+                            ReconcileCandidate::Pending {
+                                queued_s,
+                                queued_artist,
+                                queued_title,
+                                refresh,
+                                ..
+                            } => {
+                                let mut adj = Vec::new();
+                                let mut seen_imp = BTreeSet::new();
+                                // Prefer refreshed current metadata first, then
+                                // fall back to the queued snapshot.
+                                if let Some(current) = refresh
+                                    && let Some(at_second) = by_second.get(&current.timestamp_s)
+                                {
+                                    for &imp_idx in at_second {
+                                        if let Some(imp) = imports.get(imp_idx)
+                                            && same_track(
+                                                &current.artist,
+                                                &current.title,
+                                                &imp.artist,
+                                                &imp.title,
+                                            )
+                                            && seen_imp.insert(imp_idx)
+                                        {
+                                            adj.push((imp_idx, Some(current.clone())));
+                                        }
+                                    }
+                                }
+                                if let Some(at_second) = by_second.get(queued_s) {
+                                    for &imp_idx in at_second {
+                                        if let Some(imp) = imports.get(imp_idx)
+                                            && same_track(
+                                                queued_artist,
+                                                queued_title,
+                                                &imp.artist,
+                                                &imp.title,
+                                            )
+                                            && seen_imp.insert(imp_idx)
+                                        {
+                                            adj.push((imp_idx, None));
+                                        }
+                                    }
+                                }
+                                adj
+                            }
+                            ReconcileCandidate::Unplanned(listen) => {
+                                let play_s = listen.at_ms.div_euclid(1000);
+                                let tol = restore_tolerance_s(
+                                    &listen.clock_basis,
+                                    listen.time_precision_ms,
+                                );
+                                let lo = play_s.saturating_sub(tol);
+                                let hi = play_s.saturating_add(tol);
+                                let mut matched: Vec<(u64, i64, usize)> = Vec::new();
+                                for (&sec, indices) in by_second.range(lo..=hi) {
+                                    for &imp_idx in indices {
+                                        if let Some(imp) = imports.get(imp_idx)
+                                            && same_track(
+                                                &listen.artist,
+                                                &listen.title,
+                                                &imp.artist,
+                                                &imp.title,
+                                            )
+                                        {
+                                            matched.push((
+                                                sec.abs_diff(play_s),
+                                                imp.observation,
+                                                imp_idx,
+                                            ));
+                                        }
+                                    }
+                                }
+                                matched.sort_unstable();
+                                matched
+                                    .into_iter()
+                                    .map(|(_, _, imp_idx)| (imp_idx, None))
+                                    .collect()
+                            }
+                        })
+                        .collect();
+
+                    let matched = match_reconcile_candidates(&edges);
+                    for (cand_idx, (imp_idx, chosen_refresh)) in matched {
+                        let (Some(candidate), Some(import)) =
+                            (candidates.get(cand_idx), imports.get(imp_idx))
+                        else {
+                            continue;
+                        };
+                        match candidate {
+                            ReconcileCandidate::Pending { delivery, .. } => {
+                                if let Some(current) = chosen_refresh {
+                                    connection
+                                        .prepare_cached(
+                                            "UPDATE history_delivery
+                                             SET state = 'accepted', sent_timestamp_s = ?2,
+                                                 artist = ?3, title = ?4, album = ?5,
+                                                 album_artist = ?6, track_number = ?7,
+                                                 duration_ms = ?8, accepted_artist = ?9,
+                                                 accepted_title = ?10, detail = ?11,
+                                                 next_attempt_at_ms = NULL, updated_at_ms = ?12,
+                                                 rev = ?13
+                                             WHERE id = ?1",
+                                        )?
+                                        .execute(rusqlite::params![
+                                            delivery,
+                                            current.timestamp_s,
+                                            current.artist,
+                                            current.title,
+                                            current.album,
+                                            current.album_artist,
+                                            current.track_number,
+                                            current.duration_ms,
+                                            import.artist,
+                                            import.title,
+                                            RESTORED_DETAIL,
+                                            write.now_ms(),
+                                            write.rev(),
+                                        ])?;
+                                } else {
+                                    connection
+                                        .prepare_cached(
+                                            "UPDATE history_delivery
+                                             SET state = 'accepted', accepted_artist = ?2,
+                                                 accepted_title = ?3, detail = ?4,
+                                                 next_attempt_at_ms = NULL, updated_at_ms = ?5,
+                                                 rev = ?6
+                                             WHERE id = ?1",
+                                        )?
+                                        .execute(rusqlite::params![
+                                            delivery,
+                                            import.artist,
+                                            import.title,
+                                            RESTORED_DETAIL,
+                                            write.now_ms(),
+                                            write.rev(),
+                                        ])?;
+                                }
+                                touched.push(*delivery);
+                            }
+                            ReconcileCandidate::Unplanned(listen) => {
+                                let delivery =
+                                    insert_reconciled_delivery(write, listen, endpoint, import)?;
+                                touched.push(delivery);
+                            }
+                        }
+                    }
+                }
+
+                for delivery in touched {
                     rederive_delivery(write, delivery)?;
                 }
-                connection.execute("DELETE FROM library_setting WHERE key = ?1", [HELD_SETTING])?;
-                Ok(String::new())
+
+                write.connection().execute(
+                    "DELETE FROM library_setting WHERE key = ?1",
+                    [held_key(account)],
+                )?;
+                record_restored_window(write, account, held.taken_at_ms)?;
+                Ok("1".to_owned())
             },
         )?;
-        Ok(true)
+        Ok(written.result_json == "1")
     }
 }
 

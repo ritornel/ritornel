@@ -144,6 +144,51 @@ pub(crate) fn restore(
     Ok(Some(player))
 }
 
+/// Delivers due staged listens from `server.db`'s outbox into `library`
+/// synchronously during startup. Used when starting on a restored library so
+/// crashed or queued local listens are already in history before a Last.fm
+/// import can release the restore hold.
+pub(crate) fn deliver_startup_outbox(
+    server: &ServerStore,
+    library: &LibraryStore,
+    clock: &dyn Clock,
+    run_id: Id,
+) {
+    let stamps = || stamps(clock, run_id);
+    loop {
+        match deliver_listens(server, library, clock, &stamps, &|| Ok(())) {
+            Ok(done) => {
+                if !done.delivered.is_empty() {
+                    info!(
+                        delivered = done.delivered.len(),
+                        duplicates = done.duplicates,
+                        "staged listens delivered to history before restore reconciliation"
+                    );
+                }
+                for (listen, problem) in &done.failed {
+                    warn!(
+                        listen = %listen,
+                        error = %problem,
+                        "staged listen could not be delivered before restore reconciliation"
+                    );
+                }
+                if done.delivered.is_empty()
+                    || done.next_due_ms.is_none_or(|due| due > clock.now_ms())
+                {
+                    break;
+                }
+            }
+            Err(failed) => {
+                warn!(
+                    error = %failed,
+                    "staged listens could not be delivered before restore reconciliation"
+                );
+                break;
+            }
+        }
+    }
+}
+
 /// How long the thread that pulls masters waits when nothing wakes it.
 /// Every call and tick that leaves the player waiting wakes it, so this is
 /// only a fallback.
@@ -344,5 +389,199 @@ fn deliver(core: &Core, stop: &AtomicBool, run_id: Id, fail_after_ingest: bool) 
             None => IDLE,
         };
         core.deliveries().wait(wait);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use ritornel_engine::{Id, LibraryStore, OsEntropy, ServerStore, WriteRequest};
+
+    use super::deliver_startup_outbox;
+    use crate::testing::{Scratch, SetClock};
+
+    #[test]
+    fn deliver_startup_outbox_drains_due_local_outbox_rows_synchronously() {
+        let t0 = 1_794_776_400_000_i64;
+        let scratch = Scratch::new();
+        let server_path = scratch.path().join("server.db");
+        let library_path = scratch.path().join("library.db");
+        let clock = Arc::new(SetClock::at(t0));
+        let entropy = Arc::new(OsEntropy);
+        let server = ServerStore::open(&server_path, clock.clone(), entropy.clone()).unwrap();
+        let (identity, _) = server.ensure_identity("desk").unwrap();
+        let (library, _) = LibraryStore::create(
+            &library_path,
+            &identity,
+            WriteRequest {
+                method: "library.create",
+                command: None,
+                client: None,
+            },
+            |_| String::new(),
+            clock.clone(),
+            entropy.clone(),
+        )
+        .unwrap();
+        let listener = library.default_listener().unwrap().unwrap();
+        let account = library.ensure_service_account("lastfm", "someone").unwrap();
+
+        // Seed one track in `library.db` so the staged listen resolves cleanly.
+        let app_id = Id::from_bytes([0x11; 16]);
+        let asset_id = Id::from_bytes([0x12; 16]);
+        let item_id = Id::from_bytes([0x13; 16]);
+        let listen_id = Id::from_bytes([0x14; 16]);
+        let old_boot = Id::from_bytes([0x15; 16]);
+        drop(library);
+        {
+            let lib = rusqlite::Connection::open(&library_path).unwrap();
+            lib.execute(
+                "INSERT INTO library_root (public_id, server_id, name, kind, created_at_ms, rev)
+                 VALUES (?1, (SELECT id FROM server WHERE public_id = ?2), 'music', 'master', 0, 1)",
+                (Id::from_bytes([0x21; 16]).as_bytes(), identity.server_id.as_bytes()),
+            )
+            .unwrap();
+            let root = lib.last_insert_rowid();
+            lib.execute(
+                "INSERT INTO source_instance (public_id, kind, name, root_id, created_at_ms, rev)
+                 VALUES (?1, 'folder', 'music', ?2, 0, 1)",
+                (Id::from_bytes([0x22; 16]).as_bytes(), root),
+            )
+            .unwrap();
+            let source = lib.last_insert_rowid();
+            lib.execute(
+                "INSERT INTO artist_credit (display_text, rev) VALUES ('Moss Arcade', 1)",
+                [],
+            )
+            .unwrap();
+            let credit = lib.last_insert_rowid();
+            lib.execute(
+                "INSERT INTO release_group (public_id, rev) VALUES (?1, 1)",
+                [Id::from_bytes([0x23; 16]).as_bytes()],
+            )
+            .unwrap();
+            let group = lib.last_insert_rowid();
+            lib.execute(
+                "INSERT INTO release (id, public_id, release_group_id, canonical_id, display_title, rev)
+                 VALUES (1, ?1, ?2, 1, 'Tin Weather', 1)",
+                (Id::from_bytes([0x24; 16]).as_bytes(), group),
+            )
+            .unwrap();
+            lib.execute(
+                "INSERT INTO recording (id, public_id, canonical_id, display_title, display_artist_credit_id, rev)
+                 VALUES (1, ?1, 1, 'Paper Kites', ?2, 1)",
+                (Id::from_bytes([0x25; 16]).as_bytes(), credit),
+            )
+            .unwrap();
+            lib.execute(
+                "INSERT INTO track_appearance
+                   (id, public_id, recording_id, release_id, canonical_id, display_title,
+                    display_artist_credit_id, display_disc_number, display_track_number,
+                    display_duration_ms, rev)
+                 VALUES (1, ?1, 1, 1, 1, 'Paper Kites', ?2, 1, 1, 240000, 1)",
+                (app_id.as_bytes(), credit),
+            )
+            .unwrap();
+            lib.execute(
+                "INSERT INTO audio_asset
+                   (public_id, hash_scheme, audio_hash, codec, sample_rate_hz, channel_layout,
+                    bit_depth, lossless, duration_ms, rev)
+                 VALUES (?1, 1, ?2, 'flac', 44100, 'stereo', 16, 1, 240000, 1)",
+                (asset_id.as_bytes(), Id::from_bytes([0x26; 16]).as_bytes()),
+            )
+            .unwrap();
+            let asset = lib.last_insert_rowid();
+            lib.execute(
+                "INSERT INTO source_item
+                   (public_id, source_instance_id, item_kind, provider_key, size_bytes, mtime_ms,
+                    first_seen_at_ms, rev)
+                 VALUES (?1, ?2, 'file', '01.flac', 1000, 0, 0, 1)",
+                (item_id.as_bytes(), source),
+            )
+            .unwrap();
+            let item = lib.last_insert_rowid();
+            lib.execute(
+                "INSERT INTO source_item_revision
+                   (source_item_id, revision_no, payload_hash, payload_json, audio_asset_id,
+                    observed_at_ms, rev)
+                 VALUES (?1, 1, ?2, '{}', ?3, 0, 1)",
+                (item, Id::from_bytes([0x27; 16]).as_bytes(), asset),
+            )
+            .unwrap();
+            let revision = lib.last_insert_rowid();
+            lib.execute(
+                "UPDATE source_item SET current_revision_id = ?2, current_recording_id = 1
+                 WHERE id = ?1",
+                (item, revision),
+            )
+            .unwrap();
+            lib.execute(
+                "INSERT INTO identity_decision
+                   (action, source_item_id, method, resolver_version, normalizer_version,
+                    evidence_json, actor_kind, decided_at_ms, rev)
+                 VALUES ('bind', ?1, 'new', 1, 1, '{}', 'resolver', 0, 1)",
+                [item],
+            )
+            .unwrap();
+            let decision = lib.last_insert_rowid();
+            lib.execute(
+                "INSERT INTO assignment
+                   (source_item_id, recording_id, appearance_id, decision_id, effective_from_ms, rev)
+                 VALUES (?1, 1, 1, ?2, 0, 1)",
+                (item, decision),
+            )
+            .unwrap();
+        }
+        // Mark the library copy as backed up (creates per-account hold).
+        assert!(ritornel_engine::backup::hold_sending(&library_path, t0).unwrap());
+
+        // Stage an open listen in `server.db`, as a backup taken mid-playback holds.
+        drop(server);
+        {
+            let srv = rusqlite::Connection::open(&server_path).unwrap();
+            srv.execute(
+                "INSERT INTO listen_staging (
+                   listen_id, queue_entry_pid, listener_pid, played_on_server_pid,
+                   appearance_pid, asset_pid, copy_kind, source_item_pid,
+                   source_revision_no, started_at_utc_ms, zone_name, started_mono_ms,
+                   boot_id, start_reason, continues_listen_id, start_position_ms,
+                   track_duration_ms, ms_played, heard_ranges_json, max_position_ms,
+                   context_kind, shuffle, checkpoint_position_ms, checkpoint_at_ms,
+                   checkpoint_mono_ms, end_position_ms, end_reason, ended_at_utc_ms,
+                   ended_mono_ms)
+                 VALUES (?1, NULL, ?2, ?3, ?4, ?5, 'master', ?6, 1, ?7, 'America/New_York',
+                   1000, ?8, 'user_pick', NULL, 0, 240000, 180000, '[[0,180000]]', 180000,
+                   'album', 0, 180000, ?9, NULL, NULL, NULL, NULL, NULL)",
+                rusqlite::params![
+                    listen_id.as_bytes(),
+                    listener.as_bytes(),
+                    identity.server_id.as_bytes(),
+                    app_id.as_bytes(),
+                    asset_id.as_bytes(),
+                    item_id.as_bytes(),
+                    t0 - 180_000,
+                    old_boot.as_bytes(),
+                    t0,
+                ],
+            )
+            .unwrap();
+        }
+
+        // Reopen both stores as startup does: close crashed listens and drain
+        // synchronously before workers start.
+        clock.set(t0 + 60_000);
+        let server = ServerStore::open(&server_path, clock.clone(), entropy.clone()).unwrap();
+        let library =
+            LibraryStore::open(&library_path, identity.server_id, clock.clone(), entropy).unwrap();
+        assert!(library.opened_restored(Some(account)).unwrap().is_some());
+        assert_eq!(server.close_crashed_listens().unwrap(), [listen_id]);
+        assert_eq!(server.undelivered_listens().unwrap(), 1);
+
+        deliver_startup_outbox(&server, &library, &*clock, Id::from_bytes([0x99; 16]));
+
+        assert_eq!(server.undelivered_listens().unwrap(), 0);
+        let recent = library.recent_plays(listener, 10, None).unwrap();
+        assert_eq!(recent.len(), 1);
     }
 }

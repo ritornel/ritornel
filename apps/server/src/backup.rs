@@ -77,13 +77,11 @@ To look inside without changing anything: sqlite3 -readonly library.db
     )
 }
 
-/// What the README adds when the library copied had plays waiting to be
-/// sent to Last.fm.
+/// What the README adds when the library copied has a Last.fm account.
 const HELD: &str = "
-This library had plays waiting to be sent to Last.fm. A server started on
-it scrobbles nothing to Last.fm until it has imported from there, which it
-does by itself: Last.fm may already have taken some of them after the
-backup was taken.
+This library has a Last.fm account. A server started on it scrobbles nothing
+to Last.fm until that account has imported from there, which it does by
+itself: Last.fm may already have taken plays after the backup was taken.
 ";
 
 /// A backup that could not be taken.
@@ -664,18 +662,61 @@ mod tests {
         );
         let place = elsewhere(&scratch);
         let taken = backup(&dir, &place, About::default()).unwrap();
-        // With nothing waiting to be sent there is nothing to hold back:
-        // which copy is held, when something waits, is the engine's to test.
-        assert_eq!(open(&dir.library_db()).held_for_import().unwrap(), None);
+        // With no service accounts there is nothing to hold back.
+        assert_eq!(open(&dir.library_db()).any_held_for_import().unwrap(), None);
         assert_eq!(
             open(&taken.path.join("library.db"))
-                .held_for_import()
+                .any_held_for_import()
                 .unwrap(),
             None
         );
         let readme = std::fs::read_to_string(taken.path.join("README.txt")).unwrap();
         // Nor does its README say scrobbling waits.
         assert!(!readme.contains("scrobbles nothing"), "{readme}");
+    }
+
+    #[test]
+    fn a_backup_of_a_library_with_accounts_holds_each_even_without_pending_deliveries() {
+        use ritornel_engine::{LibraryStore, WriteRequest};
+        let scratch = Scratch::new();
+        let dir = data(&scratch);
+        let store = ServerStore::open(&dir.server_db(), Arc::new(SystemClock), Arc::new(OsEntropy))
+            .unwrap();
+        let (identity, _) = store.ensure_identity("desk").unwrap();
+        let open = |path: &Path| {
+            LibraryStore::open(
+                path,
+                identity.server_id,
+                Arc::new(SystemClock),
+                Arc::new(OsEntropy),
+            )
+            .unwrap()
+        };
+        let (library, _) = LibraryStore::create(
+            &dir.library_db(),
+            &identity,
+            WriteRequest {
+                method: "library.create",
+                command: None,
+                client: None,
+            },
+            |_| String::new(),
+            Arc::new(SystemClock),
+            Arc::new(OsEntropy),
+        )
+        .unwrap();
+        let first = library.ensure_service_account("lastfm", "first").unwrap();
+        let second = library.ensure_service_account("lastfm", "second").unwrap();
+        drop(library);
+        let place = elsewhere(&scratch);
+        let taken = backup(&dir, &place, About::default()).unwrap();
+        // The live library is untouched; the backup holds every account.
+        assert_eq!(open(&dir.library_db()).any_held_for_import().unwrap(), None);
+        let copy = open(&taken.path.join("library.db"));
+        assert!(copy.held_for_import(first).unwrap().is_some());
+        assert!(copy.held_for_import(second).unwrap().is_some());
+        let readme = std::fs::read_to_string(taken.path.join("README.txt")).unwrap();
+        assert!(readme.contains("scrobbles nothing"), "{readme}");
     }
 
     #[test]

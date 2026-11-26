@@ -12,7 +12,7 @@ use ritornel_domain::streams::{Scrobble, Stream, kept, repeat_order};
 use rusqlite::{Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 
-use crate::history_store::{echo_of, zone_periods};
+use crate::history_store::{echo_candidates, zone_periods};
 use crate::import_store::{Scope, bind_in};
 use crate::library_store::Write;
 use crate::{Error, Id, LibraryStore, WriteRequest};
@@ -133,7 +133,7 @@ fn offered(
     while let Some(row) = rows.next()? {
         let observation: i64 = row.get(0)?;
         let (at_ms, artist, title): (i64, String, String) = (row.get(2)?, row.get(3)?, row.get(4)?);
-        if echo_of(connection, row.get(5)?, at_ms, &artist, &title)?.is_some() {
+        if !echo_candidates(connection, row.get(5)?, at_ms, &artist, &title)?.is_empty() {
             echoes += 1;
             continue;
         }

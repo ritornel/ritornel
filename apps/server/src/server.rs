@@ -210,7 +210,7 @@ impl Server {
             info!(requeued, "jobs that an earlier run left are queued again");
         }
 
-        if let Some(library) = &library {
+        let restored_held = if let Some(library) = &library {
             history_rule(library, &steps)?;
             corrections_rule(library)?;
             // A scrobble a dead run was sending may have arrived: it is
@@ -224,14 +224,22 @@ impl Server {
             }
             // A library put back from a backup: what Last.fm took after it
             // is not known until an import has run.
-            if let Some(held) = library.opened_restored()? {
+            let active_account = store
+                .service_session("lastfm")?
+                .map(|session| session.account);
+            if let Some(held) = library.opened_restored(active_account)? {
                 info!(
                     backup_taken_at = %crate::logs::utc(held.taken_at_ms),
                     "the library was restored from a backup: nothing is scrobbled until an \
                      import from Last.fm has run"
                 );
+                true
+            } else {
+                false
             }
-        }
+        } else {
+            false
+        };
         let player = playback::restore(
             &store,
             library.as_ref(),
@@ -241,6 +249,14 @@ impl Server {
             &clock,
             &entropy,
         )?;
+        // Drain local staged/outbox listens into a restored library before
+        // background workers start so Last.fm restore reconciliation sees them.
+        if restored_held
+            && !run.playback.fail_after_ingest
+            && let Some(library) = &library
+        {
+            playback::deliver_startup_outbox(&store, library, &*clock, boot_id);
+        }
 
         let listener = listener::bind(listen).await?;
         let stores = Stores::new(store, library);
