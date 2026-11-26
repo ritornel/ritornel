@@ -88,6 +88,63 @@ pub(crate) fn start() {
     watch_scrolls();
 }
 
+/// The accent chosen in System Settings › Appearance, read now and again
+/// whenever AppKit says the system's colours have changed. Multicolor, the
+/// first choice there, leaves each app its own accent, as Apple's guidance
+/// asks: the system then writes no `AppleAccentColor`, and the app keeps its
+/// own.
+pub(crate) fn accents(_cx: &gpui::App) -> super::Accents {
+    let (sender, readings) = futures::channel::mpsc::unbounded();
+    let first = sender.clone();
+    let changed = block2::RcBlock::new(
+        move |_: std::ptr::NonNull<objc2_foundation::NSNotification>| {
+            let _ = sender.unbounded_send(accent());
+        },
+    );
+    let center = objc2_foundation::NSNotificationCenter::defaultCenter();
+    // SAFETY: the name is AppKit's own constant, no object is named, and
+    // the main queue runs the block on the main thread, where the accent
+    // is read. The block owns what it holds, a sender that may go to any
+    // thread.
+    let observer = unsafe {
+        center.addObserverForName_object_queue_usingBlock(
+            Some(objc2_app_kit::NSSystemColorsDidChangeNotification),
+            None,
+            Some(&objc2_foundation::NSOperationQueue::mainQueue()),
+            &changed,
+        )
+    };
+    // Read once watched, so no change is missed between the two.
+    let _ = first.unbounded_send(accent());
+    super::Accents::new(readings, Observer(observer))
+}
+
+/// An observer of the notification centre's, removed when let go.
+struct Observer(Retained<objc2::runtime::ProtocolObject<dyn objc2_foundation::NSObjectProtocol>>);
+
+impl Drop for Observer {
+    fn drop(&mut self) {
+        // SAFETY: the observer is the one the centre gave back for a block.
+        unsafe {
+            objc2_foundation::NSNotificationCenter::defaultCenter().removeObserver(self.0.as_ref());
+        }
+    }
+}
+
+/// The accent the system names, in sRGB, or `None` for Multicolor.
+fn accent() -> Option<gpui::Rgba> {
+    let defaults = objc2_foundation::NSUserDefaults::standardUserDefaults();
+    defaults.objectForKey(objc2_foundation::ns_string!("AppleAccentColor"))?;
+    let color = objc2_app_kit::NSColor::controlAccentColor()
+        .colorUsingColorSpace(&objc2_app_kit::NSColorSpace::sRGBColorSpace())?;
+    Some(gpui::Rgba {
+        r: color.redComponent() as f32,
+        g: color.greenComponent() as f32,
+        b: color.blueComponent() as f32,
+        a: 1.,
+    })
+}
+
 pub(crate) fn settings_dir() -> Option<PathBuf> {
     super::home().map(|home| home.join("Library/Application Support"))
 }

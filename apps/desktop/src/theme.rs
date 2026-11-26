@@ -1,10 +1,18 @@
 //! The desktop palettes ("Frame and navigation" in
 //! docs/internals/desktop.md): Graphite (dark) and Mist (light). The window
-//! follows the system's appearance; there is no switch.
+//! follows the system's appearance and accent; there is no switch yet.
+//!
+//! What the system says comes in through `follow` and `follow_accent`, and
+//! the tokens are worked out from it there, once, not as each is drawn. A
+//! choice made in the app's own settings would come in the same way, in
+//! place of the system's.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use gpui::{Hsla, Rgba, WindowAppearance, hsla, rgba};
+
+use crate::accent::{self, Look};
 
 static DARK: AtomicBool = AtomicBool::new(true);
 
@@ -27,8 +35,11 @@ pub(crate) fn dark() -> bool {
     DARK.load(Ordering::Relaxed)
 }
 
-/// The token for this appearance: dark first, light second.
-fn pick(dark: u32, light: u32) -> Rgba {
+/// A token: dark first, light second, as `0xrrggbbaa`.
+type Token = (u32, u32);
+
+/// The token for this appearance.
+fn pick((dark, light): Token) -> Rgba {
     if self::dark() {
         rgba(dark)
     } else {
@@ -36,47 +47,128 @@ fn pick(dark: u32, light: u32) -> Rgba {
     }
 }
 
+const BG: Token = (0x1b1c1fff, 0xf7f8faff);
+const BAR_BG: Token = (0x202125ff, 0xf1f3f6ff);
+const SURF: Token = (0x232428ff, 0xedeff3ff);
+const RAISED: Token = (0x2d2e33ff, 0xffffffff);
+/// The app's own accent, where the system leaves it one.
+const ACC: Token = (0x8fb4d9ff, 0x5a61d6ff);
+
 pub(crate) fn bg() -> Rgba {
-    pick(0x1b1c1fff, 0xf7f8faff)
+    pick(BG)
 }
 pub(crate) fn bar_bg() -> Rgba {
-    pick(0x202125ff, 0xf1f3f6ff)
+    pick(BAR_BG)
 }
 /// A surface over the page, as Up next's card is.
 pub(crate) fn surf() -> Rgba {
-    pick(0x232428ff, 0xedeff3ff)
+    pick(SURF)
 }
 pub(crate) fn raised() -> Rgba {
-    pick(0x2d2e33ff, 0xffffffff)
+    pick(RAISED)
 }
 pub(crate) fn fill() -> Rgba {
-    pick(0xffffff12, 0x1c22300f)
+    pick((0xffffff12, 0x1c22300f))
 }
 pub(crate) fn fill2() -> Rgba {
-    pick(0xffffff26, 0x1c223024)
+    pick((0xffffff26, 0x1c223024))
 }
 pub(crate) fn line() -> Rgba {
-    pick(0xffffff17, 0x1c22301a)
+    pick((0xffffff17, 0x1c22301a))
 }
 pub(crate) fn ink() -> Rgba {
-    pick(0xe9e9ecff, 0x1c2230ff)
+    pick((0xe9e9ecff, 0x1c2230ff))
 }
 pub(crate) fn dim() -> Rgba {
-    pick(0xa8a9b0ff, 0x5a6273ff)
+    pick((0xa8a9b0ff, 0x5a6273ff))
 }
 pub(crate) fn faint() -> Rgba {
-    pick(0x8d8e97ff, 0x616979ff)
+    pick((0x8d8e97ff, 0x616979ff))
 }
 /// What went wrong: `--warn`.
 pub(crate) fn warn() -> Rgba {
-    pick(0xe59a6cff, 0xb4572aff)
+    pick((0xe59a6cff, 0xb4572aff))
 }
+/// What is lit: the system's accent as the palette wears it (`accent.rs`),
+/// or the app's own.
 pub(crate) fn acc() -> Rgba {
-    pick(0x8fb4d9ff, 0x5a61d6ff)
+    let [dark, light] = &ACCENT;
+    pick((dark.load(Ordering::Relaxed), light.load(Ordering::Relaxed)))
+}
+/// The system's accent as its own controls wear it, for the controls drawn
+/// to look like them (`settings/controls.rs`), darkened where their white
+/// knob would not show on it (`accent::control`): a Mac's blue where the
+/// system names none.
+pub(crate) fn system_accent() -> Rgba {
+    match SYSTEM_ACCENT.load(Ordering::Relaxed) {
+        NO_ACCENT => rgba(0x027affff),
+        accent => rgba(accent),
+    }
 }
 /// Under a large cover: `--cover-shadow`.
 pub(crate) fn cover_shadow() -> Rgba {
-    pick(0x00000061, 0x28261e38)
+    pick((0x00000061, 0x28261e38))
+}
+
+/// The share of the accent in a lit button's ground (`bar.rs`).
+pub(crate) const LIT_TINT: f32 = 0.14;
+
+/// The grounds the accent is read on, in each appearance.
+const DARK_LOOK: Look = Look {
+    lightness: 0.76,
+    chroma: 0.07,
+    toward: 1.,
+    grounds: &[BG.0, BAR_BG.0, SURF.0, RAISED.0],
+    tint: LIT_TINT,
+};
+const LIGHT_LOOK: Look = Look {
+    lightness: 0.55,
+    chroma: 0.18,
+    toward: 0.,
+    grounds: &[BG.1, BAR_BG.1, SURF.1, RAISED.1],
+    tint: LIT_TINT,
+};
+
+/// `acc`, worked out for each appearance as the accent changes.
+static ACCENT: [AtomicU32; 2] = [AtomicU32::new(ACC.0), AtomicU32::new(ACC.1)];
+/// `system_accent`, or `NO_ACCENT`.
+static SYSTEM_ACCENT: AtomicU32 = AtomicU32::new(NO_ACCENT);
+/// No colour is clear: the system's accents are opaque.
+const NO_ACCENT: u32 = 0;
+
+/// The accent for each appearance, dark first: `system`'s, or the app's own
+/// where the system names none.
+fn accents(system: Option<Rgba>) -> Token {
+    match system {
+        Some(system) => (
+            accent::hex(accent::derive(system, &DARK_LOOK)),
+            accent::hex(accent::derive(system, &LIGHT_LOOK)),
+        ),
+        None => ACC,
+    }
+}
+
+/// Follows the system's accent, `None` where it leaves the app its own;
+/// whether that changed the palette. `RITORNEL_GPUI_ACCENT=#rrggbb` or
+/// `none` holds one, for a developer's pictures, without changing the
+/// system's.
+pub(crate) fn follow_accent(system: Option<Rgba>) -> bool {
+    static HELD: OnceLock<Option<Option<Rgba>>> = OnceLock::new();
+    let held = HELD.get_or_init(|| {
+        std::env::var("RITORNEL_GPUI_ACCENT")
+            .ok()
+            .and_then(|value| accent::parse(&value))
+    });
+    let system = (*held).unwrap_or(system);
+    let (dark, light) = accents(system);
+    let control = system.map_or(NO_ACCENT, |system| accent::hex(accent::control(system)));
+    let [dark_acc, light_acc] = &ACCENT;
+    let changed = [
+        dark_acc.swap(dark, Ordering::Relaxed) != dark,
+        light_acc.swap(light, Ordering::Relaxed) != light,
+        SYSTEM_ACCENT.swap(control, Ordering::Relaxed) != control,
+    ];
+    changed.contains(&true)
 }
 
 /// `a` and `b` mixed, `t` of the way to `b`.
@@ -379,6 +471,27 @@ pub(crate) fn css_shadow(y: f32, blur: f32, color: impl Into<gpui::Hsla>) -> gpu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn with_no_system_accent_the_palette_keeps_its_own() {
+        assert_eq!(accents(None), ACC);
+    }
+
+    #[test]
+    fn a_system_accent_reads_on_every_ground_of_its_appearance() {
+        for system in [0xffc600ff, 0x007affff, 0xffffffff, 0x101010ff] {
+            let (dark, light) = accents(Some(rgba(system)));
+            for (accent, look) in [(dark, DARK_LOOK), (light, LIGHT_LOOK)] {
+                for ground in look.grounds {
+                    let ratio = accent::contrast(rgba(accent), rgba(*ground));
+                    assert!(ratio >= accent::CONTRAST, "{system:08x}: {ratio:.2}");
+                    let lit = mix(rgba(*ground), rgba(accent), LIT_TINT);
+                    let ratio = accent::contrast(rgba(accent), lit);
+                    assert!(ratio >= accent::CONTRAST, "{system:08x} lit: {ratio:.2}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn soft_cache_queues_evicted_images_until_unshared() {

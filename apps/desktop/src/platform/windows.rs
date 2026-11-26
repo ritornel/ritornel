@@ -22,6 +22,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
+use ::windows::Foundation::TypedEventHandler;
+use ::windows::UI::ViewManagement::{UIColorType, UISettings};
+use ::windows::core::IInspectable;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use ritornel_client::launch::Program;
 use windows_sys::Win32::Foundation::{
@@ -54,6 +57,61 @@ pub(crate) const CHROME: Chrome = Chrome {
     padding: (12., 0.),
     menu_bar: false,
 };
+
+/// The accent chosen in Settings › Personalization › Colors, as Windows'
+/// own apps read it, read now and again whenever the system's colours
+/// change. Windows tells of a change on a thread of its own.
+pub(crate) fn accents(_cx: &gpui::App) -> super::Accents {
+    let (sender, readings) = futures::channel::mpsc::unbounded();
+    let sender = std::sync::Arc::new(std::sync::Mutex::new(sender));
+    let Ok(settings) = UISettings::new() else {
+        return super::Accents::new(readings, ());
+    };
+    let changing = std::sync::Arc::clone(&sender);
+    let changed = TypedEventHandler::<UISettings, IInspectable>::new(move |settings, _| {
+        report(&changing, settings.ok().ok());
+        Ok(())
+    });
+    // Read once watched, so no change is missed between the two.
+    let token = settings.ColorValuesChanged(&changed).ok();
+    report(&sender, Some(&settings));
+    super::Accents::new(readings, token.map(|token| ColorWatch { settings, token }))
+}
+
+/// Sends the accent `settings` name. Each reading is sent before another is
+/// made, so a change's reading never arrives before an older one.
+fn report(
+    sender: &std::sync::Mutex<futures::channel::mpsc::UnboundedSender<Option<gpui::Rgba>>>,
+    settings: Option<&UISettings>,
+) {
+    if let Ok(sender) = sender.lock() {
+        let _ = sender.unbounded_send(settings.and_then(accent));
+    }
+}
+
+/// The system's colours, watched for a change until let go.
+struct ColorWatch {
+    settings: UISettings,
+    token: i64,
+}
+
+impl Drop for ColorWatch {
+    fn drop(&mut self) {
+        let _ = self.settings.RemoveColorValuesChanged(self.token);
+    }
+}
+
+/// The accent the system names, in sRGB.
+fn accent(settings: &UISettings) -> Option<gpui::Rgba> {
+    let color = settings.GetColorValue(UIColorType::Accent).ok()?;
+    let channel = |value: u8| f32::from(value) / 255.;
+    Some(gpui::Rgba {
+        r: channel(color.R),
+        g: channel(color.G),
+        b: channel(color.B),
+        a: 1.,
+    })
+}
 
 /// Windows' pages stop at their ends.
 pub(crate) const FEEL: Feel = Feel { rubber_band: false };

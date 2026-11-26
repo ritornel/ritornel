@@ -589,7 +589,7 @@ impl Render for PlayerBar {
                 .flex()
                 .items_center()
                 .justify_center()
-                .when(lit, |button| button.bg(accent_back(0.14)))
+                .when(lit, |button| button.bg(accent_back(theme::LIT_TINT)))
                 .child(
                     icon(name, 16., if lit { theme::acc() } else { theme::faint() })
                         .when(on, |icon| {
