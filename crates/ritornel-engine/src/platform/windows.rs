@@ -1,15 +1,16 @@
 //! Windows: the precise interrupt time, a boot ID made from the registry, a
-//! folder's volume and file index, and folders under a root held open so
-//! that no link on the way is followed. What the standard library cannot
-//! ask is in `ritornel-windows`.
+//! folder's volume and file index, and folders opened and listed relative
+//! to an open one. What the standard library cannot ask is in
+//! `ritornel-windows`.
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, Metadata};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use super::{Described, Kind};
+use ritornel_windows::folder::Open;
+
+use super::{Described, Kind, refused};
 use crate::Id;
-use crate::artist_pictures::refused;
 
 /// Milliseconds on the precise interrupt time, which only goes forward and
 /// counts through sleep, as `CLOCK_BOOTTIME` does. The tick count moves in
@@ -53,108 +54,108 @@ pub(crate) fn file_id(path: &Path, _metadata: &Metadata) -> Option<(u64, u64)> {
     ritornel_windows::file::id(path).ok()
 }
 
-// FILE_ATTRIBUTE_REPARSE_POINT: a symbolic link, a junction, or another
-// thing that sends the system elsewhere.
-const REPARSE_POINT: u32 = 0x400;
-// FILE_FLAG_OPEN_REPARSE_POINT and FILE_FLAG_BACKUP_SEMANTICS, which a
-// folder is opened with.
-const OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-const BACKUP_SEMANTICS: u32 = 0x0200_0000;
-
-/// A folder under a root, open, with every folder on the way to it from
-/// the root. Windows opens nothing relative to an open folder, so each is
-/// held instead: opened without following a link, refused if it is one or
-/// is not where its parent really is, and shared with no one who would
-/// delete it, so that while it is held it cannot be renamed, removed or
-/// replaced by a link. A path from the root then leads only through the
-/// folders that were checked.
+/// A folder, open. Folders are opened in it, and what is in it listed,
+/// described and opened, relative to its handle (`ritornel_windows::folder`,
+/// as `openat` does on Unix), never by a path from elsewhere: a folder
+/// above it that is renamed or replaced by a link or a junction meanwhile
+/// changes nothing reached through it.
 #[derive(Debug)]
-pub(crate) struct Folder {
-    /// The folder's path, from the root as it was given.
-    path: PathBuf,
-    /// Where the folder really is, in the `\\?\` form.
-    real: PathBuf,
-    /// The root and each folder from it, held open.
-    held: Vec<File>,
+pub(crate) struct Folder(File);
+
+/// The error for a link where a folder or the file should be: a link that
+/// is known to be one, never a check that could not be made.
+fn a_link() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::NotADirectory, "a link")
 }
 
-/// Holds the folder at `path` open, following it if it is a link only if
-/// `follow` says to.
-fn hold(path: &Path, follow: bool) -> std::io::Result<File> {
-    use std::os::windows::fs::OpenOptionsExt;
-    // FILE_TRAVERSE and FILE_READ_ATTRIBUTES: going through it counts as
-    // reading it, which sharing is checked for.
-    const TRAVERSE_AND_ATTRIBUTES: u32 = 0x20 | 0x80;
-    // FILE_SHARE_READ and FILE_SHARE_WRITE, and not FILE_SHARE_DELETE,
-    // which a rename needs as well.
-    const SHARE_BUT_DELETE: u32 = 0x1 | 0x2;
-    let flags = if follow {
-        BACKUP_SEMANTICS
-    } else {
-        BACKUP_SEMANTICS | OPEN_REPARSE_POINT
-    };
-    std::fs::OpenOptions::new()
-        .access_mode(TRAVERSE_AND_ATTRIBUTES)
-        .share_mode(SHARE_BUT_DELETE)
-        .custom_flags(flags)
-        .open(path)
+/// Whether `file` is a reparse point of any kind.
+fn is_reparse_point(file: &File) -> std::io::Result<bool> {
+    use std::os::windows::fs::MetadataExt;
+    // FILE_ATTRIBUTE_REPARSE_POINT.
+    Ok(file.metadata()?.file_attributes() & 0x400 != 0)
 }
 
-/// Opens the folders `dirs` under `root`, each held, none followed if it is
-/// a link, and each checked to be in the one before it. The root is
-/// followed, as it was given. A folder on the way that is a link, or is
-/// not a folder, is `NotADirectory`, as [`met_a_link`] says.
-pub(crate) fn open_folder(root: &Path, dirs: &[&str]) -> std::io::Result<Folder> {
-    let first = hold(root, true)?;
-    let mut real = ritornel_windows::file::final_path(&first)?;
-    let mut held = vec![first];
-    let mut path = root.to_owned();
-    for part in dirs {
-        path.push(part);
-        let dir = hold(&path, false)?;
-        let at = ritornel_windows::file::final_path(&dir)?;
-        if ritornel_windows::file::is_link(&dir)?
-            || !dir.metadata()?.is_dir()
-            || at.parent() != Some(real.as_path())
-        {
-            return Err(std::io::ErrorKind::NotADirectory.into());
-        }
-        real = at;
-        held.push(dir);
+/// `name` in `dir`, opened as `open` says without following it. A link is
+/// refused. Another reparse point, as a cloud file's placeholder is, is
+/// opened again as the file or folder it stands for, which must be the
+/// same one: anything else is taken for a link put there between the two.
+fn open_unfollowed(dir: &File, name: &OsStr, open: Open) -> std::io::Result<File> {
+    let file = ritornel_windows::folder::open_in(dir, name, open, false)?;
+    if !is_reparse_point(&file)? {
+        return Ok(file);
     }
-    Ok(Folder { path, real, held })
+    if ritornel_windows::file::is_link(&file)? {
+        return Err(a_link());
+    }
+    let real = ritornel_windows::folder::open_in(dir, name, open, true)?;
+    if ritornel_windows::file::id_of(&real)? != ritornel_windows::file::id_of(&file)? {
+        return Err(a_link());
+    }
+    Ok(real)
 }
 
 impl Folder {
-    /// Every entry in the folder, with what it is.
+    /// Opens the folder at `root`, following it if it is a link, as it was
+    /// given.
+    pub(crate) fn open_root(root: &Path) -> std::io::Result<Folder> {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_LIST_DIRECTORY, FILE_TRAVERSE, FILE_READ_ATTRIBUTES and
+        // SYNCHRONIZE, as `ritornel_windows::folder::Open::Folder` opens one;
+        // and FILE_FLAG_BACKUP_SEMANTICS, without which no folder opens.
+        let access = 0x1 | 0x20 | 0x80 | 0x0010_0000;
+        std::fs::OpenOptions::new()
+            .access_mode(access)
+            .custom_flags(0x0200_0000)
+            .open(root)
+            .map(Folder)
+    }
+
+    /// Opens the folders `dirs` in this one, each relative to the last and
+    /// none followed if it is a link: one that is a link, or is not a
+    /// folder, is `NotADirectory`, as [`met_a_link`] says.
+    pub(crate) fn open_folder(&self, dirs: &[&str]) -> std::io::Result<Folder> {
+        let mut dir = self.0.try_clone()?;
+        for part in dirs {
+            dir = open_unfollowed(&dir, OsStr::new(part), Open::Folder)?;
+        }
+        Ok(Folder(dir))
+    }
+
+    /// Which folder this is: its volume's serial number and its index on
+    /// the volume.
+    pub(crate) fn id(&self) -> Option<(u64, u64)> {
+        ritornel_windows::file::id_of(&self.0).ok()
+    }
+
+    /// Every entry in the folder, with what it is, read from its handle.
     pub(crate) fn list(&self) -> std::io::Result<Vec<(OsString, Kind)>> {
-        let mut entries = Vec::new();
-        for entry in std::fs::read_dir(&self.path)? {
-            let entry = entry?;
-            let kind = entry.file_type()?;
-            let kind = if kind.is_dir() {
-                Kind::Folder
-            } else if kind.is_symlink() {
-                Kind::Link
-            } else {
-                Kind::Other
-            };
-            entries.push((entry.file_name(), kind));
-        }
-        // A held folder cannot be removed, but one emptied may be made a
-        // link: what was listed then was not in it.
-        if let Some(dir) = self.held.last()
-            && ritornel_windows::file::is_link(dir)?
-        {
-            return Err(std::io::ErrorKind::NotADirectory.into());
-        }
-        Ok(entries)
+        Ok(ritornel_windows::folder::list(&self.0)?
+            .into_iter()
+            .map(|entry| {
+                let kind = if entry.is_folder() {
+                    Kind::Folder
+                } else if entry.is_link() {
+                    Kind::Link
+                } else {
+                    Kind::Other
+                };
+                (entry.name, kind)
+            })
+            .collect())
     }
 
     /// What the file `name` in the folder is, following it if it is a
-    /// link.
+    /// link, as `std::fs::metadata` would say. A link that leads round to
+    /// itself is a link, as on Unix.
     pub(crate) fn describe(&self, name: &OsStr) -> std::io::Result<Described> {
-        let metadata = std::fs::metadata(self.path.join(name))?;
+        // ERROR_CANT_RESOLVE_FILENAME.
+        const LOOP: i32 = 1921;
+        let file = ritornel_windows::folder::open_in(&self.0, name, Open::Attributes, true)
+            .map_err(|error| match error.raw_os_error() {
+                Some(LOOP) => a_link(),
+                _ => error,
+            })?;
+        let metadata = file.metadata()?;
         Ok(Described {
             is_file: metadata.is_file(),
             len: metadata.len(),
@@ -163,43 +164,24 @@ impl Folder {
     }
 
     /// Opens the file `name` in the folder, following it if it is a link
-    /// only if `follow` says to. The file is opened without following it
-    /// first, and must be in the folder where it really is, as its handle
-    /// says.
+    /// only if `follow` says to. A folder is refused.
     pub(crate) fn open(&self, name: &str, follow: bool) -> std::io::Result<File> {
-        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-        let path = self.path.join(name);
-        if std::fs::symlink_metadata(&path)?.is_dir() {
+        let name = OsStr::new(name);
+        let file = if follow {
+            ritornel_windows::folder::open_in(&self.0, name, Open::Read, true)?
+        } else {
+            open_unfollowed(&self.0, name, Open::Read)?
+        };
+        if file.metadata()?.is_dir() {
             return Err(refused("not a regular file"));
         }
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(OPEN_REPARSE_POINT)
-            .open(&path)?;
-        if ritornel_windows::file::final_path(&file)?.parent() != Some(self.real.as_path()) {
-            return Err(refused("a link"));
-        }
-        if file.metadata()?.file_attributes() & REPARSE_POINT == 0 {
-            return Ok(file);
-        }
-        // A link to a file, or a cloud file's placeholder, is followed from
-        // the folder that is held.
-        if follow {
-            return std::fs::File::open(&path);
-        }
-        Err(refused("a link"))
+        Ok(file)
     }
 }
 
-/// Opens `name` in the folders `dirs` under `root`: each folder on the way
-/// is held as [`open_folder`] holds it, and the file is opened without
-/// following a link, as on Unix.
-pub(crate) fn open_inside(root: &Path, dirs: &[&str], name: &str) -> std::io::Result<File> {
-    open_folder(root, dirs)?.open(name, false)
-}
-
-/// Whether [`open_inside`] failed on a link where a folder or the file
-/// should be: a folder on the way that is not one.
+/// Whether opening failed on a link where a folder or the file should be,
+/// or on a file where a folder should be: what [`Folder::open_folder`] says
+/// of a link it does not follow.
 pub(crate) fn met_a_link(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::NotADirectory
 }
@@ -219,12 +201,15 @@ pub(crate) fn link_file(target: &Path, link: &Path) {
 }
 
 /// Makes `link` a junction to the folder `target`, which anyone may make.
+/// `mklink` takes a `/` for the start of a switch, so each path is written
+/// again with `\` between its parts.
 #[cfg(test)]
 pub(crate) fn link_folder(target: &Path, link: &Path) {
+    let backslashed = |path: &Path| path.components().collect::<std::path::PathBuf>();
     let done = std::process::Command::new("cmd")
         .args(["/C", "mklink", "/J"])
-        .arg(link)
-        .arg(target)
+        .arg(backslashed(link))
+        .arg(backslashed(target))
         .output()
         .unwrap();
     assert!(done.status.success(), "{done:?}");
@@ -290,31 +275,50 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_folder_held_open_and_each_above_it_cannot_be_renamed_until_let_go() {
+    fn a_folder_open_is_still_reached_after_it_or_its_root_is_renamed() {
         let scratch = crate::testing::Scratch::new();
-        let root = scratch.path();
+        let root = scratch.path().join("root");
         std::fs::create_dir_all(root.join("a/b")).unwrap();
-        let held = open_folder(root, &["a", "b"]).unwrap();
-        assert!(std::fs::rename(root.join("a/b"), root.join("a/moved")).is_err());
-        assert!(std::fs::rename(root.join("a"), root.join("moved")).is_err());
-        // What is in a held folder may still change.
         std::fs::write(root.join("a/b/01.flac"), b"12345").unwrap();
-        std::fs::remove_file(root.join("a/b/01.flac")).unwrap();
-        drop(held);
-        std::fs::rename(root.join("a"), root.join("moved")).unwrap();
+        let opened = Folder::open_root(&root).unwrap();
+        let held = opened.open_folder(&["a"]).unwrap();
+        // The root and the folder are renamed and others made at their
+        // paths: what was opened is still what is reached.
+        std::fs::rename(&root, scratch.path().join("moved")).unwrap();
+        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        let inner = held.open_folder(&["b"]).unwrap();
+        let names: Vec<OsString> = inner
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(names, ["01.flac"]);
+        assert!(inner.open("01.flac", false).is_ok());
+        let again = opened.open_folder(&["a", "b"]).unwrap();
+        assert_eq!(again.id(), inner.id());
     }
 
     #[test]
-    fn a_junction_on_the_way_is_not_a_folder() {
+    fn a_junction_on_the_way_is_a_link_and_a_folder_is_not() {
         let scratch = crate::testing::Scratch::new();
         let root = scratch.path().join("root");
         std::fs::create_dir_all(root.join("a")).unwrap();
         std::fs::create_dir_all(scratch.path().join("outside/b")).unwrap();
+        std::fs::write(scratch.path().join("outside/b/01.flac"), b"12345").unwrap();
         link_folder(&scratch.path().join("outside"), &root.join("a/link"));
-        let refused = open_folder(&root, &["a", "link", "b"]).unwrap_err();
-        assert!(met_a_link(&refused), "{refused:?}");
-        let refused = open_folder(&root, &["a", "link"]).unwrap_err();
-        assert!(met_a_link(&refused), "{refused:?}");
-        assert!(open_folder(&root, &["a"]).is_ok());
+        let root = Folder::open_root(&root).unwrap();
+        for dirs in [&["a", "link", "b"][..], &["a", "link"]] {
+            let refused = root.open_folder(dirs).unwrap_err();
+            assert!(met_a_link(&refused), "{refused:?}");
+        }
+        let folder = root.open_folder(&["a"]).unwrap();
+        assert_eq!(
+            folder.list().unwrap(),
+            [(OsString::from("link"), Kind::Link)]
+        );
+        // A file where a folder should be is not one either.
+        std::fs::write(scratch.path().join("root/a/file"), b"").unwrap();
+        assert!(met_a_link(&root.open_folder(&["a", "file"]).unwrap_err()));
     }
 }

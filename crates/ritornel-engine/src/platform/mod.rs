@@ -8,6 +8,9 @@
 //! The rest of `mod.rs` is pure: how each kernel writes the boot it is on,
 //! read by every system's tests.
 
+use std::fs::File;
+use std::path::Path;
+
 use crate::Id;
 
 #[cfg(unix)]
@@ -34,11 +37,22 @@ use windows as system;
 ))]
 use other_unix as system;
 
-pub(crate) use system::{
-    Folder, file_id, met_a_link, mono_ms, open_folder, open_inside, read_at, read_boot,
-};
+pub(crate) use system::{Folder, file_id, met_a_link, mono_ms, read_at, read_boot};
 #[cfg(test)]
 pub(crate) use system::{link_file, link_folder, mode_of, seal, set_listable};
+
+/// An error that says a folder holds something that may not be read.
+pub(crate) fn refused(why: &str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidInput, why.to_owned())
+}
+
+/// Opens `name` in the folders `dirs` under `root`, none of them nor the
+/// file followed if it is a link, as [`Folder`] opens them.
+pub(crate) fn open_inside(root: &Path, dirs: &[&str], name: &str) -> std::io::Result<File> {
+    Folder::open_root(root)?
+        .open_folder(dirs)?
+        .open(name, false)
+}
 
 /// What a folder's listing says one of its entries is, without following
 /// it.

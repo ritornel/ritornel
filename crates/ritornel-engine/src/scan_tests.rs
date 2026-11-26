@@ -1116,6 +1116,36 @@ fn a_folder_that_cannot_be_read_is_passed_over_and_its_files_are_not_taken_for_g
 }
 
 #[test]
+fn a_linked_file_the_walk_cannot_describe_is_not_taken_for_gone() {
+    use crate::platform::{link_file, set_listable};
+    let mut rig = Rig::new();
+    album(&mut rig);
+    // A file kept outside the root, linked from a folder inside it.
+    let kept = rig.scratch.path().join("kept");
+    rig.put_at(&kept.join("song.flac"), "a.flac");
+    std::fs::create_dir_all(rig.root().join("Linked")).unwrap();
+    link_file(
+        &kept.join("song.flac"),
+        &rig.root().join("Linked/song.flac"),
+    );
+    rig.put("Linked/beside.flac", "a.mp3");
+    assert_eq!(rig.scan().files, 7);
+
+    // Where the link leads can no longer be read. Where the system then
+    // says no, the folder is one that cannot be read; where it still
+    // describes the file, it is there. Either way nothing is missing.
+    set_listable(&kept, false);
+    let summary = rig.scan();
+    set_listable(&kept, true);
+    assert_eq!(summary.missing, 0);
+    assert_eq!(
+        rig.one("SELECT count(*) FROM source_item WHERE missing_since_ms IS NOT NULL"),
+        "0"
+    );
+    assert_eq!(rig.scan().unchanged, 7);
+}
+
+#[test]
 fn a_root_that_is_unreachable_or_empty_fails_the_scan_and_marks_nothing_missing() {
     let mut rig = Rig::new();
     album(&mut rig);

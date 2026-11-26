@@ -27,26 +27,46 @@ pub(crate) fn file_id(_path: &Path, metadata: &Metadata) -> Option<(u64, u64)> {
     Some((metadata.dev(), metadata.ino()))
 }
 
-/// A folder under a root, open. What is in it is listed, described and
-/// opened relative to the open folder, never by a path from the root, so
-/// a folder on the way that is replaced by a link meanwhile leads nowhere
-/// else.
+/// A folder, open. Folders are opened in it, and what is in it listed,
+/// described and opened, relative to the open folder, never by a path
+/// from elsewhere: a folder above it that is renamed or replaced by a link
+/// meanwhile changes nothing reached through it.
 #[derive(Debug)]
 pub(crate) struct Folder(OwnedFd);
 
-/// Opens the folders `dirs` under `root`, each from the last without
-/// following a link. The root is followed, as it was given.
-pub(crate) fn open_folder(root: &Path, dirs: &[&str]) -> std::io::Result<Folder> {
-    let into = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
-    let mut dir = open(root, into, Mode::empty())?;
-    for part in dirs {
-        dir = openat(&dir, *part, into | OFlags::NOFOLLOW, Mode::empty())?;
-    }
-    Ok(Folder(dir))
-}
+const INTO: OFlags = OFlags::RDONLY
+    .union(OFlags::DIRECTORY)
+    .union(OFlags::CLOEXEC);
 
 impl Folder {
-    /// Every entry in the folder but `.` and `..`, with what it is.
+    /// Opens the folder at `root`, following it if it is a link, as it was
+    /// given.
+    pub(crate) fn open_root(root: &Path) -> std::io::Result<Folder> {
+        Ok(Folder(open(root, INTO, Mode::empty())?))
+    }
+
+    /// Opens the folders `dirs` in this one, each from the last without
+    /// following a link: one that is a link is `ELOOP` or `ENOTDIR`, as
+    /// [`met_a_link`] says, and so is one that is not a folder.
+    pub(crate) fn open_folder(&self, dirs: &[&str]) -> std::io::Result<Folder> {
+        let mut dir = self.0.try_clone()?;
+        for part in dirs {
+            dir = openat(&dir, *part, INTO | OFlags::NOFOLLOW, Mode::empty())?;
+        }
+        Ok(Folder(dir))
+    }
+
+    /// Which folder this is: its device and inode.
+    pub(crate) fn id(&self) -> Option<(u64, u64)> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = File::from(self.0.try_clone().ok()?).metadata().ok()?;
+        Some((metadata.dev(), metadata.ino()))
+    }
+
+    /// Every entry in the folder but `.` and `..`, with what it is. An
+    /// entry removed since the folder was read is left out; any other
+    /// failure to say what one is fails the listing, rather than a folder
+    /// being taken for a file.
     pub(crate) fn list(&self) -> std::io::Result<Vec<(OsString, Kind)>> {
         let mut entries = Vec::new();
         for entry in Dir::read_from(&self.0)? {
@@ -57,10 +77,11 @@ impl Folder {
             }
             // Some file systems leave the kind out of a listing.
             let kind = match entry.file_type() {
-                FileType::Unknown => statat(&self.0, name, AtFlags::SYMLINK_NOFOLLOW)
-                    .map_or(FileType::Unknown, |stat| {
-                        FileType::from_raw_mode(stat.st_mode)
-                    }),
+                FileType::Unknown => match statat(&self.0, name, AtFlags::SYMLINK_NOFOLLOW) {
+                    Ok(stat) => FileType::from_raw_mode(stat.st_mode),
+                    Err(rustix::io::Errno::NOENT) => continue,
+                    Err(error) => return Err(error.into()),
+                },
                 kind => kind,
             };
             let kind = match kind {
@@ -108,15 +129,9 @@ impl Folder {
     }
 }
 
-/// Opens `name` in the folders `dirs` under `root`. Each part is opened
-/// from the last without following a link, and the file without waiting,
-/// so a pipe cannot hold the read up.
-pub(crate) fn open_inside(root: &Path, dirs: &[&str], name: &str) -> std::io::Result<File> {
-    open_folder(root, dirs)?.open(name, false)
-}
-
-/// Whether [`open_inside`] failed on a link where a folder or the file
-/// should be.
+/// Whether opening failed on a link where a folder or the file should be,
+/// or on a file where a folder should be: what [`Folder::open_folder`] and
+/// [`Folder::open`] say of a link they do not follow.
 pub(crate) fn met_a_link(error: &std::io::Error) -> bool {
     [rustix::io::Errno::LOOP, rustix::io::Errno::NOTDIR]
         .iter()

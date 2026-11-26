@@ -24,6 +24,12 @@ pub fn id(path: &Path) -> io::Result<(u64, u64)> {
         .access_mode(FILE_READ_ATTRIBUTES)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
         .open(path)?;
+    id_of(&file)
+}
+
+/// Which file or folder `file` is open on, as [`id`] says of a path. The
+/// handle must be open to read attributes.
+pub fn id_of(file: &File) -> io::Result<(u64, u64)> {
     // SAFETY: plain data, for which all zeroes is valid.
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: the handle is open for the call and `info` is written by it.
@@ -66,10 +72,13 @@ pub fn final_path(file: &File) -> io::Result<PathBuf> {
 /// Whether `file`, opened without following it, is a link: a symbolic link,
 /// a junction, or another reparse point that names somewhere else (a name
 /// surrogate). A reparse point that does not, as a cloud file's placeholder
-/// is, is the file or folder itself.
+/// is, is the file or folder itself. A file system without reparse points,
+/// as FAT and exFAT are, has no links, and is not asked for a tag.
 pub fn is_link(file: &File) -> io::Result<bool> {
-    // IsReparseTagNameSurrogate: bit 29 of the tag.
-    const NAME_SURROGATE: u32 = 0x2000_0000;
+    use std::os::windows::fs::MetadataExt;
+    if file.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+        return Ok(false);
+    }
     // SAFETY: plain data, for which all zeroes is valid.
     let mut info: FILE_ATTRIBUTE_TAG_INFO = unsafe { std::mem::zeroed() };
     let size = u32::try_from(std::mem::size_of::<FILE_ATTRIBUTE_TAG_INFO>()).unwrap_or(u32::MAX);
@@ -86,8 +95,13 @@ pub fn is_link(file: &File) -> io::Result<bool> {
     if ok == 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
-        && info.ReparseTag & NAME_SURROGATE != 0)
+    Ok(info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 && names_elsewhere(info.ReparseTag))
+}
+
+/// Whether a reparse tag names somewhere else (`IsReparseTagNameSurrogate`:
+/// bit 29 of the tag), as a symbolic link's and a junction's do.
+pub fn names_elsewhere(tag: u32) -> bool {
+    tag & 0x2000_0000 != 0
 }
 
 /// The bytes this user may still write on the disk that holds `path`.
