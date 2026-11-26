@@ -145,6 +145,7 @@ pub(crate) mod tests {
         job.kind = "lastfm.sync".into();
         job.scan = None;
         let running = render(&JobDetail {
+            artifacts: Vec::new(),
             job: Job {
                 state: JobState::Running,
                 ..job.clone()
@@ -161,6 +162,7 @@ pub(crate) mod tests {
             ..Default::default()
         });
         let text = render(&JobDetail {
+            artifacts: Vec::new(),
             job,
             failed_items: vec![],
         });
@@ -212,6 +214,7 @@ pub(crate) mod tests {
     #[test]
     fn a_job_is_shown_with_what_its_scan_found_and_what_failed() {
         let detail = JobDetail {
+            artifacts: Vec::new(),
             job: job(),
             failed_items: vec![JobItem {
                 item: "Elsewhere/broken.m4a".to_owned(),

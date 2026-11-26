@@ -50,6 +50,9 @@ pub(crate) fn serve(args: &ServeArgs, env: Env<'_>, out: &mut dyn Write) -> Resu
         backup_dir: args.backup_dir.clone(),
         name: args.name.clone(),
         cache_size: args.cache_size.clone(),
+        transcode_workers: args.transcode_workers.clone(),
+        transcode_cache_size: args.transcode_cache_size.clone(),
+        transcode_profiles: args.transcode_profiles.clone(),
     };
     let settings = config::load(held.dir().root(), &flags, env)?;
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
@@ -90,6 +93,7 @@ pub(crate) fn serve(args: &ServeArgs, env: Env<'_>, out: &mut dyn Write) -> Resu
             .and_then(|name| name.to_str().map(str::to_owned))
             .or_else(crate::platform::computer_name),
         name: settings.name.clone(),
+        transcode: settings.transcode.clone(),
         cache_bytes: settings.cache_bytes,
         audio_pace: None,
         log_level: Some(settings.log_level),

@@ -55,6 +55,8 @@ mod list;
 pub mod local;
 mod media;
 pub mod methods;
+pub mod transcode;
+pub use transcode::{JobStarted, TranscodeParams, TranscodePruneParams};
 mod pages;
 mod platform;
 mod playback;
@@ -163,7 +165,7 @@ pub use ticket::{SocketTicket, TICKET_PARAM};
 /// one contract. A server refuses a client whose number is not its own,
 /// and a satellite refuses a hub of another ("Session and frames" in
 /// docs/internals/contract.md).
-pub const CONTRACT_VERSION: u32 = 4;
+pub const CONTRACT_VERSION: u32 = 5;
 
 /// The capability flags a server may list in its descriptor.
 pub mod capability {
@@ -227,6 +229,12 @@ pub mod route {
     /// {sourceItemId}/{revision}` under this prefix, as `link.copies` names
     /// it. Only a link session reads it, with its token in the header.
     pub const AUDIO: &str = "/v1/audio";
+
+    /// An encoded audio derivative, addressed by key and read with a link session.
+    pub const CACHE_DERIVATIVE: &str = "/v1/cache/derivative";
+
+    /// A packaged artifact, addressed by key and read with a link session.
+    pub const CACHE_PACKAGED: &str = "/v1/cache/packaged";
 
     /// Whether the server is up: a [`Health`]. It needs a credential.
     pub const HEALTH: &str = "/v1/health";

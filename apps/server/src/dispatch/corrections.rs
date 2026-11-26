@@ -1182,6 +1182,7 @@ mod tests {
             let job = ritornel_engine::NewJob {
                 kind: "scan",
                 dedupe_key: "main".to_owned(),
+                target_kind: "source",
                 target: id(0x51),
                 params_json: "{}".to_owned(),
                 session: None,

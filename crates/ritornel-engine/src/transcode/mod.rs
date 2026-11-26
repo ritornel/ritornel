@@ -8,8 +8,9 @@ pub use package::{Artwork, Codec, Package, PackageSource, Tags};
 mod pool;
 pub use pool::{
     Batch, BatchItem, BatchProgress, Cover, Encoding, Master, PackageAudio, Packaging,
-    TranscodePool,
+    TranscodePool, Transfer,
 };
+
 mod profile;
 mod selection;
 
@@ -230,6 +231,51 @@ fn publish(stage: tempfile::NamedTempFile, output: &Path, cancel: &AtomicBool) -
     check_cancel(cancel)?;
     stage.persist_noclobber(output)?;
     Ok(())
+}
+
+impl crate::LibraryStore {
+    /// The highest-ranked local lossless copy, restricted to FLAC for pass-through.
+    pub fn transcode_master(
+        &self,
+        appearance: crate::Id,
+        server: crate::Id,
+        roots: &std::collections::HashMap<String, std::path::PathBuf>,
+        flac_only: bool,
+    ) -> Result<Option<Master>, crate::Error> {
+        use crate::playback::Catalog;
+        use rusqlite::OptionalExtension;
+        for copy in Catalog::copies(self, appearance, server)? {
+            let Some(path) = copy.path(roots) else {
+                continue;
+            };
+            let asset = self.read(|db| {
+                let sql = "SELECT hash_scheme, audio_hash FROM audio_asset
+                           WHERE public_id = ?1 AND lossless = 1 AND (?2 = 0 OR codec = 'flac')";
+                Ok(db
+                    .query_row(
+                        sql,
+                        rusqlite::params![copy.asset().as_bytes(), flac_only],
+                        |row| {
+                            Ok(AudioAsset {
+                                scheme: row.get(0)?,
+                                hash: row.get::<_, [u8; 32]>(1)?.into(),
+                            })
+                        },
+                    )
+                    .optional()?)
+            })?;
+            if let Some(asset) = asset
+                && path.is_file()
+            {
+                return Ok(Some(Master {
+                    asset,
+                    path,
+                    facts: copy.facts(),
+                }));
+            }
+        }
+        Ok(None)
+    }
 }
 
 #[cfg(test)]

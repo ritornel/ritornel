@@ -219,6 +219,7 @@ impl Core {
         let new = NewJob {
             kind: "scan",
             dedupe_key: root.to_owned(),
+            target_kind: "source",
             target: source,
             params_json: params,
             // No one asked: the server started it.

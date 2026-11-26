@@ -68,7 +68,7 @@ pub use bounds::{
     Bounds, HEADER_WAIT, HUB_CALL_WAIT, MAX_CONNECTIONS, MAX_SESSIONS, STOP_GRACE, TICKET_LIFE,
 };
 pub use cli::run;
-pub use config::{ConfigError, Listen, Origin, Origins};
+pub use config::{ConfigError, Listen, Origin, Origins, TranscodeConfig};
 pub use data_dir::HeldDir;
 pub use error::{EXIT_FAILED, EXIT_IN_USE, EXIT_USAGE, Error};
 pub use jobs::Run;

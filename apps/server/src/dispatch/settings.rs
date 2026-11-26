@@ -24,7 +24,7 @@ pub(crate) struct StartUp {
 
 /// What gave a setting given as the server started: the default when
 /// nothing did.
-fn set_by(origin: Option<Origin>) -> SetBy {
+pub(super) fn set_by(origin: Option<Origin>) -> SetBy {
     match origin {
         None => SetBy::Default,
         Some(Origin::Flag) => SetBy::Flag,
@@ -50,7 +50,7 @@ impl Core {
     }
 
     /// `server.settings`: this server's own, a satellite's included.
-    pub(super) fn server_settings(&self) -> ServerSettings {
+    pub(super) fn server_settings(&self, stores: &Stores) -> Result<ServerSettings, RpcError> {
         let start_up = self.start_up.get().copied().unwrap_or(StartUp {
             listen: Listen::DEFAULT,
             log_level: Level::INFO,
@@ -68,7 +68,8 @@ impl Core {
                 },
             }
         };
-        ServerSettings {
+        Ok(ServerSettings {
+            transcode: self.transcode_status(stores)?,
             name: Setting {
                 value: self.name(),
                 set_by: set_by(origins.name),
@@ -97,7 +98,7 @@ impl Core {
                     .map(|place| place.to_string_lossy().into_owned()),
                 set_by: set_by(origins.backup_dir),
             },
-        }
+        })
     }
 
     /// `server.setSettings`: the change and its receipt are kept in
@@ -141,7 +142,7 @@ impl Core {
                 status: ReceiptStatus::Done,
                 revision: None,
             },
-            settings: self.server_settings(),
+            settings: self.server_settings(stores)?,
         })
     }
 }

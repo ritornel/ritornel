@@ -220,6 +220,10 @@ pub struct NoParams {}
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct ServerStatus {
+    /// Encoder capabilities, effective profiles and cache usage on this server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub transcode: Option<crate::transcode::TranscodeStatus>,
     /// The server's ID.
     pub server_id: Id,
     /// The server's display name.
@@ -852,6 +856,7 @@ mod tests {
     #[test]
     fn a_status_leaves_out_what_the_system_would_not_say() {
         let mut status = ServerStatus {
+            transcode: None,
             server_id: Id::from_bytes([0x11; 16]),
             name: "desk".to_owned(),
             role: ServerRole::Hub,

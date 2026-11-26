@@ -1228,6 +1228,7 @@ mod enabled {
                             NewJob {
                                 kind: "lastfm.sync",
                                 dedupe_key: "someone".into(),
+                                target_kind: "account",
                                 target: id(2),
                                 params_json: "{}".into(),
                                 session: None,
@@ -1294,6 +1295,7 @@ mod enabled {
                             NewJob {
                                 kind: "lastfm.sync",
                                 dedupe_key: "someone".into(),
+                                target_kind: "account",
                                 target: id(2),
                                 params_json: "{}".into(),
                                 session: None,
@@ -1379,6 +1381,7 @@ mod enabled {
                             NewJob {
                                 kind: "lastfm.sync",
                                 dedupe_key: "someone".into(),
+                                target_kind: "account",
                                 target: id(2),
                                 params_json: "{}".into(),
                                 session: None,

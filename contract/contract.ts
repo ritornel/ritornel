@@ -10,7 +10,7 @@
 // Every integer fits in 53 bits, so each is a `number`.
 
 /** The version of the contract these types are. */
-export const CONTRACT_VERSION = 4;
+export const CONTRACT_VERSION = 5;
 
 /** The HTTP routes. Each is a `GET` but `ticket` and `link`, which are `POST`s. */
 export const ROUTES = {
@@ -21,6 +21,8 @@ export const ROUTES = {
   art: "/v1/art",
   link: "/v1/link",
   audio: "/v1/audio",
+  cacheDerivative: "/v1/cache/derivative",
+  cachePackaged: "/v1/cache/packaged",
 } as const;
 
 /**
@@ -73,6 +75,8 @@ export const METHODS = {
   "sources.list": { kind: "query", needsFull: true },
   "sources.add": { kind: "command", needsFull: true },
   "scan.start": { kind: "command", needsFull: true },
+  "transcode.start": { kind: "command", needsFull: true },
+  "transcode.prune": { kind: "command", needsFull: true },
   "jobs.list": { kind: "query", needsFull: true },
   "jobs.get": { kind: "query", needsFull: true },
   "jobs.cancel": { kind: "command", needsFull: true },
@@ -174,6 +178,8 @@ export type MethodMap = {
   "sources.list": { params: NoParams; result: SourcesList };
   "sources.add": { params: SourcesAddParams; result: SourceAdded };
   "scan.start": { params: ScanStartParams; result: ScanStarted };
+  "transcode.start": { params: TranscodeParams; result: JobStarted };
+  "transcode.prune": { params: TranscodePruneParams; result: JobStarted };
   "jobs.list": { params: NoParams; result: JobsList };
   "jobs.get": { params: JobGetParams; result: JobDetail };
   "jobs.cancel": { params: JobCancelParams; result: JobCancelled };
@@ -844,6 +850,11 @@ export type ArtColor = {
    */
   saturation: number,
 };
+
+/**
+ * The cache layer that holds the requested file.
+ */
+export type ArtifactLayer = "derivative" | "packaged";
 
 /**
  * The params of `artist.get`.
@@ -1712,6 +1723,38 @@ export type DryRunParams = {
    * answer is counts alone.
    */
   detail: boolean,
+};
+
+/**
+ * Sample processing applied before encoding.
+ */
+export type Dsp = {
+  /**
+   * Gain tag applied to the samples.
+   */
+  replayGain: ReplayGain,
+  /**
+   * Sample-rate ceiling in Hz, or null to use the encoder default.
+   */
+  maxRateHz: number | null,
+};
+
+/**
+ * An external encoder detected at server startup.
+ */
+export type EncoderCapability = {
+  /**
+   * Encoder program name.
+   */
+  family: string,
+  /**
+   * Detected encoder build.
+   */
+  version: string,
+  /**
+   * Output formats supported by this encoder.
+   */
+  formats: Array<string>,
 };
 
 /**
@@ -2928,6 +2971,10 @@ export type JobCancelled = {
  */
 export type JobDetail = {
   /**
+   * Outputs from a successful materialization in request order. Job history does not pin them.
+   */
+  artifacts: Array<TranscodeArtifact>,
+  /**
    * The job.
    */
   job: Job,
@@ -2962,6 +3009,29 @@ export type JobItem = {
 };
 
 /**
+ * Receipt and durable job for a materialization or prune request.
+ */
+export type JobStarted = {
+  /**
+   * The durable job to inspect with jobs.get.
+   */
+  job: Job,
+  /**
+   * The command's ID: the idempotency key it was sent with.
+   */
+  commandId: string,
+  /**
+   * How far the command has got.
+   */
+  status: ReceiptStatus,
+  /**
+   * The library revision the command was committed at. It is left out
+   * for a command that changes no library.
+   */
+  revision?: number,
+};
+
+/**
  * Where a job is in its life.
  */
 export type JobState = "queued" | "running" | "cancelling" | "succeeded" | "failed" | "cancelled";
@@ -2969,7 +3039,11 @@ export type JobState = "queued" | "running" | "cancelling" | "succeeded" | "fail
 /**
  * What a job works on, and so what its events invalidate.
  */
-export type JobTarget = { "type": "source",
+export type JobTarget = { "type": "server",
+  /**
+   * The server ID.
+   */
+  id: string, } | { "type": "source",
   /**
    * The source's ID.
    */
@@ -4044,6 +4118,11 @@ export type MediaToken = {
 };
 
 /**
+ * LAME quality preset or constant bitrate in kbps.
+ */
+export type Mp3 = "v0" | "v2" | { "cbr": number };
+
+/**
  * The candidate an item was nearest to.
  */
 export type Nearest = {
@@ -4939,6 +5018,20 @@ export type PreviewShown = {
 };
 
 /**
+ * An effective profile as reported by the server.
+ */
+export type Profile = {
+  /**
+   * Output codec and encoder options.
+   */
+  target: Target,
+  /**
+   * Sample processing for this profile.
+   */
+  dsp: Dsp,
+};
+
+/**
  * What an event on the `progress` topic carries: where the playing entry
  * is, about once a second and at once on a change. The client carries
  * the position on from when the event arrived.
@@ -5620,6 +5713,12 @@ export type Replaces = {
 };
 
 /**
+ * Which ReplayGain tag a track plays at. See "Audio pipeline" in
+ * docs/internals/playback.md.
+ */
+export type ReplayGain = "off" | "track" | "album";
+
+/**
  * One decision marked for review.
  */
 export type Review = {
@@ -5979,6 +6078,10 @@ export type ServerRole = "unassigned" | "hub" | "satellite";
  */
 export type ServerSettings = {
   /**
+   * Encoder capabilities, effective profiles and cache usage on this server.
+   */
+  transcode?: TranscodeStatus,
+  /**
    * What the server is called. With no name given as it starts, it is
    * the default: the name it already had, which a new server takes
    * from its computer.
@@ -6038,6 +6141,10 @@ export type ServerSettingsSet = {
  * docs/internals/server.md.
  */
 export type ServerStatus = {
+  /**
+   * Encoder capabilities, effective profiles and cache usage on this server.
+   */
+  transcode?: TranscodeStatus,
   /**
    * The server's ID.
    */
@@ -6704,6 +6811,28 @@ export type SyncSummary = {
 };
 
 /**
+ * Output codec and its encoder options.
+ */
+export type Target = { "codec": "mp3",
+  /**
+   * Quality preset or constant bitrate.
+   */
+  mode: Mp3, } | { "codec": "opus",
+  /**
+   * Target bitrate in kbps.
+   */
+  bitrateKbps: number,
+  /**
+   * Encoder effort from 0 to 10.
+   */
+  complexity: number,
+  /**
+   * Bitrate control mode.
+   */
+  vbr: Vbr, } | { "codec": "flac",
+};
+
+/**
  * What a tier joins.
  */
 export type TierJoins = {
@@ -6923,6 +7052,102 @@ export type TrackSummary = {
 };
 
 /**
+ * One completed output. Its job retains the key after eviction, so a later download can return 404.
+ */
+export type TranscodeArtifact = {
+  /**
+   * Appearance requested by the caller.
+   */
+  appearanceId: string,
+  /**
+   * Which cache route serves the output.
+   */
+  layer: ArtifactLayer,
+  /**
+   * BLAKE3 cache key, encoded as 64 hexadecimal digits.
+   */
+  key: string,
+  /**
+   * Exact length of the published file.
+   */
+  sizeBytes: number,
+  /**
+   * BLAKE3 digest of the entire file.
+   */
+  fileHash: string,
+  /**
+   * BLAKE3 of the first and last MiB, counting overlapping bytes once.
+   */
+  sampledHash: string,
+};
+
+/**
+ * Materialize a batch on the library hub.
+ */
+export type TranscodeParams = {
+  /**
+   * Client-generated command ID, reused on retry.
+   */
+  idempotencyKey: string,
+  /**
+   * One to 128 track appearance IDs, in result order.
+   */
+  appearances: Array<string>,
+  /**
+   * Name of the configured profile.
+   */
+  profile: string,
+  /**
+   * Which cache route serves the output.
+   */
+  layer: ArtifactLayer,
+};
+
+/**
+ * Evict all currently unpinned entries on the hub.
+ */
+export type TranscodePruneParams = {
+  /**
+   * Client-generated command ID, reused on retry.
+   */
+  idempotencyKey: string,
+};
+
+/**
+ * Effective encoder settings and the local cache index at the time of the call.
+ */
+export type TranscodeStatus = {
+  /**
+   * Available external encoders. Native FLAC pass-through needs no program.
+   */
+  encoders: Array<EncoderCapability>,
+  /**
+   * Built-ins overlaid by the winning profile table. The source identifies the overlay.
+   */
+  profiles: Setting<{ [key in string]: Profile }>,
+  /**
+   * Maximum number of simultaneous encode or package tasks.
+   */
+  workers: Setting<number>,
+  /**
+   * Maximum cache size in bytes, subject to active pins.
+   */
+  budgetBytes: Setting<number>,
+  /**
+   * Bytes occupied by indexed files across both layers.
+   */
+  usedBytes: number,
+  /**
+   * Number of encoded audio entries.
+   */
+  derivatives: number,
+  /**
+   * Number of tagged artifact entries.
+   */
+  packages: number,
+};
+
+/**
  * The params of `corrections.undo`.
  */
 export type UndoParams = {
@@ -6935,6 +7160,11 @@ export type UndoParams = {
    */
   answers: Array<string>,
 };
+
+/**
+ * Opus rate control mode.
+ */
+export type Vbr = "variable" | "constrained" | "hard_cbr";
 
 /**
  * The versions a status reports.

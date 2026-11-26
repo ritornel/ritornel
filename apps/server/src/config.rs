@@ -158,9 +158,54 @@ impl From<Listen> for ritornel_contract::ListenOn {
     }
 }
 
+/// Startup settings for generated audio and portable files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscodeConfig {
+    pub workers: std::num::NonZeroUsize,
+    pub budget: u64,
+    pub profiles: std::collections::BTreeMap<String, ritornel_engine::transcode::Profile>,
+}
+
+impl Default for TranscodeConfig {
+    fn default() -> Self {
+        use ritornel_engine::transcode::{
+            Mp3, Profile, Target, TranscodeCache, TranscodePool, Vbr,
+        };
+        let opus = |bitrate_kbps| Target::Opus {
+            bitrate_kbps,
+            complexity: 10,
+            vbr: Vbr::Variable,
+        };
+        let profiles = [
+            ("mp3-v0", Target::Mp3 { mode: Mp3::V0 }),
+            ("mp3-v2", Target::Mp3 { mode: Mp3::V2 }),
+            ("opus-160", opus(160)),
+            ("opus-192", opus(192)),
+            ("passthrough-flac", Target::Flac {}),
+        ]
+        .into_iter()
+        .map(|(name, target)| {
+            (
+                name.to_owned(),
+                Profile {
+                    target,
+                    dsp: Default::default(),
+                },
+            )
+        })
+        .collect();
+        Self {
+            workers: TranscodePool::default_workers(),
+            budget: TranscodeCache::DEFAULT_BUDGET,
+            profiles,
+        }
+    }
+}
+
 /// The settings a run uses, each already resolved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Settings {
+    pub(crate) transcode: TranscodeConfig,
     /// The least severe level that is logged. `info` unless set.
     pub(crate) log_level: Level,
     /// Where the server listens.
@@ -182,6 +227,9 @@ pub(crate) struct Settings {
 /// default. `server.settings` reports it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Origins {
+    pub transcode_workers: Option<Origin>,
+    pub transcode_cache_size: Option<Origin>,
+    pub transcode_profiles: Option<Origin>,
     /// The log level.
     pub log_level: Option<Origin>,
     /// The listen address.
@@ -197,6 +245,9 @@ pub struct Origins {
 /// The settings given on the command line.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Flags {
+    pub(crate) transcode_workers: Option<String>,
+    pub(crate) transcode_cache_size: Option<String>,
+    pub(crate) transcode_profiles: Option<String>,
     pub(crate) log_level: Option<String>,
     pub(crate) listen: Option<String>,
     pub(crate) backup_dir: Option<String>,
@@ -209,6 +260,10 @@ pub(crate) struct Flags {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct File {
+    transcode_workers: Option<u32>,
+    transcode_cache_size: Option<String>,
+    transcode_profiles:
+        Option<std::collections::BTreeMap<String, ritornel_engine::transcode::Profile>>,
     log_level: Option<String>,
     listen: Option<String>,
     backup_dir: Option<String>,
@@ -242,6 +297,7 @@ impl Origin {
 /// A setting the server cannot use.
 #[derive(Debug)]
 pub enum ConfigError {
+    Transcode(String),
     /// `config.toml` is not TOML, or holds a key that is not a setting.
     File(toml::de::Error),
     /// The log level is not one of the five.
@@ -263,6 +319,7 @@ pub enum ConfigError {
 impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Transcode(message) => f.write_str(message),
             Self::File(error) => write!(f, "config.toml: {}", error.message()),
             Self::LogLevel(origin) => write!(
                 f,
@@ -305,7 +362,8 @@ impl std::error::Error for ConfigError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::File(error) => Some(error),
-            Self::LogLevel(_)
+            Self::Transcode(_)
+            | Self::LogLevel(_)
             | Self::Listen(_)
             | Self::BackupRelative(_)
             | Self::BackupInside(_)
@@ -396,7 +454,91 @@ fn resolve(
         }
         None => None,
     };
+    let mut transcode = TranscodeConfig::default();
+    if let Some((text, origin)) = chosen(
+        flags.transcode_cache_size.as_deref(),
+        env("RITORNEL_TRANSCODE_CACHE_SIZE"),
+        file.transcode_cache_size,
+    ) {
+        transcode.budget = text.as_deref().and_then(bytes).ok_or_else(|| {
+            ConfigError::Transcode(format!(
+                "{}: cache size must be a positive whole number of MiB or GiB",
+                origin.place(
+                    "--transcode-cache-size",
+                    "RITORNEL_TRANSCODE_CACHE_SIZE",
+                    "transcode_cache_size"
+                )
+            ))
+        })?;
+        origins.transcode_cache_size = Some(origin);
+    }
+    if let Some((text, origin)) = chosen(
+        flags.transcode_workers.as_deref(),
+        env("RITORNEL_TRANSCODE_WORKERS"),
+        file.transcode_workers.map(|n| n.to_string()),
+    ) {
+        transcode.workers = text
+            .and_then(|s| s.parse::<std::num::NonZeroUsize>().ok())
+            .filter(|n| n.get() <= 1024)
+            .ok_or_else(|| {
+                ConfigError::Transcode(format!(
+                    "{}: worker count must be 1 to 1024",
+                    origin.place(
+                        "--transcode-workers",
+                        "RITORNEL_TRANSCODE_WORKERS",
+                        "transcode_workers"
+                    )
+                ))
+            })?;
+        origins.transcode_workers = Some(origin);
+    }
+    let profiles = if let Some((text, origin)) = chosen(
+        flags.transcode_profiles.as_deref(),
+        env("RITORNEL_TRANSCODE_PROFILES"),
+        None,
+    ) {
+        origins.transcode_profiles = Some(origin);
+        Some(
+            serde_json::from_str(&text.unwrap_or_default()).map_err(|e| {
+                ConfigError::Transcode(format!(
+                    "{}: invalid profiles JSON: {e}",
+                    origin.place(
+                        "--transcode-profiles",
+                        "RITORNEL_TRANSCODE_PROFILES",
+                        "transcode_profiles"
+                    )
+                ))
+            })?,
+        )
+    } else {
+        origins.transcode_profiles = file.transcode_profiles.as_ref().map(|_| Origin::File);
+        file.transcode_profiles
+    };
+    if let (Some(profiles), Some(origin)) = (profiles, origins.transcode_profiles) {
+        let source = origin.place(
+            "--transcode-profiles",
+            "RITORNEL_TRANSCODE_PROFILES",
+            "transcode_profiles",
+        );
+        for (name, profile) in profiles {
+            if name.is_empty()
+                || name.len() > 64
+                || !name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+            {
+                return Err(ConfigError::Transcode(format!(
+                    "{source}: profile names must contain 1 to 64 letters, digits, hyphens or underscores"
+                )));
+            }
+            profile.validate().map_err(|e| {
+                ConfigError::Transcode(format!("{source}: transcode profile {name}: {e}"))
+            })?;
+            transcode.profiles.insert(name, profile);
+        }
+    }
     Ok(Settings {
+        transcode,
         log_level,
         listen,
         backup_dir,
@@ -954,6 +1096,7 @@ mod tests {
                 listen: Listen::DEFAULT,
                 backup_dir: None,
                 name: None,
+                transcode: Default::default(),
                 cache_bytes: None,
                 origins: Origins::default(),
             }
@@ -988,6 +1131,110 @@ mod tests {
     }
 
     #[test]
+    fn transcode_configuration_reports_the_winning_source_for_each_setting() {
+        let file = r#"
+            transcode_workers = 2
+            transcode_cache_size = "3 MiB"
+            [transcode_profiles.travel.target]
+            codec = "mp3"
+            mode = "v2"
+        "#;
+        let defaults = Flags::default();
+        let vars = [
+            ("RITORNEL_TRANSCODE_WORKERS", "3"),
+            ("RITORNEL_TRANSCODE_CACHE_SIZE", "4 MiB"),
+            (
+                "RITORNEL_TRANSCODE_PROFILES",
+                r#"{"travel":{"target":{"codec":"mp3","mode":"v0"}}}"#,
+            ),
+        ];
+        let flags = Flags {
+            transcode_workers: Some("4".into()),
+            transcode_cache_size: Some("5 MiB".into()),
+            transcode_profiles: Some(r#"{"travel":{"target":{"codec":"flac"}}}"#.into()),
+            ..Flags::default()
+        };
+        use ritornel_engine::transcode::{Mp3, Target};
+        for (flags, vars, origin, workers, mib, target) in [
+            (
+                &defaults,
+                &[][..],
+                Origin::File,
+                2,
+                3,
+                Target::Mp3 { mode: Mp3::V2 },
+            ),
+            (
+                &defaults,
+                vars.as_slice(),
+                Origin::Environment,
+                3,
+                4,
+                Target::Mp3 { mode: Mp3::V0 },
+            ),
+            (&flags, vars.as_slice(), Origin::Flag, 4, 5, Target::Flac {}),
+        ] {
+            let s = resolve(Path::new(ROOT), flags, &env(vars), Some(file)).unwrap();
+            assert_eq!(s.transcode.workers.get(), workers);
+            assert_eq!(s.transcode.budget, mib << 20);
+            assert_eq!(s.transcode.profiles["travel"].target, target);
+            assert!(s.transcode.profiles.contains_key("opus-160"));
+            assert_eq!(s.origins.transcode_workers, Some(origin));
+            assert_eq!(s.origins.transcode_cache_size, Some(origin));
+            assert_eq!(s.origins.transcode_profiles, Some(origin));
+        }
+        let s = resolve(Path::new(ROOT), &defaults, &env(&[]), None).unwrap();
+        assert_eq!(s.transcode.budget, 10 << 30);
+        assert_eq!(s.transcode, TranscodeConfig::default());
+    }
+
+    #[test]
+    fn invalid_transcode_settings_fail_before_listening() {
+        for (var, value, expected) in [
+            ("RITORNEL_TRANSCODE_CACHE_SIZE", "0 MiB", "cache size"),
+            ("RITORNEL_TRANSCODE_WORKERS", "0", "worker"),
+            ("RITORNEL_TRANSCODE_PROFILES", "[]", "profiles JSON"),
+            (
+                "RITORNEL_TRANSCODE_PROFILES",
+                r#"{"bad name":{"target":{"codec":"flac"}}}"#,
+                "profile name",
+            ),
+            (
+                "RITORNEL_TRANSCODE_PROFILES",
+                r#"{"bad":{"target":{"codec":"mp3","mode":{"cbr":3}}}}"#,
+                "bad: unsupported MP3",
+            ),
+            (
+                "RITORNEL_TRANSCODE_PROFILES",
+                r#"{"bad":{"target":{"codec":"flac","typo":3}}}"#,
+                "unknown field",
+            ),
+        ] {
+            let error = resolve(
+                Path::new(ROOT),
+                &Flags::default(),
+                &env(&[(var, value)]),
+                None,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn invalid_profile_names_the_configuration_file_and_profile() {
+        let file = "[transcode_profiles.pocket.target]\ncodec='mp3'\nmode={cbr=7}";
+        let error = resolve(Path::new(ROOT), &Flags::default(), &env(&[]), Some(file))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("config.toml") && error.contains("pocket"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn a_cache_size_fits_in_53_bits() {
         assert_eq!(bytes("8388607 GiB"), Some(8_388_607 << 30));
         assert_eq!(bytes("8388608 GiB"), None);
@@ -1014,6 +1261,7 @@ mod tests {
                 backup_dir: None,
                 name: Some(Origin::Flag),
                 cache_size: None,
+                ..Origins::default()
             }
         );
     }

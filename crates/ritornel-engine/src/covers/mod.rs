@@ -421,6 +421,18 @@ fn read_source(roots: &[(String, String)], source: &Source) -> Option<Vec<u8>> {
 }
 
 impl LibraryStore {
+    /// Read the original bytes of the first available source matching the artwork digest.
+    pub fn original_cover(
+        &self,
+        art: Id,
+        roots: &[(String, String)],
+    ) -> Result<Option<Vec<u8>>, Error> {
+        Ok(self
+            .picture_sources(art)?
+            .iter()
+            .find_map(|source| read_source(roots, source)))
+    }
+
     /// Where the picture `art` may be read from, best first: an artist's
     /// portrait in a picture folder, by `artist_picture_picture`, then the
     /// files it came with that are still there, folder images before

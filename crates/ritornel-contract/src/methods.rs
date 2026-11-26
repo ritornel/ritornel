@@ -182,6 +182,12 @@ methods! {
     /// job. A source that is being scanned returns the job that is running.
     ScanStart: "scan.start", Command, needs_full: true,
     ScanStartParams => ScanStarted;
+    /// Materialize local lossless tracks with a named profile on the hub.
+    TranscodeStart: "transcode.start", Command, needs_full: true,
+    TranscodeParams => JobStarted;
+    /// Remove unpinned audio derivatives and packages on the hub.
+    TranscodePrune: "transcode.prune", Command, needs_full: true,
+    TranscodePruneParams => JobStarted;
 
     /// `jobs.list`: the newest jobs, newest first.
     JobsList: "jobs.list", Query, needs_full: true,
@@ -672,6 +678,8 @@ mod tests {
                 "sources.list",
                 "sources.add",
                 "scan.start",
+                "transcode.start",
+                "transcode.prune",
                 "jobs.list",
                 "jobs.get",
                 "jobs.cancel",
@@ -778,6 +786,8 @@ mod tests {
                 "sources.list",
                 "sources.add",
                 "scan.start",
+                "transcode.start",
+                "transcode.prune",
                 "jobs.list",
                 "jobs.get",
                 "jobs.cancel",

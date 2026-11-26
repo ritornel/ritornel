@@ -94,5 +94,6 @@ Detailed guides for shipped subsystems live under `docs/internals/`:
 - [`docs/internals/history.md`](docs/internals/history.md) — immutable observations, play derivation, monotonic timekeeping, indexed queries, Last.fm sync/scrobbling, and portable export.
 - [`docs/internals/corrections.md`](docs/internals/corrections.md) — sidecars kept with the audio, CD layouts and disc IDs read from them, MusicBrainz lookups behind the library's switch, the album and edition proposals worked out from them, and the answers that say yes or no to one, keep two albums apart, or undo another.
 - [`docs/internals/identity.md`](docs/internals/identity.md) — read-only scanning, audio-only hashing, folder watching, normalization, recording resolution, catalog projection, and scrobble matching.
+- [`docs/internals/transcoding.md`](docs/internals/transcoding.md) — encoder profiles, cached derivatives and packages, verification commands and link-session downloads.
 - [`docs/internals/linking.md`](docs/internals/linking.md) — server identity, hub write guard, local owner credentials, sessions, tickets, media tokens, and listener transport bounds.
 - [`docs/internals/desktop.md`](docs/internals/desktop.md) — GPUI desktop workspace, server discovery, frame and whole-page navigation, virtualized walls and cover loading, History/Lean back views, queue, Settings, and offscreen testing.

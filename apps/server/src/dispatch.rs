@@ -69,7 +69,9 @@ mod playback;
 mod ratings;
 mod record;
 mod settings;
+mod transcode;
 mod watch;
+pub(crate) use transcode::Transcodes;
 
 pub(crate) use backup::record_backup;
 pub(crate) use calls::job_state;
@@ -201,6 +203,7 @@ pub(crate) struct Core {
     backups: std::sync::OnceLock<crate::backup::Backups>,
     /// The most a satellite's cache of pulled masters holds, in bytes,
     /// once the server has started.
+    transcodes: std::sync::OnceLock<std::sync::Weak<Transcodes>>,
     cache_bytes: std::sync::OnceLock<u64>,
     /// The settings given as the server started that it reports and does
     /// not keep elsewhere, once it has started.
@@ -339,6 +342,7 @@ impl Core {
             answering: Mutex::new(()),
             watch: std::sync::OnceLock::new(),
             backups: std::sync::OnceLock::new(),
+            transcodes: Default::default(),
             cache_bytes: std::sync::OnceLock::new(),
             start_up: std::sync::OnceLock::new(),
             signs: Mutex::default(),
@@ -936,6 +940,17 @@ impl Core {
                 self.wake_watch();
                 added
             }),
+            methods::TranscodeStart::NAME => {
+                run::<methods::TranscodeStart>(params, |p| self.start_transcode(stores, p))
+            }
+            methods::TranscodePrune::NAME => run::<methods::TranscodePrune>(params, |p| {
+                self.enqueue_transcode::<methods::TranscodePrune>(
+                    stores,
+                    &p,
+                    p.idempotency_key,
+                    || Ok("{}".into()),
+                )
+            }),
             ScanStart::NAME => run::<ScanStart>(params, |params| self.scan_start(stores, &params)),
             LibrarySetWatching::NAME => run::<LibrarySetWatching>(params, |params| {
                 self.library_set_watching(stores, &params)
@@ -1119,7 +1134,7 @@ impl Core {
             }
             LinkPing::NAME => run::<LinkPing>(params, |params| self.link_ping(session, params)),
             ServerSettingsCall::NAME => {
-                run::<ServerSettingsCall>(params, |_| Ok(self.server_settings()))
+                run::<ServerSettingsCall>(params, |_| self.server_settings(stores))
             }
             ServerSetSettings::NAME => {
                 run::<ServerSetSettings>(params, |params| self.server_set_settings(stores, &params))
@@ -1263,6 +1278,7 @@ impl Core {
         let backup = self.backup_status(stores);
         let record = self.record_status(stores);
         Ok(ritornel_contract::ServerStatus {
+            transcode: self.transcode_status(stores)?,
             server_id: self.server_id,
             name,
             role,
@@ -1518,6 +1534,58 @@ mod tests {
         let session = core.open_session(kind).unwrap();
         call(core, &session, "server.hello", Some(hello())).unwrap();
         session
+    }
+
+    #[test]
+    fn a_transcode_receipt_replays_after_cancellation_and_rejects_changed_params() {
+        use ritornel_engine::transcode::{TranscodeCache, TranscodePool};
+        let (core, scratch) = core();
+        let store = core.with_stores(|s| s.server.clone()).unwrap();
+        let config = crate::TranscodeConfig::default();
+        let cache = TranscodeCache::open(
+            &store,
+            &scratch.path().join("cache"),
+            Id::from_bytes([6; 16]),
+            config.budget,
+        )
+        .unwrap();
+        let service = Arc::new(Transcodes {
+            pool: Arc::new(TranscodePool::new(store, cache, config.workers).unwrap()),
+            config,
+            origins: Default::default(),
+            encoders: vec![],
+        });
+        core.attach_transcodes(&service);
+        let session = core.open_session(SessionKind::Full).unwrap();
+        call(&core, &session, "server.hello", Some(hello())).unwrap();
+        call(
+            &core,
+            &session,
+            "library.create",
+            Some(json!({"idempotencyKey": Id::from_bytes([9;16])})),
+        )
+        .unwrap();
+        let mut params = json!({"idempotencyKey": Id::from_bytes([8;16]), "profile":"passthrough-flac","appearances":[Id::from_bytes([7;16])],"layer":"packaged"});
+        let started = call(&core, &session, "transcode.start", Some(params.clone())).unwrap();
+        let id = &started["job"]["jobId"];
+        call(
+            &core,
+            &session,
+            "jobs.cancel",
+            Some(json!({"idempotencyKey":Id::from_bytes([4;16]),"jobId":id})),
+        )
+        .unwrap();
+        drop(service);
+        let replay = call(&core, &session, "transcode.start", Some(params.clone())).unwrap();
+        assert_eq!(&replay["job"]["jobId"], id);
+        assert_eq!(replay["job"]["state"], "cancelled");
+        params["profile"] = json!("missing");
+        assert_eq!(
+            call(&core, &session, "transcode.start", Some(params))
+                .unwrap_err()
+                .0,
+            ErrorCode::IdempotencyMismatch
+        );
     }
 
     #[test]
@@ -2040,6 +2108,7 @@ mod tests {
                 let new = ritornel_engine::NewJob {
                     kind: "scan",
                     dedupe_key: "music".into(),
+                    target_kind: "source",
                     target: Id::from_bytes([1; 16]),
                     params_json: "{}".into(),
                     session: None,

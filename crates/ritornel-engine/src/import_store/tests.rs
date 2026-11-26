@@ -2039,6 +2039,7 @@ fn cancellation_while_queued_on_the_library_writer_aborts_apply_undo_and_ingest(
                 crate::NewJob {
                     kind,
                     dedupe_key: format!("k-{key}"),
+                    target_kind: "import_run",
                     target: Id::from_bytes([key; 16]),
                     params_json: "{}".to_owned(),
                     session: None,

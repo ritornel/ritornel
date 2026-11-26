@@ -54,14 +54,18 @@ pub(crate) fn job(job: &ritornel_engine::Job) -> Job {
         job_id: job.public_id,
         kind: job.kind.clone(),
         target: job.target.map(|id| {
-            if job.kind == crate::lastfm::SYNC_JOB {
+            if job.target_kind.as_deref() == Some("account") || job.kind == crate::lastfm::SYNC_JOB
+            {
                 JobTarget::Account { id }
-            } else if [
-                crate::imports::DRY_RUN_JOB,
-                crate::imports::APPLY_JOB,
-                crate::imports::UNDO_JOB,
-            ]
-            .contains(&job.kind.as_str())
+            } else if job.target_kind.as_deref() == Some("server") {
+                JobTarget::Server { id }
+            } else if job.target_kind.as_deref() == Some("import_run")
+                || [
+                    crate::imports::DRY_RUN_JOB,
+                    crate::imports::APPLY_JOB,
+                    crate::imports::UNDO_JOB,
+                ]
+                .contains(&job.kind.as_str())
             {
                 JobTarget::ImportRun { id }
             } else {
@@ -485,6 +489,7 @@ impl Core {
         let new = NewJob {
             kind: "scan",
             dedupe_key: source.name,
+            target_kind: "source",
             target: source.public_id,
             params_json: serde_json::to_string(params).unwrap_or_default(),
             session: self.local_credential.session(),
@@ -533,6 +538,21 @@ impl Core {
             .failed_job_items(found.id, LISTED)
             .map_err(stored)?;
         Ok(JobDetail {
+            artifacts: if found.kind == "transcode.start"
+                && found.state == ritornel_engine::JobState::Succeeded
+            {
+                found
+                    .checkpoint_json
+                    .as_deref()
+                    .map(serde_json::from_str)
+                    .transpose()
+                    .map_err(|_| {
+                        RpcError::new(ErrorCode::Internal, "invalid transcode job result")
+                    })?
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            },
             job: job(&found),
             failed_items: items
                 .into_iter()

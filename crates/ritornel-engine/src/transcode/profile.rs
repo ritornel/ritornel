@@ -108,3 +108,45 @@ impl Profile {
         Ok(serde_json::to_string(&self)?)
     }
 }
+
+// The contract describes a running profile to clients. The engine serializes
+// its own profile for configuration and cache keys, independently of that wire format.
+impl From<Profile> for ritornel_contract::transcode::Profile {
+    fn from(profile: Profile) -> Self {
+        use ritornel_contract::transcode as wire;
+        let target = match profile.target {
+            Target::Flac {} => wire::Target::Flac {},
+            Target::Mp3 { mode } => wire::Target::Mp3 {
+                mode: match mode {
+                    Mp3::V0 => wire::Mp3::V0,
+                    Mp3::V2 => wire::Mp3::V2,
+                    Mp3::Cbr(kbps) => wire::Mp3::Cbr(kbps),
+                },
+            },
+            Target::Opus {
+                bitrate_kbps,
+                complexity,
+                vbr,
+            } => wire::Target::Opus {
+                bitrate_kbps,
+                complexity,
+                vbr: match vbr {
+                    Vbr::Variable => wire::Vbr::Variable,
+                    Vbr::Constrained => wire::Vbr::Constrained,
+                    Vbr::HardCbr => wire::Vbr::HardCbr,
+                },
+            },
+        };
+        Self {
+            target,
+            dsp: wire::Dsp {
+                max_rate_hz: profile.dsp.max_rate_hz,
+                replay_gain: match profile.dsp.replay_gain {
+                    ReplayGain::Off => wire::ReplayGain::Off,
+                    ReplayGain::Album => wire::ReplayGain::Album,
+                    ReplayGain::Track => wire::ReplayGain::Track,
+                },
+            },
+        }
+    }
+}

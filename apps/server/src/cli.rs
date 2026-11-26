@@ -79,6 +79,10 @@ Options:
                         as the room its speakers are in. Given, it replaces
                         the name the server has stored at every start; the
                         stored name is kept when none is given
+  --transcode-workers <n>       Maximum simultaneous encodes or packages (1 to 1024).
+                        Defaults to available cores minus one, minimum one
+  --transcode-cache-size <size> Budget for cached transcodes, in MiB or GiB (default 10 GiB)
+  --transcode-profiles <json>   JSON object adding to or overriding the built-in profiles
   --cache-size <size>   The most a satellite keeps of the music it pulls
                         from its hub, in MiB or GiB, such as 8 GiB. The
                         oldest goes first once it holds more. The default
@@ -96,6 +100,9 @@ Environment:
   RITORNEL_LOG_LEVEL    The log level, when --log-level is not given
   RITORNEL_BACKUP_DIR   The backup folder, when --backup-dir is not given
   RITORNEL_NAME         The server's name, when --name is not given
+  RITORNEL_TRANSCODE_WORKERS     Worker count when --transcode-workers is not given
+  RITORNEL_TRANSCODE_CACHE_SIZE  Cache budget when --transcode-cache-size is not given
+  RITORNEL_TRANSCODE_PROFILES    Named profiles when --transcode-profiles is not given
   RITORNEL_CACHE_SIZE   The cache's size, when --cache-size is not given
 
 A setting is read from its flag, then its environment variable, then
@@ -156,6 +163,12 @@ pub(crate) struct ServeArgs {
     pub(crate) name: Option<String>,
     #[arg(long, value_parser = NonEmptyStringValueParser::new())]
     pub(crate) cache_size: Option<String>,
+    #[arg(long)]
+    pub(crate) transcode_workers: Option<String>,
+    #[arg(long)]
+    pub(crate) transcode_cache_size: Option<String>,
+    #[arg(long)]
+    pub(crate) transcode_profiles: Option<String>,
 }
 
 /// What a wrong command line is answered with. The messages are fixed and
@@ -301,6 +314,9 @@ mod tests {
             backup_dir: None,
             name: Some("Workbench Speakers".to_owned()),
             cache_size: Some("8 GiB".to_owned()),
+            transcode_workers: None,
+            transcode_cache_size: None,
+            transcode_profiles: None,
         });
         for line in [
             &[

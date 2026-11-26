@@ -20,3 +20,4 @@ mod play;
 mod scan;
 mod spotify;
 mod status;
+mod transcode;
