@@ -15,7 +15,8 @@ use windows_sys::Wdk::Storage::FileSystem::{
     NtCreateFile,
 };
 use windows_sys::Win32::Foundation::{
-    ERROR_NO_MORE_FILES, HANDLE, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, UNICODE_STRING,
+    ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_FILES, HANDLE, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError,
+    UNICODE_STRING,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FULL_DIR_INFO, FILE_GENERIC_READ,
@@ -162,32 +163,43 @@ pub fn list(dir: &File) -> io::Result<Vec<Entry>> {
         };
         if ok == 0 {
             let error = io::Error::last_os_error();
-            if error.raw_os_error() == i32::try_from(ERROR_NO_MORE_FILES).ok() {
+            let code = |code: u32| error.raw_os_error() == i32::try_from(code).ok();
+            // The root of a drive has no `.` or `..`: empty, it has nothing
+            // to list from the start.
+            let empty_root = class == FileFullDirectoryRestartInfo && code(ERROR_FILE_NOT_FOUND);
+            if code(ERROR_NO_MORE_FILES) || empty_root {
                 return Ok(entries);
             }
             return Err(error);
         }
         class = FileFullDirectoryInfo;
         let bytes: Vec<u8> = buffer.iter().flat_map(|word| word.to_ne_bytes()).collect();
-        let mut at = 0;
+        let mut at: usize = 0;
         loop {
             let field = |offset: usize| {
-                let start = at + offset;
+                let start = at.checked_add(offset).ok_or_else(malformed)?;
                 bytes
-                    .get(start..start + 4)
+                    .get(start..start.checked_add(4).ok_or_else(malformed)?)
                     .and_then(|field| field.try_into().ok())
                     .map(u32::from_ne_bytes)
                     .ok_or_else(malformed)
             };
             let next = field(offset_of!(FILE_FULL_DIR_INFO, NextEntryOffset))?;
             let attributes = field(offset_of!(FILE_FULL_DIR_INFO, FileAttributes))?;
-            let length = field(offset_of!(FILE_FULL_DIR_INFO, FileNameLength))? as usize;
+            let length = usize::try_from(field(offset_of!(FILE_FULL_DIR_INFO, FileNameLength))?)
+                .map_err(|_| malformed())?;
             // The reparse tag of a reparse point is where the size of its
             // extended attributes would be.
             let tag = field(offset_of!(FILE_FULL_DIR_INFO, EaSize))?;
-            let start = at + offset_of!(FILE_FULL_DIR_INFO, FileName);
+            let start = at
+                .checked_add(offset_of!(FILE_FULL_DIR_INFO, FileName))
+                .ok_or_else(malformed)?;
+            let end = start.checked_add(length).ok_or_else(malformed)?;
+            if length % 2 != 0 {
+                return Err(malformed());
+            }
             let name: Vec<u16> = bytes
-                .get(start..start + length)
+                .get(start..end)
                 .ok_or_else(malformed)?
                 .as_chunks::<2>()
                 .0
@@ -205,7 +217,8 @@ pub fn list(dir: &File) -> io::Result<Vec<Entry>> {
             if next == 0 {
                 break;
             }
-            at += next as usize;
+            let next = usize::try_from(next).map_err(|_| malformed())?;
+            at = at.checked_add(next).ok_or_else(malformed)?;
         }
     }
 }

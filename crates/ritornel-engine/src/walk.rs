@@ -17,7 +17,7 @@ use ritornel_domain::layout;
 
 use crate::Error;
 use crate::media::is_folder_image;
-use crate::platform::{Folder, Kind, met_a_link, refused};
+use crate::platform::{Folder, Kind, entry_missing, met_a_link, refused};
 
 /// The extensions of the files a scan takes to be audio. A file Symphonia
 /// cannot demux is here too, so that it is recorded as unreadable rather
@@ -149,7 +149,7 @@ fn list(
         }
         // Removed since it was opened: gone, as it would be had the walk
         // come a moment later.
-        Err(error) if !rel.is_empty() && error.kind() == ErrorKind::NotFound => {
+        Err(error) if !rel.is_empty() && entry_missing(&error) => {
             return Ok(folders);
         }
         Err(error) => return Err(Error::Io(error)),
@@ -192,13 +192,10 @@ fn list(
         // rather than a file being taken for gone.
         let described = match folder.describe(&name) {
             Ok(described) => described,
-            Err(error)
-                if kind == Kind::Link
-                    && (error.kind() == ErrorKind::NotFound || met_a_link(&error)) =>
-            {
+            Err(error) if kind == Kind::Link && (entry_missing(&error) || met_a_link(&error)) => {
                 continue;
             }
-            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) if entry_missing(&error) => continue,
             Err(error) if !rel.is_empty() && error.kind() == ErrorKind::PermissionDenied => {
                 unreadable(walked, rel);
                 return Ok(Vec::new());
@@ -226,9 +223,10 @@ fn list(
 
 /// What the walk asks of the system, which a test may answer instead.
 struct Seams<'a> {
-    /// Which folder is at a path: the root's, before and after the walk.
+    /// Which folder is at the root's path once the walk is done.
     root_id: &'a dyn Fn(&Path) -> Option<FolderId>,
-    /// Which folder the one opened at `rel` under the root is.
+    /// Which folder the one opened at `rel` under the root is: `""` for
+    /// the root.
     id: &'a dyn Fn(&str, &Folder) -> Option<FolderId>,
     /// Told of each folder under the root, by its path relative to the
     /// root, before it is opened.
@@ -250,17 +248,16 @@ const SYSTEM: Seams<'static> = Seams {
 /// those still to go rather than by recursion, so that how deep a tree
 /// goes costs no stack. A folder that is one of the folders it is inside,
 /// as a bind mount can make, is passed over rather than gone round again.
+/// Every folder under the open root `top` is opened from it, a part at a
+/// time and none followed if it is a link: one on the way that has become
+/// a link since a folder was queued, or the folder itself, leads nowhere,
+/// as a link to a folder found in a listing does.
 fn walk_tree(
-    root: &Path,
+    top: &Folder,
     walked: &mut Walked,
     stop: &AtomicBool,
     seams: &Seams<'_>,
 ) -> Result<(), Error> {
-    // The root is opened once, and every folder under it from there, a
-    // part at a time and none followed if it is a link: one on the way
-    // that has become a link since a folder was queued, or the folder
-    // itself, leads nowhere, as a link to a folder found in a listing does.
-    let top = Folder::open_root(root).map_err(Error::Io)?;
     // Each folder still to list, with how deep it is; and the identity of
     // each folder on the way down to the one being listed.
     let mut todo = vec![(String::new(), 0)];
@@ -280,7 +277,7 @@ fn walk_tree(
             // A folder removed since its parent was listed is gone, with
             // all that was in it, as it would be had the walk come a moment
             // later.
-            Err(error) if depth > 0 && error.kind() == ErrorKind::NotFound => continue,
+            Err(error) if depth > 0 && entry_missing(&error) => continue,
             Err(error) if depth > 0 && met_a_link(&error) => continue,
             Err(error) if depth > 0 && error.kind() == ErrorKind::PermissionDenied => {
                 unreadable(walked, &rel);
@@ -371,15 +368,16 @@ fn walk_by(root: &Path, stop: &AtomicBool, seams: &Seams<'_>) -> Result<Walked, 
     let offline = || Error::RootOffline {
         path: root.to_owned(),
     };
-    std::fs::read_dir(root).map_err(|_| offline())?;
+    // The root is opened once, and its identity asked of what was opened.
     // A root that cannot be told from another folder mounted at its path
     // later is not walked: nothing could prove that what the scan then
     // reads, or does not find, is of the folder it walked.
+    let top = Folder::open_root(root).map_err(|_| offline())?;
     let mut walked = Walked {
-        root_id: (seams.root_id)(root).ok_or_else(offline)?,
+        root_id: (seams.id)("", &top).ok_or_else(offline)?,
         ..Walked::default()
     };
-    walk_tree(root, &mut walked, stop, seams)?;
+    walk_tree(&top, &mut walked, stop, seams)?;
     // A walk that was asked to stop has not looked everywhere.
     if !stop.load(Ordering::Relaxed)
         && (walked.files.is_empty() || (seams.root_id)(root) != Some(walked.root_id))
@@ -629,6 +627,7 @@ mod tests {
         // later finds there could be of any disk mounted at the path.
         let seams = Seams {
             root_id: &|_| None,
+            id: &|_, _| None,
             ..SYSTEM
         };
         let refused = walk_by(root, &AtomicBool::new(false), &seams);

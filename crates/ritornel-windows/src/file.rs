@@ -11,9 +11,10 @@ use std::path::{Path, PathBuf};
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FileAttributeTagInfo,
-    GetDiskFreeSpaceExW, GetFileInformationByHandle, GetFileInformationByHandleEx,
-    GetFinalPathNameByHandleW, MOVEFILE_WRITE_THROUGH, MoveFileExW, VOLUME_NAME_DOS,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_INFO, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES,
+    FileAttributeTagInfo, FileIdInfo, GetDiskFreeSpaceExW, GetFileInformationByHandle,
+    GetFileInformationByHandleEx, GetFinalPathNameByHandleW, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    VOLUME_NAME_DOS,
 };
 
 /// Which file or folder is at `path`: the serial number of its volume and
@@ -38,6 +39,36 @@ pub fn id_of(file: &File) -> io::Result<(u64, u64)> {
     }
     let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
     Ok((u64::from(info.dwVolumeSerialNumber), index))
+}
+
+/// Which file or folder `file` is open on, as surely as the volume can
+/// say: its volume's serial number and its 128-bit file ID, or, where the
+/// file system has none of those, its 64-bit index. `None` when the file
+/// system names no file at all, giving a zero index for every one.
+pub fn identity(file: &File) -> io::Result<Option<(u64, u128)>> {
+    // SAFETY: plain data, for which all zeroes is valid.
+    let mut info: FILE_ID_INFO = unsafe { std::mem::zeroed() };
+    let size = u32::try_from(std::mem::size_of::<FILE_ID_INFO>()).unwrap_or(u32::MAX);
+    // SAFETY: the handle is open for the call, and `info` is as large as
+    // `size` says and written by it.
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle() as HANDLE,
+            FileIdInfo,
+            (&raw mut info).cast(),
+            size,
+        )
+    };
+    let (volume, id) = if ok != 0 {
+        (
+            info.VolumeSerialNumber,
+            u128::from_ne_bytes(info.FileId.Identifier),
+        )
+    } else {
+        let (volume, index) = id_of(file)?;
+        (volume, u128::from(index))
+    };
+    Ok((id != 0).then_some((volume, id)))
 }
 
 /// The path `file` is really open at, with every link and junction on the

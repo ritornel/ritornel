@@ -990,7 +990,7 @@ impl ScanRun {
                 Ok(_) => self
                     .sidecar_ops
                     .extend(live.map(|id| SidecarOp::Gone { id })),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Err(error) if crate::platform::entry_missing(&error) => {
                     self.sidecar_ops
                         .extend(live.map(|id| SidecarOp::Gone { id }));
                 }

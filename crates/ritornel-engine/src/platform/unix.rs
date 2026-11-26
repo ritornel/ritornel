@@ -57,10 +57,12 @@ impl Folder {
     }
 
     /// Which folder this is: its device and inode.
+    // The fields' types differ from one Unix to another; `std` casts them
+    // so too.
+    #[allow(clippy::unnecessary_cast)]
     pub(crate) fn id(&self) -> Option<(u64, u64)> {
-        use std::os::unix::fs::MetadataExt;
-        let metadata = File::from(self.0.try_clone().ok()?).metadata().ok()?;
-        Some((metadata.dev(), metadata.ino()))
+        let stat = rustix::fs::fstat(&self.0).ok()?;
+        Some((stat.st_dev as u64, stat.st_ino as u64))
     }
 
     /// Every entry in the folder but `.` and `..`, with what it is. An
@@ -136,6 +138,12 @@ pub(crate) fn met_a_link(error: &std::io::Error) -> bool {
     [rustix::io::Errno::LOOP, rustix::io::Errno::NOTDIR]
         .iter()
         .any(|errno| error.raw_os_error() == Some(errno.raw_os_error()))
+}
+
+/// Whether a failure says that what was asked for is not there, and so is
+/// gone, rather than that it could not be reached.
+pub(crate) fn entry_missing(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound
 }
 
 /// Reads into `buffer` from `at` in `file`, leaving no place of its own.

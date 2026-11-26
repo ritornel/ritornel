@@ -78,7 +78,8 @@ fn is_reparse_point(file: &File) -> std::io::Result<bool> {
 /// `name` in `dir`, opened as `open` says without following it. A link is
 /// refused. Another reparse point, as a cloud file's placeholder is, is
 /// opened again as the file or folder it stands for, which must be the
-/// same one: anything else is taken for a link put there between the two.
+/// same one by its file ID: if it is not, or the volume gives no ID, that
+/// is an error, never taken for a link.
 fn open_unfollowed(dir: &File, name: &OsStr, open: Open) -> std::io::Result<File> {
     let file = ritornel_windows::folder::open_in(dir, name, open, false)?;
     if !is_reparse_point(&file)? {
@@ -88,8 +89,12 @@ fn open_unfollowed(dir: &File, name: &OsStr, open: Open) -> std::io::Result<File
         return Err(a_link());
     }
     let real = ritornel_windows::folder::open_in(dir, name, open, true)?;
-    if ritornel_windows::file::id_of(&real)? != ritornel_windows::file::id_of(&file)? {
-        return Err(a_link());
+    // Not known to be a link, so not passed over as one: the walk fails
+    // rather than take what is in it for gone.
+    let unproven = || std::io::Error::other("a reparse point that cannot be told to be itself");
+    let was = ritornel_windows::file::identity(&file)?.ok_or_else(unproven)?;
+    if ritornel_windows::file::identity(&real)? != Some(was) {
+        return Err(unproven());
     }
     Ok(real)
 }
@@ -103,11 +108,15 @@ impl Folder {
         // SYNCHRONIZE, as `ritornel_windows::folder::Open::Folder` opens one;
         // and FILE_FLAG_BACKUP_SEMANTICS, without which no folder opens.
         let access = 0x1 | 0x20 | 0x80 | 0x0010_0000;
-        std::fs::OpenOptions::new()
+        let root = std::fs::OpenOptions::new()
             .access_mode(access)
             .custom_flags(0x0200_0000)
-            .open(root)
-            .map(Folder)
+            .open(root)?;
+        // A file opens too, which `O_DIRECTORY` refuses on Unix.
+        if !root.metadata()?.is_dir() {
+            return Err(std::io::ErrorKind::NotADirectory.into());
+        }
+        Ok(Folder(root))
     }
 
     /// Opens the folders `dirs` in this one, each relative to the last and
@@ -184,6 +193,18 @@ impl Folder {
 /// of a link it does not follow.
 pub(crate) fn met_a_link(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::NotADirectory
+}
+
+/// Whether a failure says that what was asked for is not there, and so is
+/// gone. The standard library takes a network path or a drive that cannot
+/// be reached for one not found too, and that is not gone: only a file or
+/// a path that is not there is.
+pub(crate) fn entry_missing(error: &std::io::Error) -> bool {
+    // ERROR_FILE_NOT_FOUND and ERROR_PATH_NOT_FOUND.
+    match error.raw_os_error() {
+        Some(code) => code == 2 || code == 3,
+        None => error.kind() == std::io::ErrorKind::NotFound,
+    }
 }
 
 /// Reads into `buffer` from `at` in `file`. Windows moves the file's own

@@ -37,7 +37,7 @@ use windows as system;
 ))]
 use other_unix as system;
 
-pub(crate) use system::{Folder, file_id, met_a_link, mono_ms, read_at, read_boot};
+pub(crate) use system::{Folder, entry_missing, file_id, met_a_link, mono_ms, read_at, read_boot};
 #[cfg(test)]
 pub(crate) use system::{link_file, link_folder, mode_of, seal, set_listable};
 
