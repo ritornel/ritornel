@@ -41,10 +41,10 @@ pub fn id_of(file: &File) -> io::Result<(u64, u64)> {
     Ok((u64::from(info.dwVolumeSerialNumber), index))
 }
 
-/// Which file or folder `file` is open on, as surely as the volume can
-/// say: its volume's serial number and its 128-bit file ID, or, where the
-/// file system has none of those, its 64-bit index. `None` when the file
-/// system names no file at all, giving a zero index for every one.
+/// Which file or folder `file` is open on, by its volume's serial number
+/// and its 128-bit file ID (`FileIdInfo`). Returns `None` when the file
+/// system gives a zero ID, and returns an error when `FileIdInfo` fails so
+/// callers never compare mixed or colliding 64-bit fallback indices.
 pub fn identity(file: &File) -> io::Result<Option<(u64, u128)>> {
     // SAFETY: plain data, for which all zeroes is valid.
     let mut info: FILE_ID_INFO = unsafe { std::mem::zeroed() };
@@ -59,16 +59,11 @@ pub fn identity(file: &File) -> io::Result<Option<(u64, u128)>> {
             size,
         )
     };
-    let (volume, id) = if ok != 0 {
-        (
-            info.VolumeSerialNumber,
-            u128::from_ne_bytes(info.FileId.Identifier),
-        )
-    } else {
-        let (volume, index) = id_of(file)?;
-        (volume, u128::from(index))
-    };
-    Ok((id != 0).then_some((volume, id)))
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let id = u128::from_ne_bytes(info.FileId.Identifier);
+    Ok((id != 0).then_some((info.VolumeSerialNumber, id)))
 }
 
 /// The path `file` is really open at, with every link and junction on the
