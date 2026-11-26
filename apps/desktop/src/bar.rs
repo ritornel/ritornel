@@ -619,14 +619,13 @@ impl Render for PlayerBar {
                 )
             },
         );
-        // Already in the ink, a step takes a ground under the pointer, as
-        // wide as the toggles' and no wider in the row than its icon.
+        // Already in the ink, a step lightens under the pointer like Play
+        // (no hover pill), keeping a 28-pt hit target without changing row spacing.
         let step = |id: &'static str, name: &'static str| {
             div()
                 .id(id)
                 .size(px(28.))
                 .mx(px(-5.5))
-                .rounded(px(8.))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -650,8 +649,8 @@ impl Render for PlayerBar {
         if on {
             shuffle_button = shuffle_button.active(theme::pressed);
             repeat_button = repeat_button.active(theme::pressed);
-            previous = previous.hover(theme::hovered).active(theme::pressed);
-            next = next.hover(theme::hovered).active(theme::pressed);
+            previous = previous.hover(theme::hovered_solid).active(theme::pressed);
+            next = next.hover(theme::hovered_solid).active(theme::pressed);
             play = play.hover(theme::hovered_solid).active(theme::pressed);
             shuffle_button = shuffle_button.on_click(act(|player, cx| {
                 let shuffle = player.state.as_ref().is_some_and(|state| state.shuffle);
