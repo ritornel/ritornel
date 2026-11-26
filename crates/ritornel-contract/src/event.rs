@@ -9,7 +9,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Id, Job, PlaybackEvent, ProgressEvent, QueueEvent, ServerInfo};
+use crate::{Id, Job, Permission, PlaybackEvent, ProgressEvent, QueueEvent, ServerInfo};
 
 /// The method of every event notification.
 pub const EVENT_METHOD: &str = "event";
@@ -24,7 +24,7 @@ pub enum Topic {
     /// A place to play changed. Read `players.list` again.
     Players,
     /// One job's full summary, whenever it changes: at most four times a
-    /// second for one job. Subscribing requires a full session.
+    /// second for one job. Subscribing requires `status:read`.
     Jobs,
     /// The library changed: a hint to read again what is on screen that is
     /// not a view.
@@ -57,6 +57,21 @@ impl Topic {
         Self::Progress,
         Self::Queue,
     ];
+
+    /// Whether a session with `permissions` may subscribe to this topic.
+    pub const fn any_permission(self) -> &'static [Permission] {
+        match self {
+            Self::Servers => &[Permission::StatusRead, Permission::LibraryRead],
+            Self::Players => &[
+                Permission::LibraryRead,
+                Permission::PlaybackControl,
+                Permission::StatusRead,
+            ],
+            Self::Jobs => &[Permission::StatusRead],
+            Self::Library | Self::List => &[Permission::LibraryRead],
+            Self::Playback | Self::Progress | Self::Queue => &[Permission::PlaybackControl],
+        }
+    }
 
     /// The topic as it is written on the wire.
     pub const fn as_str(self) -> &'static str {

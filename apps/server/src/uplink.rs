@@ -26,8 +26,8 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use ritornel_client::contract::{
-    CONTRACT_VERSION, ClientKind, ErrorCode, Event, HelloParams, HubStatus, Id, PresenceHello,
-    RpcError, Topic,
+    CONTRACT_VERSION, ClientKind, ErrorCode, Event, HelloParams, HubStatus, Id, Permission,
+    PresenceHello, RpcError, Topic,
 };
 use ritornel_client::{Client, Credential};
 use ritornel_engine::{Clock, Entropy, HubLink};
@@ -95,6 +95,9 @@ pub(crate) struct Uplink {
     /// [`HUB_CALL_WAIT`](crate::bounds::HUB_CALL_WAIT), but for a test.
     call_wait: std::time::Duration,
     reach: Mutex<Reach>,
+    /// The permissions the hub granted this satellite's link session, once
+    /// observed from `server.hello`.
+    hub_permissions: Mutex<Option<Vec<Permission>>>,
     /// Each client session's connection, by the session's ID.
     sessions: Arc<Mutex<HashMap<u64, Arc<Client>>>>,
     /// The sessions whose connection the hub closed while they followed
@@ -131,6 +134,7 @@ impl Uplink {
             entropy,
             call_wait,
             reach: Mutex::default(),
+            hub_permissions: Mutex::default(),
             sessions: Arc::default(),
             cut: Arc::default(),
             changes: tokio::sync::watch::Sender::new(0),
@@ -316,6 +320,7 @@ impl Uplink {
         }
         reach.answers = Some(false);
         reach.problem = Some(why.to_owned());
+        *lock(&self.hub_permissions) = None;
     }
 
     /// Opens a connection to the hub at `address`, once it has proved it
@@ -337,9 +342,14 @@ impl Uplink {
         .map_err(|error| error.to_string())
     }
 
+    /// The permissions this satellite's link session holds at its hub, when known.
+    pub(crate) fn hub_permissions(&self) -> Option<Vec<Permission>> {
+        lock(&self.hub_permissions).clone()
+    }
+
     async fn hello(&self, client: &Client, presence: Option<PresenceHello>) -> Result<(), String> {
         let name = self.name.borrow().clone();
-        client
+        let descriptor = client
             .hello(&HelloParams {
                 presence,
                 name,
@@ -349,6 +359,7 @@ impl Uplink {
             })
             .await
             .map_err(|error| error.to_string())?;
+        *lock(&self.hub_permissions) = Some(descriptor.permissions);
         Ok(())
     }
 
@@ -839,11 +850,11 @@ async fn answer_player_calls(
     client: &Client,
     mut requests: tokio::sync::mpsc::Receiver<ritornel_contract::Request>,
 ) {
-    // A hub gets the same playback access as a limited local controller.
+    // A hub gets playback access on this satellite's player.
     // Its session has no library views or subscriptions from other clients.
     let session = Arc::new(Session::linked(
         0,
-        ritornel_contract::SessionKind::Limited,
+        crate::session::SessionGrant::for_role(ritornel_contract::TokenRole::Guest),
         None,
     ));
     session.greet();

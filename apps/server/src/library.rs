@@ -111,7 +111,7 @@ mod tests {
     use ritornel_client::Client;
     use ritornel_client::contract::{
         CONTRACT_VERSION, ClientKind, ErrorCode, HelloParams, Id, ServerRole, ServerStatus,
-        SessionKind,
+        TokenRole,
     };
     use ritornel_engine::{OsEntropy, SystemClock, WriteRequest};
 
@@ -131,7 +131,7 @@ mod tests {
 
     /// A client of the server with a full session, that has said hello.
     async fn client(server: &Server) -> Client {
-        let (outgoing, incoming) = server.connect_in_memory(SessionKind::Full);
+        let (outgoing, incoming) = server.connect_in_memory(TokenRole::Owner);
         let client = Client::over_memory(outgoing, incoming);
         client
             .hello(&HelloParams {

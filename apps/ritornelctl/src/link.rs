@@ -22,6 +22,7 @@ pub(crate) fn link(
         LinkCommand::Invite(args) => {
             let params = LinkInviteParams {
                 routes: args.route.clone(),
+                ..Default::default()
             };
             let invite = server::ask(&args.server, env, async |client| {
                 client.call::<Invite>(&params).await

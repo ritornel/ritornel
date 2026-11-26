@@ -81,14 +81,22 @@ pub(super) fn on_a_satellite(method: &str) -> Route {
         "transcode.start" | "transcode.prune" => {
             Route::Refused("manage the transcode cache on the library hub")
         }
+        "lastfm.signInStart"
+        | "lastfm.signInFinish"
+        | "lastfm.signOut"
+        | "lastfm.setScrobbling" => {
+            Route::Refused("connect or configure Last.fm on the library hub")
+        }
         "library.create"
         | "sources.add"
-        | "scan.start"
         | "library.setWatching"
         | "artists.importPictures"
         | "artists.pictureFolders"
         | "sources.tracks"
-        | "history.export" => Route::Refused(FOLDERS),
+        | "history.export"
+        | "identity.dryRun"
+        | "identity.review"
+        | "corrections.discs" => Route::Refused(FOLDERS),
         _ => Route::Hub,
     }
 }
@@ -99,32 +107,6 @@ pub(crate) type Refusal = (u16, String);
 
 fn internal(error: impl std::fmt::Display) -> RpcError {
     RpcError::new(ErrorCode::Internal, error.to_string())
-}
-
-/// Whether `method` is kept from a satellite's link session: what names
-/// the hub's own folders, which a satellite cannot see, and what is for the
-/// hub's own machine alone, such as its backups, its settings and its
-/// links. A satellite is trusted with the library's calls and its own
-/// listens, and no more.
-pub(super) fn kept_from_a_link(method: &str) -> bool {
-    matches!(
-        method,
-        "library.create"
-            | "sources.add"
-            | "transcode.start"
-            | "transcode.prune"
-            | "scan.start"
-            | "library.setWatching"
-            | "artists.importPictures"
-            | "artists.pictureFolders"
-            | "sources.tracks"
-            | "history.export"
-            | "server.backup"
-            | "link.invite"
-            | "link.join"
-            | "server.settings"
-            | "server.setSettings"
-    )
 }
 
 fn not_a_hub() -> RpcError {
@@ -267,7 +249,48 @@ impl Core {
             )
             .with_detail("reason", "loopback_only"));
         }
-        let secret = self.invites.issue(&*self.entropy).map_err(internal)?;
+        let grant = match (&params.role, &params.permissions) {
+            (None, None) => {
+                crate::session::SessionGrant::for_role(ritornel_contract::TokenRole::Personal)
+            }
+            (Some(role), None) => crate::session::SessionGrant::for_role(*role),
+            (None, Some(perms)) => {
+                if perms.is_empty() {
+                    return Err(
+                        RpcError::new(ErrorCode::Invalid, "permissions cannot be empty")
+                            .with_detail("field", "permissions"),
+                    );
+                }
+                let set = ritornel_contract::PermissionSet::from_slice(perms);
+                crate::session::SessionGrant::custom(set.matching_role(), set)
+            }
+            (Some(_), Some(_)) => {
+                return Err(RpcError::new(
+                    ErrorCode::Invalid,
+                    "specify either role or permissions, not both",
+                ));
+            }
+        };
+        // A satellite link cannot hold hub-machine administration permissions
+        // (folders:manage, server:manage, services:connect, access:manage).
+        let link_max =
+            ritornel_contract::PermissionSet::for_role(ritornel_contract::TokenRole::Personal);
+        if !link_max.is_superset_of(grant.permissions) {
+            return Err(RpcError::new(
+                ErrorCode::Forbidden,
+                "a satellite link cannot hold hub-machine administration permissions",
+            ));
+        }
+        if !session.permissions().is_superset_of(grant.permissions) {
+            return Err(RpcError::new(
+                ErrorCode::Forbidden,
+                "cannot grant permissions that the calling session does not hold",
+            ));
+        }
+        let secret = self
+            .invites
+            .issue(&*self.entropy, grant)
+            .map_err(internal)?;
         let invite = InviteLink {
             hub: self.server_id,
             key: self.signer.public_key(),
@@ -317,10 +340,6 @@ impl Core {
         if asked.server_id == self.server_id {
             return Err(refused(409, "a server cannot be its own satellite"));
         }
-        if !self.invites.redeem(&secret) {
-            warn!(peer = %asked.server_id, "a satellite offered a secret that is no open invite's");
-            return Err(refused(403, "no such invite"));
-        }
         let name = untrusted_name(&asked.name);
         let stores = self.stores.read().unwrap_or_else(PoisonError::into_inner);
         let stores = stores
@@ -337,6 +356,26 @@ impl Core {
             warn!(%error, "a satellite could not be linked");
             refused(500, "the hub could not record the link")
         };
+        // Serialize key checks, invite redemption, SQLite issuance, and
+        // in-memory publication so concurrent joins or re-pairings cannot race.
+        let _linking = lock(&self.linking);
+        // Check peer key conflict before spending the invite or touching the
+        // peer registry.
+        if stores
+            .server
+            .peer_public_key(asked.server_id)
+            .map_err(failed)?
+            .is_some_and(|known| known != key)
+        {
+            return Err(refused(
+                409,
+                "a server of this ID is linked already, with another key",
+            ));
+        }
+        let Some(grant) = self.invites.redeem(&secret) else {
+            warn!(peer = %asked.server_id, "a satellite offered a secret that is no open invite's");
+            return Err(refused(403, "no such invite"));
+        };
         // The library first: a satellite registered with no session can
         // join again, and a session with no registry row would deliver
         // listens the library refuses.
@@ -344,16 +383,19 @@ impl Core {
             .register_server(asked.server_id, &name)
             .map_err(failed)?;
         let meta = library.meta().map_err(failed)?;
-        let (session, token) = match stores
-            .server
-            .issue_link_session(asked.server_id, key, &name)
-        {
+        let (session, token) = match stores.server.issue_link_session(
+            asked.server_id,
+            key,
+            &name,
+            grant.role,
+            grant.permissions,
+        ) {
             Ok(issued) => issued,
             Err(ritornel_engine::Error::Invalid(why)) => return Err(refused(409, why)),
             Err(error) => return Err(failed(error)),
         };
         self.link_sessions
-            .add(token.hash(), asked.server_id, session);
+            .add(token.hash(), asked.server_id, session, grant);
         // Whatever the satellite had open on the session it held before
         // ends with it.
         self.close_linked(asked.server_id);
@@ -745,6 +787,8 @@ impl Core {
                 server_id: session.peer,
                 name: session.label,
                 linked_at_ms: session.created_at_ms,
+                permissions: session.permissions.to_vec(),
+                token_role: session.permissions.exact_role(session.role),
             })
             .collect();
         let (awake, kept_awake) = self.awake();

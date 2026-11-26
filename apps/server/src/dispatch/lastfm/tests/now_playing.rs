@@ -6,13 +6,14 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
-use ritornel_contract::{CONTRACT_VERSION, Id, SessionKind};
+use ritornel_contract::{CONTRACT_VERSION, Id, TokenRole};
 use ritornel_engine::{JobState, ScanSettings, run_scan};
 use ritornel_lastfm::fake::FakeLastfm;
 use serde_json::{Value, json};
 
 use super::{Core, Scratch, Session, SetClock, T0, call, hello, key, server_at};
 use crate::lastfm::show_settled;
+use crate::session::SessionGrant;
 
 struct Hub {
     core: Core,
@@ -90,7 +91,7 @@ impl Hub {
             .core
             .open(
                 &mut crate::dispatch::lock(&self.core.sessions),
-                SessionKind::Full,
+                SessionGrant::for_role(TokenRole::Personal),
                 Some(Id::from_bytes([byte; 16])),
             )
             .unwrap();

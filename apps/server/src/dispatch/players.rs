@@ -529,11 +529,16 @@ fn clean(mut summary: PlayerSummary) -> PlayerSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ritornel_contract::{OutputInfo, OutputMode, SessionKind, Topic};
+    use crate::session::SessionGrant;
+    use ritornel_contract::{OutputInfo, OutputMode, TokenRole, Topic};
 
     fn peer_session(core: &Core, peer: Id) -> Arc<Session> {
-        core.open(&mut lock(&core.sessions), SessionKind::Full, Some(peer))
-            .unwrap()
+        core.open(
+            &mut lock(&core.sessions),
+            SessionGrant::for_role(TokenRole::Personal),
+            Some(peer),
+        )
+        .unwrap()
     }
 
     fn hello(name: &str) -> HelloParams {
@@ -601,7 +606,9 @@ mod tests {
     #[test]
     fn only_the_replacement_can_report_or_go_away() {
         let (core, _scratch) = crate::testing::core();
-        let observer = core.open_session(SessionKind::Limited).unwrap();
+        let observer = core
+            .open_session(SessionGrant::for_role(TokenRole::Guest))
+            .unwrap();
         observer.subscribe(&[Topic::Players]);
         let peer = Id::from_bytes([7; 16]);
         let first = peer_session(&core, peer);
@@ -657,7 +664,7 @@ mod tests {
         use ritornel_contract::{LinkPlayerEvent, QueueEvent};
         let (core, _scratch) = crate::testing::core();
         let id = Id::from_bytes([5; 16]);
-        let local = core.open_session(SessionKind::Full).unwrap();
+        let local = core.open_session(SessionGrant::OWNER).unwrap();
         let report = LinkPlayerEvent::Queue(QueueEvent {
             player: Some(core.server_id),
             queue_revision: 9,
@@ -691,7 +698,7 @@ mod tests {
         use serde_json::json;
 
         let (core, _scratch) = crate::testing::core();
-        let session = Session::new(0, SessionKind::Limited);
+        let session = Session::new(0, SessionGrant::for_role(TokenRole::Guest));
         session.greet();
         for (method, params, code) in [
             ("server.status", json!({}), ErrorCode::Forbidden),
@@ -729,7 +736,9 @@ mod tests {
         let peer = Id::from_bytes([8; 16]);
         let first = peer_session(&core, peer);
         announce(&core, &first, "Desk");
-        let controller = core.open_session(SessionKind::Limited).unwrap();
+        let controller = core
+            .open_session(SessionGrant::for_role(TokenRole::Guest))
+            .unwrap();
         controller.greet();
         let read = || {
             let (core, controller) = (Arc::clone(&core), Arc::clone(&controller));

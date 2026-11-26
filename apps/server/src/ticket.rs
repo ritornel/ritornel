@@ -14,11 +14,12 @@ use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use ritornel_contract::{SessionKind, SocketTicket};
+use ritornel_contract::SocketTicket;
 use ritornel_engine::Entropy;
 use subtle::ConstantTimeEq;
 
 use crate::Error;
+use crate::session::SessionGrant;
 
 /// How many tickets may be waiting to be used at once. A ticket is asked
 /// for by a program that is about to open a socket, and waits for
@@ -32,9 +33,9 @@ type Secret = [u8; 32];
 /// A ticket that has been issued and not yet presented.
 struct Waiting {
     secret: Secret,
-    /// The kind of session the credential that asked for it holds, and so
-    /// the kind it opens.
-    kind: SessionKind,
+    /// The permissions the credential that asked for it holds, and so
+    /// what the socket it opens holds.
+    grant: SessionGrant,
     /// When it was made. It opens nothing once its life has passed.
     made: Instant,
 }
@@ -57,18 +58,18 @@ impl Tickets {
         }
     }
 
-    /// Makes a ticket that opens one socket of this kind.
-    pub(crate) fn issue(&self, kind: SessionKind) -> Result<SocketTicket, Error> {
-        self.issue_at(kind, Instant::now())
+    /// Makes a ticket that opens one socket with this grant.
+    pub(crate) fn issue(&self, grant: SessionGrant) -> Result<SocketTicket, Error> {
+        self.issue_at(grant, Instant::now())
     }
 
-    /// The kind of session `presented` opens, if it is a ticket that is
-    /// waiting. It is not waiting afterwards: a ticket works once.
-    pub(crate) fn redeem(&self, presented: &str) -> Option<SessionKind> {
+    /// The grant `presented` opens, if it is a ticket that is waiting.
+    /// It is not waiting afterwards: a ticket works once.
+    pub(crate) fn redeem(&self, presented: &str) -> Option<SessionGrant> {
         self.redeem_at(presented, Instant::now())
     }
 
-    fn issue_at(&self, kind: SessionKind, now: Instant) -> Result<SocketTicket, Error> {
+    fn issue_at(&self, grant: SessionGrant, now: Instant) -> Result<SocketTicket, Error> {
         let mut secret = [0; 32];
         self.entropy.fill(&mut secret)?;
 
@@ -80,7 +81,7 @@ impl Tickets {
         }
         waiting.push(Waiting {
             secret,
-            kind,
+            grant,
             made: now,
         });
         Ok(SocketTicket {
@@ -89,7 +90,7 @@ impl Tickets {
         })
     }
 
-    fn redeem_at(&self, presented: &str, now: Instant) -> Option<SessionKind> {
+    fn redeem_at(&self, presented: &str, now: Instant) -> Option<SessionGrant> {
         let presented = secret_of(presented)?;
         let mut waiting = self.lock();
         self.forget_expired(&mut waiting, now);
@@ -102,7 +103,7 @@ impl Tickets {
                 found = Some(index);
             }
         }
-        found.map(|index| waiting.remove(index).kind)
+        found.map(|index| waiting.remove(index).grant)
     }
 
     /// Drops every ticket whose life has passed.
@@ -158,6 +159,7 @@ fn hex(digit: u8) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
+    use ritornel_contract::TokenRole;
     use ritornel_engine::OsEntropy;
 
     use super::*;
@@ -170,23 +172,24 @@ mod tests {
 
     #[test]
     fn a_ticket_is_64_hex_digits_and_says_how_long_it_works_for() {
-        let issued = tickets().issue(SessionKind::Full).unwrap();
+        let issued = tickets().issue(SessionGrant::OWNER).unwrap();
         assert_eq!(issued.ticket.len(), 64);
         assert!(issued.ticket.bytes().all(|digit| hex(digit).is_some()));
         assert_eq!(issued.expires_in_ms, 10_000);
     }
 
     #[test]
-    fn a_ticket_works_once_and_opens_the_kind_of_session_it_was_made_for() {
+    fn a_ticket_works_once_and_opens_the_grant_it_was_made_for() {
         let tickets = tickets();
-        let full = tickets.issue(SessionKind::Full).unwrap().ticket;
-        let limited = tickets.issue(SessionKind::Limited).unwrap().ticket;
-        assert_ne!(full, limited);
+        let owner = tickets.issue(SessionGrant::OWNER).unwrap().ticket;
+        let guest_grant = SessionGrant::for_role(TokenRole::Guest);
+        let guest = tickets.issue(guest_grant).unwrap().ticket;
+        assert_ne!(owner, guest);
 
-        assert_eq!(tickets.redeem(&limited), Some(SessionKind::Limited));
-        assert_eq!(tickets.redeem(&full), Some(SessionKind::Full));
-        assert_eq!(tickets.redeem(&full), None);
-        assert_eq!(tickets.redeem(&limited), None);
+        assert_eq!(tickets.redeem(&guest), Some(guest_grant));
+        assert_eq!(tickets.redeem(&owner), Some(SessionGrant::OWNER));
+        assert_eq!(tickets.redeem(&owner), None);
+        assert_eq!(tickets.redeem(&guest), None);
         assert_eq!(tickets.waiting(), 0);
     }
 
@@ -194,13 +197,13 @@ mod tests {
     fn a_ticket_stops_working_when_its_time_is_up() {
         let tickets = tickets();
         let made = Instant::now();
-        let just_in_time = tickets.issue_at(SessionKind::Full, made).unwrap().ticket;
-        let too_late = tickets.issue_at(SessionKind::Full, made).unwrap().ticket;
+        let just_in_time = tickets.issue_at(SessionGrant::OWNER, made).unwrap().ticket;
+        let too_late = tickets.issue_at(SessionGrant::OWNER, made).unwrap().ticket;
 
         let last_instant = made + LIFE - Duration::from_nanos(1);
         assert_eq!(
             tickets.redeem_at(&just_in_time, last_instant),
-            Some(SessionKind::Full)
+            Some(SessionGrant::OWNER)
         );
         assert_eq!(tickets.redeem_at(&too_late, made + LIFE), None);
         // It is gone, and not only refused: an earlier clock would not
@@ -212,7 +215,7 @@ mod tests {
     #[test]
     fn a_ticket_with_no_life_never_works() {
         let tickets = Tickets::new(Arc::new(OsEntropy), Duration::ZERO);
-        let issued = tickets.issue(SessionKind::Full).unwrap();
+        let issued = tickets.issue(SessionGrant::OWNER).unwrap();
         assert_eq!(issued.expires_in_ms, 0);
         assert_eq!(tickets.redeem(&issued.ticket), None);
     }
@@ -220,7 +223,7 @@ mod tests {
     #[test]
     fn what_was_never_issued_opens_nothing_and_spends_nothing() {
         let tickets = tickets();
-        let real = tickets.issue(SessionKind::Full).unwrap().ticket;
+        let real = tickets.issue(SessionGrant::OWNER).unwrap().ticket;
         let mut one_digit_off = real.clone().into_bytes();
         one_digit_off[63] = if one_digit_off[63] == b'0' {
             b'1'
@@ -240,24 +243,24 @@ mod tests {
         ] {
             assert_eq!(tickets.redeem(&made_up), None, "{} bytes", made_up.len());
         }
-        assert_eq!(tickets.redeem(&real), Some(SessionKind::Full));
+        assert_eq!(tickets.redeem(&real), Some(SessionGrant::OWNER));
     }
 
     #[test]
     fn with_the_list_full_the_oldest_ticket_gives_way() {
         let tickets = tickets();
-        let oldest = tickets.issue(SessionKind::Full).unwrap().ticket;
-        let second = tickets.issue(SessionKind::Full).unwrap().ticket;
+        let oldest = tickets.issue(SessionGrant::OWNER).unwrap().ticket;
+        let second = tickets.issue(SessionGrant::OWNER).unwrap().ticket;
         for _ in 2..MAX_WAITING {
-            tickets.issue(SessionKind::Full).unwrap();
+            tickets.issue(SessionGrant::OWNER).unwrap();
         }
         assert_eq!(tickets.waiting(), MAX_WAITING);
 
-        let newest = tickets.issue(SessionKind::Full).unwrap().ticket;
+        let newest = tickets.issue(SessionGrant::OWNER).unwrap().ticket;
         assert_eq!(tickets.waiting(), MAX_WAITING);
         assert_eq!(tickets.redeem(&oldest), None);
-        assert_eq!(tickets.redeem(&second), Some(SessionKind::Full));
-        assert_eq!(tickets.redeem(&newest), Some(SessionKind::Full));
+        assert_eq!(tickets.redeem(&second), Some(SessionGrant::OWNER));
+        assert_eq!(tickets.redeem(&newest), Some(SessionGrant::OWNER));
     }
 
     #[test]
@@ -265,16 +268,16 @@ mod tests {
         let tickets = tickets();
         let made = Instant::now();
         for _ in 0..MAX_WAITING {
-            tickets.issue_at(SessionKind::Full, made).unwrap();
+            tickets.issue_at(SessionGrant::OWNER, made).unwrap();
         }
-        tickets.issue_at(SessionKind::Full, made + LIFE).unwrap();
+        tickets.issue_at(SessionGrant::OWNER, made + LIFE).unwrap();
         assert_eq!(tickets.waiting(), 1);
     }
 
     #[test]
     fn what_is_waiting_is_not_printed() {
         let tickets = tickets();
-        let issued = tickets.issue(SessionKind::Full).unwrap();
+        let issued = tickets.issue(SessionGrant::OWNER).unwrap();
         let printed = format!("{tickets:?}");
         assert!(!printed.contains(&issued.ticket), "{printed}");
         assert_eq!(printed, "Tickets { life: 10s, .. }");

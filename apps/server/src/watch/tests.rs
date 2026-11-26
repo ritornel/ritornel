@@ -9,7 +9,7 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use ritornel_contract::{
     AutoTrigger, CONTRACT_VERSION, Frame, Id, ListKind, Query, Request, RequestId, Row,
-    ScanSummary, SessionKind, WatchState, WatchedKind,
+    ScanSummary, WatchState, WatchedKind,
 };
 use ritornel_engine::{JobState, OsEntropy, ScanSettings, ServerStore, scan_summary};
 use serde_json::{Value, json};
@@ -18,7 +18,7 @@ use super::{Backend, Folder, SIGNALS, Signal, Signals, Watch, WatchRun, receive,
 use crate::Bounds;
 use crate::data_dir::DataDir;
 use crate::dispatch::{Core, Stores};
-use crate::session::Session;
+use crate::session::{Session, SessionGrant};
 use crate::testing::{Scratch, SetClock};
 
 /// 2025-11-16 12:00 UTC.
@@ -125,7 +125,7 @@ impl Rig {
             ..WatchRun::on()
         };
         core.set_watch(run.clone());
-        let session = core.open_session(SessionKind::Full).unwrap();
+        let session = core.open_session(SessionGrant::OWNER).unwrap();
         let fake = Shared::default();
         fake.0.lock().unwrap().refuse = refuse;
         let mut rig = Self {
@@ -1161,7 +1161,7 @@ mod running {
     use ritornel_client::contract::{
         AutoTrigger, CONTRACT_VERSION, ClientKind, Event, HelloParams, HistoryRecentParams, Id,
         ImportPicturesParams, NoParams, PlaySource, PlaybackCommandParams, PlaybackGetParams,
-        PlaybackPlayParams, PlaybackStatus, QueueWindowParams, SessionKind, SourcesTracksParams,
+        PlaybackPlayParams, PlaybackStatus, QueueWindowParams, SourcesTracksParams, TokenRole,
         Topic, WatchState, WatchedFolder, WatchedKind,
     };
     use ritornel_engine::playback::Output;
@@ -1199,7 +1199,7 @@ mod running {
         )
         .await
         .unwrap();
-        let (outgoing, incoming) = server.connect_in_memory(SessionKind::Full);
+        let (outgoing, incoming) = server.connect_in_memory(TokenRole::Owner);
         let client = Client::over_memory(outgoing, incoming);
         client
             .hello(&HelloParams {

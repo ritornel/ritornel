@@ -1437,7 +1437,7 @@ mod tests {
                         revision: 1,
                     }),
                     free_disk: FreeDisk { data_bytes: None },
-                    log_path: "/tmp".to_owned(),
+                    log_path: Some("/tmp".to_owned()),
                     watch: None,
                     backup: None,
                     record: None,

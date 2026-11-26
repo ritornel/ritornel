@@ -9,7 +9,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Id, ListSupport};
+use crate::{Id, ListSupport, Permission, TokenRole};
 
 /// A server's own record of its role. The library's hub pointer decides
 /// which server is the hub ("Server identity and hub role" in
@@ -35,19 +35,6 @@ impl ServerRole {
             Self::Satellite => "satellite",
         }
     }
-}
-
-/// What a session may do ("Local credentials, sessions, and tokens" in
-/// docs/internals/linking.md).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[cfg_attr(test, derive(ts_rs::TS))]
-#[serde(rename_all = "snake_case")]
-pub enum SessionKind {
-    /// Everything.
-    Full,
-    /// Read the library and control playback. It may change or delete
-    /// nothing.
-    Limited,
 }
 
 /// What sort of program a client is. It is for logs and for display, and
@@ -280,8 +267,16 @@ pub struct Descriptor {
     /// What anyone may know.
     #[serde(flatten)]
     pub server: PublicDescriptor,
-    /// What this session may do.
-    pub session_kind: SessionKind,
+    /// The permissions this session holds.
+    pub permissions: Vec<Permission>,
+    /// The named role this session's permissions match, when unchanged from it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub token_role: Option<TokenRole>,
+    /// On a satellite, the permissions its hub link holds when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub hub_permissions: Option<Vec<Permission>>,
 }
 
 /// The params of a method that takes none: an empty object, which may also
@@ -316,8 +311,10 @@ pub struct ServerStatus {
     /// The space left where the server keeps what it owns.
     pub free_disk: FreeDisk,
     /// The directory the server writes its logs in, on the server's own
-    /// disk.
-    pub log_path: String,
+    /// disk. Left out when the session lacks `folders:manage`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub log_path: Option<String>,
     /// Whether the server watches its folders for changes, and what it last
     /// did on its own. Left out by a server that does not say.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -479,8 +476,11 @@ pub struct BackupStatus {
 pub struct BackupMade {
     /// When it was taken, as Unix milliseconds.
     pub at: i64,
-    /// Its folder, on the server's own disk.
-    pub path: String,
+    /// Its folder, on the server's own disk. Left out when the session lacks
+    /// `folders:manage`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub path: Option<String>,
     /// Why it was taken.
     pub reason: BackupReason,
     /// Whether its folder is still there.
@@ -524,8 +524,11 @@ impl BackupReason {
 pub struct BackupFailure {
     /// When it failed, as Unix milliseconds.
     pub at: i64,
-    /// What went wrong, as a person reads it.
-    pub message: String,
+    /// What went wrong, as a person reads it. Left out when the session lacks
+    /// `folders:manage`, since OS errors may carry filesystem paths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub message: Option<String>,
 }
 
 /// The params of `server.backup`.
@@ -848,10 +851,6 @@ mod tests {
         assert_eq!(serde_json::to_value(&hello).unwrap(), wire);
         assert_eq!(serde_json::from_value::<HelloParams>(wire).unwrap(), hello);
 
-        assert_eq!(
-            serde_json::to_value(SessionKind::Limited).unwrap(),
-            "limited"
-        );
         for role in [
             ServerRole::Unassigned,
             ServerRole::Hub,
@@ -871,10 +870,12 @@ mod tests {
     }
 
     #[test]
-    fn the_descriptor_is_the_public_one_and_the_sessions_kind_in_one_object() {
+    fn the_descriptor_is_the_public_one_and_the_sessions_permissions_in_one_object() {
         let descriptor = Descriptor {
             server: public(),
-            session_kind: SessionKind::Full,
+            permissions: Permission::ALL.to_vec(),
+            token_role: Some(TokenRole::Owner),
+            hub_permissions: None,
         };
         let wire = json!({
             "serverId": "11111111-1111-1111-1111-111111111111",
@@ -890,7 +891,17 @@ mod tests {
             },
             "lists": [],
             "artSizes": [64, 128],
-            "sessionKind": "full",
+            "permissions": [
+                "library:read",
+                "library:write",
+                "playback:control",
+                "status:read",
+                "folders:manage",
+                "server:manage",
+                "services:connect",
+                "access:manage",
+            ],
+            "tokenRole": "owner",
         });
         assert_eq!(serde_json::to_value(&descriptor).unwrap(), wire);
         assert_eq!(
@@ -951,7 +962,7 @@ mod tests {
             free_disk: FreeDisk {
                 data_bytes: Some(1_000),
             },
-            log_path: "/srv/ritornel/logs".to_owned(),
+            log_path: Some("/srv/ritornel/logs".to_owned()),
             watch: None,
             backup: None,
             record: None,

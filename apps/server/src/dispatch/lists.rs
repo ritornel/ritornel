@@ -383,11 +383,10 @@ impl Core {
 
 #[cfg(test)]
 mod tests {
-    use ritornel_contract::{
-        Frame, LibraryChange, ListKind, Notification, SessionKind, SortKey, Topic,
-    };
+    use ritornel_contract::{Frame, LibraryChange, ListKind, Notification, SortKey, Topic};
 
     use super::*;
+    use crate::session::SessionGrant;
 
     fn view(kind: ListKind) -> Arc<View> {
         Arc::new(View {
@@ -402,7 +401,7 @@ mod tests {
     /// A session told of library writes, holding a view of songs and one
     /// of albums, and the fanout that tells it.
     fn watching() -> (Arc<Session>, Fanout) {
-        let session = Arc::new(Session::new(1, SessionKind::Full));
+        let session = Arc::new(Session::new(1, SessionGrant::OWNER));
         session.subscribe(&[Topic::Library]);
         session.hold_view("songs".to_owned(), view(ListKind::Songs));
         session.hold_view("albums".to_owned(), view(ListKind::Albums));

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
-use ritornel_client::contract::{CONTRACT_VERSION, ClientKind, HelloParams, Id, SessionKind};
+use ritornel_client::contract::{CONTRACT_VERSION, ClientKind, HelloParams, Id, TokenRole};
 use ritornel_client::{Client, Credential};
 use ritornel_engine::{OsEntropy, SystemClock};
 use ritornel_server::{Bounds, HeldDir, Listen, Server};
@@ -195,7 +195,7 @@ impl Running {
     pub(crate) async fn connect(&self, via: Via) -> Client {
         match via {
             Via::Memory => {
-                let (outgoing, incoming) = self.server.connect_in_memory(SessionKind::Full);
+                let (outgoing, incoming) = self.server.connect_in_memory(TokenRole::Owner);
                 Client::over_memory(outgoing, incoming)
             }
             Via::Socket => Client::connect(self.endpoint(), &self.credential())

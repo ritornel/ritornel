@@ -12,18 +12,53 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
-use ritornel_contract::{EVENT_METHOD, Event, Frame, Id, Notification, SessionKind, Topic};
+use ritornel_contract::{
+    EVENT_METHOD, Event, Frame, Id, Notification, Permission, PermissionSet, TokenRole, Topic,
+};
 use ritornel_engine::View;
 use tokio::sync::{Notify, watch};
 use tracing::error;
 
 use crate::views::Views;
 
+/// What a verified credential or socket ticket grants a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SessionGrant {
+    pub(crate) role: Option<TokenRole>,
+    pub(crate) permissions: PermissionSet,
+}
+
+impl SessionGrant {
+    /// Full local-owner access (every permission, role `owner`).
+    pub(crate) const OWNER: Self = Self {
+        role: Some(TokenRole::Owner),
+        permissions: PermissionSet::ALL,
+    };
+
+    /// Grants the exact permission set of a named role.
+    pub(crate) const fn for_role(role: TokenRole) -> Self {
+        Self {
+            role: Some(role),
+            permissions: PermissionSet::for_role(role),
+        }
+    }
+
+    /// Grants a custom permission set with an optional origin role.
+    pub(crate) const fn custom(role: Option<TokenRole>, permissions: PermissionSet) -> Self {
+        Self { role, permissions }
+    }
+
+    /// The named role when `permissions` still match it exactly.
+    pub(crate) const fn effective_role(self) -> Option<TokenRole> {
+        self.permissions.exact_role(self.role)
+    }
+}
+
 /// One client's session on one transport.
 #[derive(Debug)]
 pub(crate) struct Session {
     id: u64,
-    kind: SessionKind,
+    grant: SessionGrant,
     /// On a hub, the satellite this session is the link of.
     peer: Option<Id>,
     state: Mutex<State>,
@@ -155,16 +190,16 @@ fn merge(unsent: &mut Event, newer: Event) {
 
 impl Session {
     #[cfg(test)]
-    pub(crate) fn new(id: u64, kind: SessionKind) -> Self {
-        Self::linked(id, kind, None)
+    pub(crate) fn new(id: u64, grant: SessionGrant) -> Self {
+        Self::linked(id, grant, None)
     }
 
     /// A session that is the link of the satellite `peer`, if there is one.
-    pub(crate) fn linked(id: u64, kind: SessionKind, peer: Option<Id>) -> Self {
+    pub(crate) fn linked(id: u64, grant: SessionGrant, peer: Option<Id>) -> Self {
         Self {
             last_heard: watch::Sender::new(None),
             id,
-            kind,
+            grant,
             peer,
             state: Mutex::default(),
             wake: Notify::new(),
@@ -180,8 +215,24 @@ impl Session {
         self.id
     }
 
-    pub(crate) fn kind(&self) -> SessionKind {
-        self.kind
+    pub(crate) fn grant(&self) -> SessionGrant {
+        self.grant
+    }
+
+    pub(crate) fn permissions(&self) -> PermissionSet {
+        self.grant.permissions
+    }
+
+    pub(crate) fn has(&self, permission: Permission) -> bool {
+        self.grant.permissions.contains(permission)
+    }
+
+    pub(crate) fn has_all(&self, required: &[Permission]) -> bool {
+        self.grant.permissions.contains_all(required)
+    }
+
+    pub(crate) fn has_any(&self, candidates: &[Permission]) -> bool {
+        self.grant.permissions.contains_any(candidates)
     }
 
     /// The satellite this session is the link of: `None` for a client's.
@@ -488,9 +539,7 @@ struct Closed;
 
 #[cfg(test)]
 mod tests {
-    use ritornel_contract::{
-        Id, RequestId, Response, ServerInfo, ServerRole, ServersEvent, SessionKind,
-    };
+    use ritornel_contract::{Id, RequestId, Response, ServerInfo, ServerRole, ServersEvent};
     use serde_json::json;
 
     use super::*;
@@ -516,7 +565,7 @@ mod tests {
     }
 
     fn subscribed() -> Session {
-        let session = Session::new(1, SessionKind::Full);
+        let session = Session::new(1, SessionGrant::OWNER);
         assert_eq!(session.subscribe(&[Topic::Servers]), [Topic::Servers]);
         session
     }
@@ -584,7 +633,7 @@ mod tests {
     #[test]
     fn unsent_player_events_coalesce_and_unsubscribe_within_one_player_only() {
         use ritornel_contract::QueueEvent;
-        let session = Session::new(1, SessionKind::Limited);
+        let session = Session::new(1, SessionGrant::for_role(TokenRole::Player));
         let remote = Some(Id::from_bytes([5; 16]));
         let another = Some(Id::from_bytes([6; 16]));
         for player in [None, remote, another] {
@@ -634,7 +683,7 @@ mod tests {
 
     #[test]
     fn a_session_that_did_not_subscribe_is_sent_no_event() {
-        let session = Session::new(1, SessionKind::Full);
+        let session = Session::new(1, SessionGrant::OWNER);
         session.publish(status(1, "desk", 2));
         assert_eq!(drain(&session), []);
     }
@@ -737,7 +786,7 @@ mod tests {
     #[test]
     fn library_events_merge_into_the_highest_revision_and_every_kind_of_change() {
         use ritornel_contract::LibraryChange::{Membership, Metadata, Stats};
-        let session = Session::new(1, SessionKind::Full);
+        let session = Session::new(1, SessionGrant::OWNER);
         // Not subscribed: nothing.
         session.publish(library(2, &[Metadata]));
         assert_eq!(drain(&session), []);
@@ -752,7 +801,7 @@ mod tests {
 
     #[test]
     fn a_list_event_needs_no_subscription_and_a_reorder_is_never_lost_in_a_merge() {
-        let session = Session::new(1, SessionKind::Full);
+        let session = Session::new(1, SessionGrant::OWNER);
         session.publish(list("a", 2, true));
         session.publish(list("b", 2, false));
         session.publish(list("a", 3, false));
@@ -762,7 +811,7 @@ mod tests {
 
     #[test]
     fn a_session_holds_views_until_it_closes() {
-        let session = Session::new(1, SessionKind::Full);
+        let session = Session::new(1, SessionGrant::OWNER);
         let resolved = std::sync::Arc::new(ritornel_engine::View {
             kind: ritornel_contract::ListKind::Artists,
             sort: ritornel_contract::SortKey::Name,
@@ -780,9 +829,10 @@ mod tests {
     }
 
     #[test]
-    fn a_session_starts_ungreeted_with_the_kind_it_was_given() {
-        let session = Session::new(7, SessionKind::Limited);
-        assert_eq!((session.id(), session.kind()), (7, SessionKind::Limited));
+    fn a_session_starts_ungreeted_with_the_grant_it_was_given() {
+        let grant = SessionGrant::for_role(TokenRole::Guest);
+        let session = Session::new(7, grant);
+        assert_eq!((session.id(), session.grant()), (7, grant));
         assert!(!session.greeted());
         session.greet();
         assert!(session.greeted());

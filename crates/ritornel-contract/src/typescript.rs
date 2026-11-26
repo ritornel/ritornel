@@ -32,8 +32,8 @@ use ts_rs::{Config, TS, TypeVisitor};
 use crate::methods::{Method, MethodKind, MethodVisitor, visit_methods};
 use crate::{
     ART_SIZES, CONTRACT_VERSION, EVENT_METHOD, Event, FILTER_VERSION, MAX_CLIENT_TEXT,
-    MEDIA_TOKEN_PARAM, PublicDescriptor, Receipt, RpcError, SocketTicket, TICKET_PARAM, Topic,
-    capability, route,
+    MEDIA_TOKEN_PARAM, Permission, PublicDescriptor, Receipt, RpcError, SocketTicket, TICKET_PARAM,
+    TokenRole, Topic, capability, route,
 };
 
 /// The file, from the repository root.
@@ -189,7 +189,8 @@ fn declaration<T: TS + ?Sized>(config: &Config) -> String {
 struct Row {
     name: &'static str,
     kind: MethodKind,
-    needs_full: bool,
+    needs: &'static [Permission],
+    link_only: bool,
     params: String,
     result: String,
 }
@@ -208,7 +209,8 @@ impl MethodVisitor for Table {
         self.rows.push(Row {
             name: M::NAME,
             kind: M::KIND,
-            needs_full: M::NEEDS_FULL,
+            needs: M::NEEDS,
+            link_only: M::LINK_ONLY,
             params: M::Params::name(&self.declarations.config),
             result: M::Result::name(&self.declarations.config),
         });
@@ -239,6 +241,8 @@ fn generate() -> String {
     declarations.visit::<Receipt>();
     declarations.visit::<Event>();
     declarations.visit::<Topic>();
+    declarations.visit::<Permission>();
+    declarations.visit::<TokenRole>();
     declarations.visit::<RpcError>();
     declarations.visit::<PublicDescriptor>();
     declarations.visit::<route::Health>();
@@ -282,8 +286,31 @@ fn generate() -> String {
         .iter()
         .map(|row| {
             let (name, kind) = (quoted(row.name), quoted(kind(row.kind)));
-            let needs_full = row.needs_full;
-            format!("  {name}: {{ kind: {kind}, needsFull: {needs_full} }},\n")
+            let needs: String = row
+                .needs
+                .iter()
+                .map(|p| quoted(p.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let link_only = row.link_only;
+            format!("  {name}: {{ kind: {kind}, needs: [{needs}], linkOnly: {link_only} }},\n")
+        })
+        .collect();
+    let permissions_const: String = Permission::ALL
+        .iter()
+        .map(|p| quoted(p.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let roles_const: String = TokenRole::ALL
+        .iter()
+        .map(|r| {
+            let perms: String = r
+                .permissions()
+                .iter()
+                .map(|p| quoted(p.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("  {}: [{perms}],\n", quoted(r.as_str()))
         })
         .collect();
     let method_map: String = rows
@@ -338,9 +365,16 @@ export const ART_SIZES = [{art_sizes}] as const;
 /** The version of the filter language a filter is written in. */
 export const FILTER_VERSION = {FILTER_VERSION};
 
+/** Every permission a token may hold, in canonical order. */
+export const PERMISSIONS = [{permissions_const}] as const;
+
+/** Default permission sets for each named token role. */
+export const TOKEN_ROLES = {{
+{roles_const}}} as const;
+
 /**
  * Every method, in the order of the method table: what kind of call it is,
- * and whether it needs a `full` session.
+ * which permissions it needs, and whether it is restricted to link sessions.
  */
 export const METHODS = {{
 {methods}}} as const;
@@ -569,8 +603,15 @@ fn the_maps_follow_the_method_table_and_the_topics() {
         );
         assert!(text.contains(&row), "{row}");
     }
-    assert!(text.contains("  \"server.status\": { kind: \"query\", needsFull: true },\n"));
-    assert!(text.contains("  \"library.create\": { kind: \"command\", needsFull: true },\n"));
+    assert!(text.contains(
+        "  \"server.status\": { kind: \"query\", needs: [\"status:read\"], linkOnly: false },\n"
+    ));
+    assert!(text.contains(
+        "  \"library.create\": { kind: \"command\", needs: [\"server:manage\"], linkOnly: false },\n"
+    ));
+    assert!(text.contains(
+        "  \"link.tracks\": { kind: \"query\", needs: [\"library:read\"], linkOnly: true },\n"
+    ));
     assert!(text.contains("  \"servers\": Extract<Event, { topic: \"servers\" }>;\n"));
     assert!(text.contains("  \"jobs\": Extract<Event, { topic: \"jobs\" }>;\n"));
     assert!(text.contains("  \"list\": Extract<Event, { topic: \"list\" }>;\n"));

@@ -55,7 +55,7 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
 use ritornel_contract::route::{self, Health, HealthStatus};
 use ritornel_contract::{
-    ART_SIZES, Id, MEDIA_TOKEN_PARAM, NONCE_PARAM, SessionKind, TICKET_PARAM, hex,
+    ART_SIZES, Id, MEDIA_TOKEN_PARAM, NONCE_PARAM, Permission, PermissionSet, TICKET_PARAM, hex,
 };
 use ritornel_engine::SessionToken;
 use ritornel_engine::playback::FileFacts;
@@ -67,6 +67,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::dispatch::{Core, MAX_MESSAGE_BYTES};
 use crate::link::Peer;
+use crate::session::SessionGrant;
 use crate::ticket::Tickets;
 use crate::transport::{self, Wire};
 use crate::{Bounds, Error, Listen};
@@ -344,23 +345,32 @@ async fn require_credential(
     // database, so a request costs an async worker nothing it could wait on.
     let by_header = bearer(request.headers())
         .and_then(|token| core.authenticate(&token))
-        .map(|(kind, peer)| (kind, peer, Presented::Header));
+        .map(|(grant, peer)| (grant, peer, Presented::Header));
     let admitted = by_header
         .or_else(|| {
             socket_ticket(&request)
                 .and_then(|ticket| tickets.redeem(ticket))
-                .map(|kind| (kind, None, Presented::Ticket))
+                .map(|grant| (grant, None, Presented::Ticket))
         })
         .or_else(|| {
-            // A media token reads media, and nothing else: a session of no
-            // kind is opened with it.
+            // A media token reads artwork and nothing else: it cannot open
+            // a WebSocket session or exchange for a ticket.
             media_token(&request)
                 .filter(|token| core.media_accepts(token))
-                .map(|_| (SessionKind::Limited, None, Presented::MediaToken))
+                .map(|_| {
+                    (
+                        SessionGrant::custom(
+                            None,
+                            PermissionSet::from_slice(&[Permission::LibraryRead]),
+                        ),
+                        None,
+                        Presented::MediaToken,
+                    )
+                })
         });
     match admitted {
-        Some((kind, peer, presented)) => {
-            request.extensions_mut().insert(kind);
+        Some((grant, peer, presented)) => {
+            request.extensions_mut().insert(grant);
             request.extensions_mut().insert(peer);
             request.extensions_mut().insert(presented);
             next.run(request).await
@@ -445,17 +455,20 @@ async fn descriptor(State(core): State<Arc<Core>>, request: Request) -> Response
     }
 }
 
-async fn health() -> Response {
+async fn health(Extension(grant): Extension<SessionGrant>) -> Response {
+    if !grant.permissions.contains(Permission::StatusRead) {
+        return (StatusCode::FORBIDDEN, "health requires status:read\n").into_response();
+    }
     json(&Health {
         status: HealthStatus::Ok,
     })
 }
 
-/// Trades the credential for a ticket that opens one socket of the kind
-/// the credential holds.
+/// Trades the credential for a ticket that opens one socket carrying the
+/// permissions the credential holds.
 async fn ticket(
     Extension(tickets): Extension<Arc<Tickets>>,
-    Extension(kind): Extension<SessionKind>,
+    Extension(grant): Extension<SessionGrant>,
     Extension(peer): Extension<Option<Peer>>,
     headers: HeaderMap,
 ) -> Response {
@@ -475,7 +488,7 @@ async fn ticket(
     if headers.contains_key(header::ORIGIN) {
         return (StatusCode::FORBIDDEN, "a page may not ask for a ticket\n").into_response();
     }
-    match tickets.issue(kind) {
+    match tickets.issue(grant) {
         Ok(issued) => {
             let mut response = json(&issued);
             response.headers_mut().insert(
@@ -501,11 +514,16 @@ const AUDIO_CHUNK: usize = 256 * 1024;
 /// changed, or a later scan has read it again.
 async fn audio(
     State(core): State<Arc<Core>>,
+    Extension(grant): Extension<SessionGrant>,
     Extension(peer): Extension<Option<Peer>>,
     Path((appearance, item, revision)): Path<(String, String, String)>,
 ) -> Response {
-    if peer.is_none() {
-        return (StatusCode::FORBIDDEN, "only a satellite reads masters\n").into_response();
+    if peer.is_none() || !grant.permissions.contains(Permission::LibraryRead) {
+        return (
+            StatusCode::FORBIDDEN,
+            "only a satellite with library:read reads masters\n",
+        )
+            .into_response();
     }
     let (Ok(appearance), Ok(item), Ok(revision)) = (
         appearance.parse::<Id>(),
@@ -625,7 +643,14 @@ async fn join(State(core): State<Arc<Core>>, request: Request) -> Response {
 /// The answer never changes for one URL, so it may be kept for a year.
 /// A cover that cannot be found, at a size that is not a bucket or for an
 /// art ID that is not one, is 404.
-async fn art(State(core): State<Arc<Core>>, Path((art, size)): Path<(String, String)>) -> Response {
+async fn art(
+    State(core): State<Arc<Core>>,
+    Extension(grant): Extension<SessionGrant>,
+    Path((art, size)): Path<(String, String)>,
+) -> Response {
+    if !grant.permissions.contains(Permission::LibraryRead) {
+        return (StatusCode::FORBIDDEN, "artwork requires library:read\n").into_response();
+    }
     let (Ok(art), Ok(size)) = (art.parse::<Id>(), size.parse::<u32>()) else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -722,7 +747,7 @@ fn origin_may_open_a_socket(headers: &HeaderMap, presented: Presented) -> bool {
 
 async fn socket(
     State(core): State<Arc<Core>>,
-    Extension(kind): Extension<SessionKind>,
+    Extension(grant): Extension<SessionGrant>,
     Extension(peer): Extension<Option<Peer>>,
     Extension(presented): Extension<Presented>,
     headers: HeaderMap,
@@ -746,7 +771,7 @@ async fn socket(
         .max_frame_size(MAX_MESSAGE_BYTES)
         .on_upgrade(move |socket| async move {
             // The session runs as a task the server owns, not as this one.
-            if let Err(mut socket) = core.run(kind, peer.map(|peer| peer.server), socket) {
+            if let Err(mut socket) = core.run(grant, peer, socket) {
                 // The server began to stop, or the last place was taken,
                 // while the socket was being opened.
                 let _ = socket.send(Message::Close(None)).await;

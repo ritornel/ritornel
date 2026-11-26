@@ -16,6 +16,7 @@ use ritornel_contract::{
 use ritornel_engine::{Entropy, LinkSession, SessionToken, Signer};
 
 use crate::Listen;
+use crate::session::SessionGrant;
 
 /// How long an invite works.
 pub(crate) const INVITE_LIFE: Duration = Duration::from_secs(10 * 60);
@@ -30,31 +31,34 @@ pub(crate) struct Invites(Mutex<Open>);
 
 #[derive(Debug, Default)]
 struct Open {
-    /// The SHA-256 of each secret, with when it stops working.
-    invites: Vec<([u8; 32], Instant)>,
+    /// The SHA-256 of each secret, when it stops working, and what grant it issues.
+    invites: Vec<([u8; 32], Instant, SessionGrant)>,
 }
 
 impl Invites {
-    /// Makes an invite's secret.
-    pub(crate) fn issue(&self, entropy: &dyn Entropy) -> Result<[u8; 32], ritornel_engine::Error> {
+    /// Makes an invite's secret carrying `grant`.
+    pub(crate) fn issue(
+        &self,
+        entropy: &dyn Entropy,
+        grant: SessionGrant,
+    ) -> Result<[u8; 32], ritornel_engine::Error> {
         let mut secret = [0; 32];
         entropy.fill(&mut secret)?;
         let now = Instant::now();
         let mut open = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        open.invites.retain(|(_, until)| *until > now);
-        open.invites.push((hash(&secret), now + INVITE_LIFE));
+        open.invites.retain(|(_, until, _)| *until > now);
+        open.invites.push((hash(&secret), now + INVITE_LIFE, grant));
         Ok(secret)
     }
 
-    /// Whether `secret` is an open invite's, which it then no longer is.
-    pub(crate) fn redeem(&self, secret: &[u8]) -> bool {
+    /// Consumes an open invite and returns the grant it carries, if valid.
+    pub(crate) fn redeem(&self, secret: &[u8]) -> Option<SessionGrant> {
         let hash = hash(secret);
         let now = Instant::now();
         let mut open = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        open.invites.retain(|(_, until)| *until > now);
-        let before = open.invites.len();
-        open.invites.retain(|(held, _)| *held != hash);
-        open.invites.len() < before
+        open.invites.retain(|(_, until, _)| *until > now);
+        let index = open.invites.iter().position(|(held, _, _)| *held == hash)?;
+        Some(open.invites.remove(index).2)
     }
 }
 
@@ -71,6 +75,8 @@ pub(crate) struct Peer {
     pub(crate) server: Id,
     /// The link session's public ID.
     pub(crate) session: Id,
+    /// The permissions granted to this satellite's link session.
+    pub(crate) grant: SessionGrant,
 }
 
 /// The link sessions a hub has issued, by the hash of their tokens. A
@@ -83,16 +89,28 @@ impl LinkSessions {
     pub(crate) fn new(sessions: Vec<LinkSession>) -> Self {
         let held = Self::default();
         for session in sessions {
-            held.add(session.token_hash, session.peer, session.session);
+            held.add(
+                session.token_hash,
+                session.peer,
+                session.session,
+                SessionGrant::custom(session.role, session.permissions),
+            );
         }
         held
     }
 
     /// Takes a session in, ending any the same satellite held before.
-    pub(crate) fn add(&self, token_hash: [u8; 32], server: Id, session: Id) {
+    pub(crate) fn add(&self, token_hash: [u8; 32], server: Id, session: Id, grant: SessionGrant) {
         let mut held = self.0.write().unwrap_or_else(PoisonError::into_inner);
         held.retain(|_, peer| peer.server != server);
-        held.insert(token_hash, Peer { server, session });
+        held.insert(
+            token_hash,
+            Peer {
+                server,
+                session,
+                grant,
+            },
+        );
     }
 
     /// The satellite whose link session `token` is, if it is one.
@@ -104,6 +122,15 @@ impl LinkSessions {
             .unwrap_or_else(PoisonError::into_inner)
             .get(&token.hash())
             .copied()
+    }
+
+    /// Whether `session` is still the active link session for `server`.
+    pub(crate) fn is_current(&self, server: Id, session: Id) -> bool {
+        self.0
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .any(|peer| peer.server == server && peer.session == session)
     }
 }
 
@@ -527,29 +554,32 @@ mod tests {
     fn an_invite_works_once_and_wrong_secrets_end_none() {
         let invites = Invites::default();
         let entropy = ritornel_engine::OsEntropy;
-        let first = invites.issue(&entropy).unwrap();
-        assert!(invites.redeem(&first));
-        assert!(!invites.redeem(&first));
+        let grant = SessionGrant::for_role(ritornel_contract::TokenRole::Personal);
+        let first = invites.issue(&entropy, grant).unwrap();
+        assert_eq!(invites.redeem(&first), Some(grant));
+        assert_eq!(invites.redeem(&first), None);
 
-        let second = invites.issue(&entropy).unwrap();
+        let second = invites.issue(&entropy, grant).unwrap();
         for _ in 0..100 {
-            assert!(!invites.redeem(&[0; 32]));
+            assert_eq!(invites.redeem(&[0; 32]), None);
         }
-        assert!(invites.redeem(&second));
+        assert_eq!(invites.redeem(&second), Some(grant));
     }
 
     #[test]
     fn a_satellite_holds_one_link_session() {
         let sessions = LinkSessions::default();
+        let grant = SessionGrant::for_role(ritornel_contract::TokenRole::Personal);
         let (peer, other) = (Id::from_bytes([1; 16]), Id::from_bytes([2; 16]));
         let (old, new) = (SessionToken::new("old"), SessionToken::new("new"));
-        sessions.add(old.hash(), peer, Id::from_bytes([3; 16]));
+        sessions.add(old.hash(), peer, Id::from_bytes([3; 16]), grant);
         sessions.add(
             SessionToken::new("o").hash(),
             other,
             Id::from_bytes([4; 16]),
+            grant,
         );
-        sessions.add(new.hash(), peer, Id::from_bytes([5; 16]));
+        sessions.add(new.hash(), peer, Id::from_bytes([5; 16]), grant);
         assert_eq!(sessions.peer(&old), None);
         assert_eq!(sessions.peer(&new).map(|peer| peer.server), Some(peer));
         assert_eq!(
@@ -578,7 +608,7 @@ mod tests {
                 ritornel_contract::CONTRACT_VERSION,
                 ritornel_engine::LISTEN_RECORD_VERSION
             ),
-            (6, 1),
+            (7, 1),
             "the listen record changed: raise CONTRACT_VERSION too"
         );
     }

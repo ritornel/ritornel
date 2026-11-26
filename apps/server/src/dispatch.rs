@@ -33,8 +33,8 @@ use ritornel_contract::methods::{
 use ritornel_contract::{
     ART_SIZES, CONTRACT_VERSION, Descriptor, ErrorCode, Event, Frame, FreeDisk, HelloParams, Id,
     LibraryCreateParams, LibraryCreated, LibraryStatus, Limits, ListSupport, MAX_CLIENT_TEXT,
-    PublicDescriptor, Receipt, ReceiptStatus, Response, RpcError, ServerInfo, ServerRole,
-    ServersEvent, SessionKind, Versions, capability, descriptor_proof, hex,
+    Permission, PublicDescriptor, Receipt, ReceiptStatus, Response, RpcError, ServerInfo,
+    ServerRole, ServersEvent, Versions, capability, descriptor_proof, hex,
 };
 use ritornel_engine::{
     Client, Clock, Command, Entropy, Fingerprint, LibraryStore, Role, SQLITE_VERSION,
@@ -47,7 +47,7 @@ use tracing::{debug, error, info, warn};
 use crate::credential::Verifier;
 use crate::data_dir::DataDir;
 use crate::media::{CoverPool, MediaTokens};
-use crate::session::Session;
+use crate::session::{Session, SessionGrant};
 use crate::transport::{self, Wire};
 use crate::views::{MAX_VIEWS, MAX_WINDOW_ROWS, VIEW_IDLE};
 use crate::{Bounds, Error};
@@ -195,6 +195,9 @@ pub(crate) struct Core {
     /// The catalogue the library is asked about at, once the server has
     /// started, on a server built with one.
     catalogue: std::sync::OnceLock<Arc<dyn ritornel_source::Catalogue>>,
+    /// Serializes `POST /v1/link` key checks, invite redemption, and session
+    /// publication so concurrent joins or re-pairings cannot race.
+    linking: Mutex<()>,
     /// Held by a lookup from its receipt's check to its commit, so that no
     /// two lookups ask the same thing at once.
     lookup: Mutex<()>,
@@ -323,6 +326,7 @@ impl Core {
             hub_stop_by: std::sync::OnceLock::new(),
             awake: Mutex::default(),
             naming: Mutex::default(),
+            linking: Mutex::default(),
             clock,
             entropy,
             bounds,
@@ -379,24 +383,24 @@ impl Core {
         lock(&self.this).role == ServerRole::Hub
     }
 
-    /// What kind of session `token` holds, if it holds one, and the
-    /// satellite it is the link of, if it is a link session. The local
-    /// credential and a link session are both `full`.
+    /// What grant `token` holds, if it holds one, and the satellite it is
+    /// the link of, if it is a link session. The local credential holds
+    /// [`SessionGrant::OWNER`]; a link session holds the permissions recorded
+    /// for it in `server.db`.
     ///
-    /// Every credential check goes through here: the per-call session check
-    /// and revocation will too. It compares against what the server holds
-    /// in memory and touches neither a file nor the database, so it is safe
-    /// to call on an async worker.
+    /// Every credential check goes through here. It compares against what
+    /// the server holds in memory and touches neither a file nor the
+    /// database, so it is safe to call on an async worker.
     pub(crate) fn authenticate(
         &self,
         token: &SessionToken,
-    ) -> Option<(SessionKind, Option<crate::link::Peer>)> {
+    ) -> Option<(SessionGrant, Option<crate::link::Peer>)> {
         if self.local_credential.accepts(token) {
-            return Some((SessionKind::Full, None));
+            return Some((SessionGrant::OWNER, None));
         }
         self.link_sessions
             .peer(token)
-            .map(|peer| (SessionKind::Full, Some(peer)))
+            .map(|peer| (peer.grant, Some(peer)))
     }
 
     /// On a satellite, its link to its hub.
@@ -594,19 +598,19 @@ impl Core {
         !sessions.closed && sessions.open.len() < self.bounds.max_sessions
     }
 
-    /// Opens a session of this kind. `None` once the server is stopping,
+    /// Opens a session with this grant. `None` once the server is stopping,
     /// and while it has as many sessions as it takes.
     fn open(
         &self,
         sessions: &mut Sessions,
-        kind: SessionKind,
+        grant: SessionGrant,
         peer: Option<Id>,
     ) -> Option<Arc<Session>> {
         if sessions.closed || sessions.open.len() >= self.bounds.max_sessions {
             return None;
         }
         sessions.next_id += 1;
-        let session = Arc::new(Session::linked(sessions.next_id, kind, peer));
+        let session = Arc::new(Session::linked(sessions.next_id, grant, peer));
         sessions.open.insert(session.id(), Arc::clone(&session));
         self.fanout.add(&session);
         Some(session)
@@ -614,8 +618,8 @@ impl Core {
 
     /// Opens a session with no transport, for a test to call through.
     #[cfg(test)]
-    pub(crate) fn open_session(&self, kind: SessionKind) -> Option<Arc<Session>> {
-        self.open(&mut lock(&self.sessions), kind, None)
+    pub(crate) fn open_session(&self, grant: SessionGrant) -> Option<Arc<Session>> {
+        self.open(&mut lock(&self.sessions), grant, None)
     }
 
     /// The sessions that are open, oldest first.
@@ -626,21 +630,27 @@ impl Core {
         open
     }
 
-    /// Opens a session of this kind and runs it over `wire`, as a task
+    /// Opens a session with this grant and runs it over `wire`, as a task
     /// this server owns. It hands the wire back if no session may open:
     /// the server is stopping, or has as many as it takes.
     ///
     /// It must be called on the server's runtime.
     pub(crate) fn run<W: Wire + 'static>(
         self: &Arc<Self>,
-        kind: SessionKind,
-        peer: Option<Id>,
+        grant: SessionGrant,
+        peer: Option<crate::link::Peer>,
         mut wire: W,
     ) -> Result<(), W> {
         // One lock for the check and for the task, so that a stop sees
-        // either none of this or all of it.
+        // either none of this or all of it, and a link re-pairing that ran
+        // `close_linked` cannot be raced by an upgrade holding a revoked token.
         let mut sessions = lock(&self.sessions);
-        let Some(session) = self.open(&mut sessions, kind, peer) else {
+        if let Some(peer) = peer
+            && !self.link_sessions.is_current(peer.server, peer.session)
+        {
+            return Err(wire);
+        }
+        let Some(session) = self.open(&mut sessions, grant, peer.map(|p| p.server)) else {
             return Err(wire);
         };
         // Tasks that have ended are forgotten as new ones come.
@@ -874,19 +884,22 @@ impl Core {
                     .with_detail("reason", "hello_required"),
             );
         }
-        if row.needs_full && session.kind() != SessionKind::Full {
+        if row.link_only && session.peer().is_none() {
             return Err(RpcError::new(
                 ErrorCode::Forbidden,
-                format!("{} needs a full session", row.name),
+                format!("{} is for a satellite's link session", row.name),
             ));
         }
-        if session.peer().is_some() && link::kept_from_a_link(row.name) {
+        if !session.has_all(row.needs) {
+            let missing: Vec<&str> = row
+                .needs
+                .iter()
+                .filter(|perm| !session.has(**perm))
+                .map(|perm| perm.as_str())
+                .collect();
             return Err(RpcError::new(
                 ErrorCode::Forbidden,
-                format!(
-                    "{} is for this server's own machine, not a satellite",
-                    row.name
-                ),
+                format!("{} requires {}", row.name, missing.join(", ")),
             ));
         }
         // What a linked server asks keeps this hub awake for a while.
@@ -959,11 +972,12 @@ impl Core {
         let stores = stores
             .as_ref()
             .ok_or_else(|| RpcError::new(ErrorCode::Unavailable, "the server is stopping"))?;
+        let show_paths = session.has(Permission::FoldersManage);
         match row.name {
             ServerHello::NAME => {
                 run::<ServerHello>(params, |hello| self.hello(stores, session, &hello))
             }
-            ServerStatus::NAME => run::<ServerStatus>(params, |_| self.status(stores)),
+            ServerStatus::NAME => run::<ServerStatus>(params, |_| self.status(stores, show_paths)),
             methods::PlayersListCall::NAME => {
                 run::<methods::PlayersListCall>(params, |_| self.players_list())
             }
@@ -978,7 +992,9 @@ impl Core {
                 self.wake_watch();
                 created
             }),
-            SourcesList::NAME => run::<SourcesList>(params, |_| self.sources_list(stores)),
+            SourcesList::NAME => {
+                run::<SourcesList>(params, |_| self.sources_list(stores, show_paths))
+            }
             SourcesAdd::NAME => run::<SourcesAdd>(params, |params| {
                 let added = self.sources_add(stores, &params);
                 self.wake_watch();
@@ -999,9 +1015,9 @@ impl Core {
             LibrarySetWatching::NAME => run::<LibrarySetWatching>(params, |params| {
                 self.library_set_watching(stores, &params)
             }),
-            ServerBackup::NAME => {
-                run::<ServerBackup>(params, |params| self.server_backup(stores, &params))
-            }
+            ServerBackup::NAME => run::<ServerBackup>(params, |params| {
+                self.server_backup(stores, &params, show_paths)
+            }),
             ArtistsPictureFolders::NAME => {
                 run::<ArtistsPictureFolders>(params, |_| self.artists_picture_folders(stores))
             }
@@ -1010,8 +1026,10 @@ impl Core {
                 self.wake_watch();
                 imported
             }),
-            JobsList::NAME => run::<JobsList>(params, |_| self.jobs_list(stores)),
-            JobsGet::NAME => run::<JobsGet>(params, |params| self.jobs_get(stores, &params)),
+            JobsList::NAME => run::<JobsList>(params, |_| self.jobs_list(stores, show_paths)),
+            JobsGet::NAME => {
+                run::<JobsGet>(params, |params| self.jobs_get(stores, &params, show_paths))
+            }
             JobsCancel::NAME => {
                 run::<JobsCancel>(params, |params| self.jobs_cancel(stores, &params))
             }
@@ -1181,11 +1199,11 @@ impl Core {
             }
             LinkPing::NAME => run::<LinkPing>(params, |params| self.link_ping(session, params)),
             ServerSettingsCall::NAME => {
-                run::<ServerSettingsCall>(params, |_| self.server_settings(stores))
+                run::<ServerSettingsCall>(params, |_| self.server_settings(stores, show_paths))
             }
-            ServerSetSettings::NAME => {
-                run::<ServerSetSettings>(params, |params| self.server_set_settings(stores, &params))
-            }
+            ServerSetSettings::NAME => run::<ServerSetSettings>(params, |params| {
+                self.server_set_settings(stores, &params, show_paths)
+            }),
             HistoryZones::NAME => run::<HistoryZones>(params, |_| self.history_zones(stores)),
             HistorySetZones::NAME => {
                 run::<HistorySetZones>(params, |params| self.history_set_zones(stores, &params))
@@ -1247,14 +1265,18 @@ impl Core {
                 "a player can be named only for playback, progress and queue topics",
             ));
         }
-        if add
-            && session.kind() != SessionKind::Full
-            && params.topics.contains(&ritornel_contract::Topic::Jobs)
-        {
-            return Err(RpcError::new(
-                ErrorCode::Forbidden,
-                "Job events need a full session. Subscribe without the jobs topic.",
-            ));
+        if add {
+            for topic in &params.topics {
+                if !session.has_any(topic.any_permission()) {
+                    return Err(RpcError::new(
+                        ErrorCode::Forbidden,
+                        format!(
+                            "subscribing to {} requires a permission this session does not hold",
+                            topic.as_str()
+                        ),
+                    ));
+                }
+            }
         }
         let player = params.player.filter(|p| *p != self.server_id);
         let topics = session.change_topics(player, &params.topics, add)?;
@@ -1343,7 +1365,9 @@ impl Core {
         }
         Ok(Descriptor {
             server: self.public_descriptor(None),
-            session_kind: session.kind(),
+            permissions: session.permissions().to_vec(),
+            token_role: session.grant().effective_role(),
+            hub_permissions: self.uplink().and_then(|uplink| uplink.hub_permissions()),
         })
     }
 
@@ -1353,7 +1377,11 @@ impl Core {
     /// before the record's health reads the library again: a read kept
     /// while another is taken would wait behind a writer queued between
     /// them, which waits on the first.
-    fn status(&self, stores: &Stores) -> Result<ritornel_contract::ServerStatus, RpcError> {
+    fn status(
+        &self,
+        stores: &Stores,
+        show_paths: bool,
+    ) -> Result<ritornel_contract::ServerStatus, RpcError> {
         let read = stores
             .library
             .read()
@@ -1384,7 +1412,7 @@ impl Core {
         };
         drop(read);
         let watch = self.watch_status(stores);
-        let backup = self.backup_status(stores);
+        let backup = self.backup_status(stores, show_paths);
         let record = self.record_status(stores);
         Ok(ritornel_contract::ServerStatus {
             transcode: self.transcode_status(stores)?,
@@ -1402,7 +1430,7 @@ impl Core {
             free_disk: FreeDisk {
                 data_bytes: crate::platform::free_bytes(self.dir.root()),
             },
-            log_path: self.dir.logs().to_string_lossy().into_owned(),
+            log_path: show_paths.then(|| self.dir.logs().to_string_lossy().into_owned()),
             watch: Some(watch),
             backup: Some(backup),
             record: Some(record),
@@ -1609,7 +1637,7 @@ mod tests {
     use std::path::Path;
     use std::time::Instant;
 
-    use ritornel_contract::{METHODS, Request, RequestId, Topic};
+    use ritornel_contract::{METHODS, Request, RequestId, TokenRole, Topic};
     use ritornel_engine::{OsEntropy, SystemClock};
     use serde_json::json;
 
@@ -1642,8 +1670,8 @@ mod tests {
             .map_err(|error| (error.data.code, Value::Object(error.data.details)))
     }
 
-    fn greeted(core: &Core, kind: SessionKind) -> Arc<Session> {
-        let session = core.open_session(kind).unwrap();
+    fn greeted(core: &Core, grant: SessionGrant) -> Arc<Session> {
+        let session = core.open_session(grant).unwrap();
         call(core, &session, "server.hello", Some(hello())).unwrap();
         session
     }
@@ -1668,7 +1696,7 @@ mod tests {
             encoders: vec![],
         });
         core.attach_transcodes(&service);
-        let session = core.open_session(SessionKind::Full).unwrap();
+        let session = core.open_session(SessionGrant::OWNER).unwrap();
         call(&core, &session, "server.hello", Some(hello())).unwrap();
         call(
             &core,
@@ -1701,9 +1729,11 @@ mod tests {
     }
 
     #[test]
-    fn hello_answers_with_the_descriptor_and_the_sessions_kind() {
+    fn hello_answers_with_the_descriptor_and_the_sessions_permissions() {
         let (core, _scratch) = core();
-        let session = core.open_session(SessionKind::Limited).unwrap();
+        let session = core
+            .open_session(SessionGrant::for_role(TokenRole::Guest))
+            .unwrap();
         let descriptor = call(&core, &session, "server.hello", Some(hello())).unwrap();
         assert_eq!(
             descriptor,
@@ -1722,7 +1752,8 @@ mod tests {
                 "lists": serde_json::to_value(ListSupport::all()).unwrap(),
                 "artSizes": ART_SIZES,
                 "publicKey": core.public_key(),
-                "sessionKind": "limited",
+                "permissions": ["library:read", "playback:control"],
+                "tokenRole": "guest",
             })
         );
         assert!(session.greeted());
@@ -1731,7 +1762,7 @@ mod tests {
     #[test]
     fn every_call_but_hello_is_refused_until_hello_has_succeeded() {
         let (core, _scratch) = core();
-        let session = core.open_session(SessionKind::Full).unwrap();
+        let session = core.open_session(SessionGrant::OWNER).unwrap();
         for method in METHODS.iter().filter(|row| row.name != "server.hello") {
             assert_eq!(
                 call(&core, &session, method.name, None),
@@ -1755,7 +1786,7 @@ mod tests {
     #[test]
     fn a_client_built_for_another_contract_version_is_refused() {
         let (core, _scratch) = core();
-        let session = core.open_session(SessionKind::Full).unwrap();
+        let session = core.open_session(SessionGrant::OWNER).unwrap();
         let mut other = hello();
         other["contractVersion"] = json!(CONTRACT_VERSION + 1);
         assert_eq!(
@@ -1772,8 +1803,8 @@ mod tests {
     fn a_method_the_server_does_not_have_is_unsupported() {
         let (core, _scratch) = core();
         for session in [
-            core.open_session(SessionKind::Full).unwrap(),
-            greeted(&core, SessionKind::Full),
+            core.open_session(SessionGrant::OWNER).unwrap(),
+            greeted(&core, SessionGrant::OWNER),
         ] {
             assert_eq!(
                 call(&core, &session, "weather.get", None),
@@ -1785,7 +1816,7 @@ mod tests {
     #[test]
     fn params_of_the_wrong_shape_are_invalid() {
         let (core, _scratch) = core();
-        let session = greeted(&core, SessionKind::Full);
+        let session = greeted(&core, SessionGrant::OWNER);
         for (method, params) in [
             ("server.hello", None),
             ("server.hello", Some(json!({ "name": "test" }))),
@@ -1829,7 +1860,7 @@ mod tests {
     #[test]
     fn a_name_or_a_version_that_is_empty_or_too_long_is_invalid() {
         let (core, _scratch) = core();
-        let session = core.open_session(SessionKind::Full).unwrap();
+        let session = core.open_session(SessionGrant::OWNER).unwrap();
         for (field, text) in [
             ("name", String::new()),
             ("version", String::new()),
@@ -1849,50 +1880,106 @@ mod tests {
     }
 
     #[test]
-    fn the_status_and_a_command_need_a_full_session_and_the_rest_do_not() {
+    fn scoped_sessions_can_only_call_methods_and_topics_within_their_permissions() {
         let (core, scratch) = core();
-        let limited = greeted(&core, SessionKind::Limited);
+        let guest = greeted(&core, SessionGrant::for_role(TokenRole::Guest));
         assert_eq!(
-            call(&core, &limited, "server.status", None),
+            call(&core, &guest, "server.status", None),
             Err((ErrorCode::Forbidden, json!({})))
         );
-        // A limited session may change nothing, and it is refused before
+        // A guest session may change nothing, and it is refused before
         // its params are looked at.
         for params in [None, Some(key(0xc0))] {
             assert_eq!(
-                call(&core, &limited, "library.create", params),
+                call(&core, &guest, "library.create", params),
                 Err((ErrorCode::Forbidden, json!({})))
             );
         }
         assert_eq!(
-            call(&core, &limited, "jobs.list", None),
+            call(&core, &guest, "jobs.list", None),
             Err((ErrorCode::Forbidden, json!({})))
         );
         assert_eq!(
             call(
                 &core,
-                &limited,
+                &guest,
                 "events.subscribe",
                 Some(json!({"topics":["library","jobs"]}))
             ),
             Err((ErrorCode::Forbidden, json!({})))
         );
-        assert!(limited.subscribe(&[]).is_empty());
+        assert!(guest.subscribe(&[]).is_empty());
         assert!(!scratch.path().join("data/library.db").exists());
-        call(&core, &limited, "servers.list", None).unwrap();
+        call(&core, &guest, "servers.list", None).unwrap();
         call(
             &core,
-            &limited,
+            &guest,
             "events.subscribe",
             Some(json!({ "topics": ["servers"] })),
         )
         .unwrap();
+
+        // A monitor session reads status and jobs, but not library catalog, settings, or paths.
+        let monitor = greeted(&core, SessionGrant::for_role(TokenRole::Monitor));
+        let status = call(&core, &monitor, "server.status", None).unwrap();
+        assert!(status.get("logPath").is_none());
+        assert_eq!(
+            call(&core, &monitor, "server.settings", None),
+            Err((ErrorCode::Forbidden, json!({})))
+        );
+        // A session with server:manage (without folders:manage) reads settings with backupDir redacted.
+        let mgr = greeted(
+            &core,
+            SessionGrant::custom(
+                None,
+                ritornel_contract::PermissionSet::from_slice(&[Permission::ServerManage]),
+            ),
+        );
+        let settings = call(&core, &mgr, "server.settings", None).unwrap();
+        assert!(settings["backupDir"]["value"].is_null());
+        assert_eq!(
+            call(&core, &monitor, "list.open", None),
+            Err((ErrorCode::Forbidden, json!({})))
+        );
+        assert_eq!(
+            call(
+                &core,
+                &monitor,
+                "events.subscribe",
+                Some(json!({ "topics": ["library"] }))
+            ),
+            Err((ErrorCode::Forbidden, json!({})))
+        );
+        call(
+            &core,
+            &monitor,
+            "events.subscribe",
+            Some(json!({ "topics": ["servers", "jobs"] })),
+        )
+        .unwrap();
+
+        // Link-only methods are refused to non-peer sessions, even an owner.
+        let owner = greeted(&core, SessionGrant::OWNER);
+        for method in [
+            "link.tracks",
+            "link.copies",
+            "link.listen",
+            "link.event",
+            "link.handoff",
+            "link.ping",
+        ] {
+            assert_eq!(
+                call(&core, &owner, method, None),
+                Err((ErrorCode::Forbidden, json!({}))),
+                "{method}"
+            );
+        }
     }
 
     #[test]
     fn the_status_reports_what_exists() {
         let (core, scratch) = core();
-        let session = greeted(&core, SessionKind::Full);
+        let session = greeted(&core, SessionGrant::OWNER);
         let status = call(&core, &session, "server.status", Some(json!({}))).unwrap();
         let free = status["freeDisk"]["dataBytes"].as_u64().unwrap();
         assert!(free > 0);
@@ -1939,7 +2026,7 @@ mod tests {
         .unwrap();
         let place = scratch.path().join("elsewhere");
         core.set_backups(crate::backup::Backups::new(Some(place.clone())));
-        let session = greeted(&core, SessionKind::Full);
+        let session = greeted(&core, SessionGrant::OWNER);
         let status = || call(&core, &session, "server.status", Some(json!({}))).unwrap();
 
         // Its disk is not connected: refused, and said.
@@ -2001,7 +2088,7 @@ mod tests {
     #[test]
     fn dismissing_with_a_library_answers_the_record_and_again_changes_nothing() {
         let (core, _scratch) = core();
-        let session = greeted(&core, SessionKind::Full);
+        let session = greeted(&core, SessionGrant::OWNER);
         call(&core, &session, "library.create", Some(key(0xc1))).unwrap();
         for _ in 0..2 {
             let dismissed = call(&core, &session, "record.dismiss", Some(key(0xd2))).unwrap();
@@ -2012,7 +2099,7 @@ mod tests {
     #[test]
     fn dismissing_with_no_library_changes_nothing_and_answers_the_record() {
         let (core, _scratch) = core();
-        let session = greeted(&core, SessionKind::Full);
+        let session = greeted(&core, SessionGrant::OWNER);
         let dismissed = call(&core, &session, "record.dismiss", Some(key(0xd1))).unwrap();
         assert_eq!(dismissed["record"], json!({ "problems": [], "notes": [] }));
     }
@@ -2025,7 +2112,7 @@ mod tests {
     #[test]
     fn creating_a_library_makes_this_server_its_hub() {
         let (core, scratch) = core();
-        let session = greeted(&core, SessionKind::Full);
+        let session = greeted(&core, SessionGrant::OWNER);
         let created = call(&core, &session, "library.create", Some(key(0xc0))).unwrap();
         let library_id = created["libraryId"].as_str().unwrap().to_owned();
         assert_eq!(
@@ -2070,7 +2157,7 @@ mod tests {
     #[test]
     fn a_hub_renamed_while_it_runs_keeps_the_librarys_registry_in_step() {
         let (core, scratch) = core();
-        let session = greeted(&core, SessionKind::Full);
+        let session = greeted(&core, SessionGrant::OWNER);
         call(&core, &session, "library.create", Some(key(0xc0))).unwrap();
         let registry = || -> (String, i64) {
             rusqlite::Connection::open(scratch.path().join("data/library.db"))
@@ -2116,12 +2203,12 @@ mod tests {
     #[test]
     fn a_command_sent_again_gets_its_first_answer_and_another_is_refused() {
         let (core, _scratch) = core();
-        let session = greeted(&core, SessionKind::Full);
+        let session = greeted(&core, SessionGrant::OWNER);
         let created = call(&core, &session, "library.create", Some(key(0xc0))).unwrap();
 
         // The same key: the same receipt, from another session too, and
         // nothing is created a second time.
-        let other = greeted(&core, SessionKind::Full);
+        let other = greeted(&core, SessionGrant::OWNER);
         for session in [&session, &other] {
             assert_eq!(
                 call(&core, session, "library.create", Some(key(0xc0))).unwrap(),
@@ -2146,7 +2233,7 @@ mod tests {
     fn adding_a_folder_again_answers_from_its_receipt_and_another_folder_under_its_key_is_refused()
     {
         let (core, scratch) = core();
-        let session = greeted(&core, SessionKind::Full);
+        let session = greeted(&core, SessionGrant::OWNER);
         call(&core, &session, "library.create", Some(key(0xc0))).unwrap();
         let music = scratch.path().join("music");
         std::fs::create_dir(&music).unwrap();
@@ -2180,7 +2267,7 @@ mod tests {
     #[test]
     fn a_folder_refused_for_want_of_a_library_is_added_once_there_is_one() {
         let (core, scratch) = core();
-        let session = greeted(&core, SessionKind::Full);
+        let session = greeted(&core, SessionGrant::OWNER);
         let music = scratch.path().join("music");
         std::fs::create_dir(&music).unwrap();
         let mut params = key(0xc1);
@@ -2209,11 +2296,11 @@ mod tests {
     #[test]
     fn becoming_a_hub_is_sent_to_the_sessions_that_subscribed() {
         let (core, _scratch) = core();
-        let subscribed = greeted(&core, SessionKind::Full);
+        let subscribed = greeted(&core, SessionGrant::OWNER);
         let subscribe = Some(json!({ "topics": ["servers"] }));
         call(&core, &subscribed, "events.subscribe", subscribe).unwrap();
 
-        let creator = greeted(&core, SessionKind::Full);
+        let creator = greeted(&core, SessionGrant::OWNER);
         call(&core, &creator, "library.create", Some(key(0xc0))).unwrap();
         let Some(Frame::Notification(sent)) = now(subscribed.next()) else {
             panic!("an event was queued");
@@ -2238,7 +2325,7 @@ mod tests {
     #[test]
     fn a_jobs_end_is_not_undone_by_an_older_copy_sent_after_it() {
         let (core, _scratch) = core();
-        let subscribed = greeted(&core, SessionKind::Full);
+        let subscribed = greeted(&core, SessionGrant::OWNER);
         let subscribe = Some(json!({ "topics": ["jobs"] }));
         call(&core, &subscribed, "events.subscribe", subscribe).unwrap();
         let (queued, running) = core
@@ -2299,7 +2386,7 @@ mod tests {
     #[test]
     fn a_library_file_that_is_another_servers_stops_one_being_created_over_it() {
         let (core, scratch) = core();
-        let session = greeted(&core, SessionKind::Full);
+        let session = greeted(&core, SessionGrant::OWNER);
         // A library.db that names some other server as its hub.
         let library_db = scratch.path().join("data/library.db");
         let other = ServerIdentity {
@@ -2340,7 +2427,7 @@ mod tests {
     #[test]
     fn the_list_of_servers_is_this_server() {
         let (core, _scratch) = core();
-        let session = greeted(&core, SessionKind::Full);
+        let session = greeted(&core, SessionGrant::OWNER);
         assert_eq!(
             call(&core, &session, "servers.list", None).unwrap(),
             json!({ "servers": [{
@@ -2388,7 +2475,7 @@ mod tests {
         let (core, _scratch) = core();
         let core = Arc::new(core);
         with_player(&core);
-        let session = greeted(&core, SessionKind::Full);
+        let session = greeted(&core, SessionGrant::OWNER);
         let (out, mut requests) = tokio::sync::mpsc::channel(1);
         let (replies, incoming) = tokio::sync::mpsc::channel(1);
         let client = Client::over_memory(out, incoming);
@@ -2432,7 +2519,7 @@ mod tests {
     #[test]
     fn a_server_with_a_player_says_so_and_one_without_refuses_the_players_calls() {
         let (core, _scratch) = core();
-        let session = greeted(&core, SessionKind::Limited);
+        let session = greeted(&core, SessionGrant::for_role(TokenRole::Guest));
         assert_eq!(
             call(&core, &session, "playback.get", None),
             Err((ErrorCode::Unsupported, json!({"reason":"no_player"})))
@@ -2534,7 +2621,7 @@ mod tests {
     #[test]
     fn a_media_next_from_an_entry_the_player_has_left_skips_nothing() {
         let (core, scratch) = core();
-        let session = greeted(&core, SessionKind::Full);
+        let session = greeted(&core, SessionGrant::OWNER);
         let files = ["a.flac", "b.flac", "b.compilation.flac"];
         let entries = playing(&core, &session, scratch.path(), &files);
         let on = || {
@@ -2554,7 +2641,7 @@ mod tests {
     #[test]
     fn an_add_that_plays_if_empty_plays_an_empty_queue_and_adds_to_any_other() {
         let (core, scratch) = core();
-        let session = greeted(&core, SessionKind::Full);
+        let session = greeted(&core, SessionGrant::OWNER);
         playing(&core, &session, scratch.path(), &["a.flac", "b.flac"]);
         let queue = call(&core, &session, "queue.window", None).unwrap();
         let tracks: Vec<Value> = queue["entries"]
@@ -2596,7 +2683,7 @@ mod tests {
     #[test]
     fn a_tick_sends_what_it_did_before_a_command_can_change_the_player() {
         let (core, scratch) = core();
-        let session = greeted(&core, SessionKind::Full);
+        let session = greeted(&core, SessionGrant::OWNER);
         playing(&core, &session, scratch.path(), &["a.flac"]);
         let topics = json!({ "topics": ["playback", "progress"] });
         call(&core, &session, "events.subscribe", Some(topics)).unwrap();
@@ -2643,7 +2730,7 @@ mod tests {
     fn every_method_in_the_table_has_a_handler() {
         let (core, _scratch) = core();
         with_player(&core);
-        let session = greeted(&core, SessionKind::Full);
+        let session = greeted(&core, SessionGrant::OWNER);
         for method in METHODS {
             let outcome = call(&core, &session, method.name, None);
             assert!(
@@ -2660,8 +2747,8 @@ mod tests {
     #[test]
     fn a_rename_is_sent_to_the_sessions_that_subscribed_and_to_no_other() {
         let (core, _scratch) = core();
-        let subscribed = greeted(&core, SessionKind::Full);
-        let other = greeted(&core, SessionKind::Full);
+        let subscribed = greeted(&core, SessionGrant::OWNER);
+        let other = greeted(&core, SessionGrant::OWNER);
         let subscribe = Some(json!({ "topics": ["servers"] }));
         assert_eq!(
             call(&core, &subscribed, "events.subscribe", subscribe.clone()).unwrap(),
@@ -2726,7 +2813,7 @@ mod tests {
     #[test]
     fn text_that_is_not_a_frame_is_answered_with_an_error_and_a_notification_with_nothing() {
         let (core, _scratch) = core();
-        let session = core.open_session(SessionKind::Full).unwrap();
+        let session = core.open_session(SessionGrant::OWNER).unwrap();
         core.receive(&session, "[]");
         core.receive(&session, r#"{"jsonrpc":"2.0","method":"servers.list"}"#);
         core.receive(&session, r#"{"jsonrpc":"2.0","id":4,"result":{}}"#);
@@ -2747,15 +2834,16 @@ mod tests {
     fn no_more_sessions_open_than_the_server_takes_until_one_closes() {
         let (core, _scratch) = core();
         let open: Vec<_> = (0..4)
-            .map(|_| core.open_session(SessionKind::Full).unwrap())
+            .map(|_| core.open_session(SessionGrant::OWNER).unwrap())
             .collect();
         assert!(!core.has_room());
-        assert!(core.open_session(SessionKind::Full).is_none());
+        assert!(core.open_session(SessionGrant::OWNER).is_none());
 
         core.close_session(&open[0]);
         assert!(core.has_room());
-        core.open_session(SessionKind::Limited).unwrap();
-        assert!(core.open_session(SessionKind::Full).is_none());
+        core.open_session(SessionGrant::for_role(TokenRole::Guest))
+            .unwrap();
+        assert!(core.open_session(SessionGrant::OWNER).is_none());
     }
 
     #[test]
@@ -2763,23 +2851,23 @@ mod tests {
         let (core, scratch) = core();
         let token = std::fs::read_to_string(scratch.path().join("data/credential")).unwrap();
         let token = SessionToken::new(token.trim());
-        assert_eq!(core.authenticate(&token), Some((SessionKind::Full, None)));
+        assert_eq!(core.authenticate(&token), Some((SessionGrant::OWNER, None)));
         assert_eq!(core.authenticate(&SessionToken::new("anything")), None);
         assert_eq!(core.authenticate(&SessionToken::new("")), None);
 
         // With the database busy, and then gone, the answer is the same.
         let busy = core.stall();
-        assert_eq!(core.authenticate(&token), Some((SessionKind::Full, None)));
+        assert_eq!(core.authenticate(&token), Some((SessionGrant::OWNER, None)));
         drop(busy);
         core.close_store().unwrap();
-        assert_eq!(core.authenticate(&token), Some((SessionKind::Full, None)));
+        assert_eq!(core.authenticate(&token), Some((SessionGrant::OWNER, None)));
         assert_eq!(core.authenticate(&SessionToken::new("anything")), None);
     }
 
     #[test]
     fn a_frame_over_the_limit_is_refused_unread_and_one_at_the_limit_is_read() {
         let (core, _scratch) = core();
-        let session = core.open_session(SessionKind::Full).unwrap();
+        let session = core.open_session(SessionGrant::OWNER).unwrap();
         // Valid JSON, so only its length can be what refuses it.
         let frame = |bytes: usize| {
             let padding = bytes - r#"{"jsonrpc":"2.0","id":1,"method":""}"#.len();
@@ -2809,10 +2897,10 @@ mod tests {
     #[test]
     fn once_the_server_stops_no_session_opens_and_the_database_is_gone() {
         let (core, _scratch) = core();
-        let session = greeted(&core, SessionKind::Full);
+        let session = greeted(&core, SessionGrant::OWNER);
         core.close_sessions();
         assert_eq!(now(session.next()), None);
-        assert!(core.open_session(SessionKind::Full).is_none());
+        assert!(core.open_session(SessionGrant::OWNER).is_none());
 
         core.close_session(&session);
         assert_eq!(core.sessions().len(), 0);
@@ -2840,7 +2928,7 @@ mod tests {
         let (core, scratch) = core();
         let core: &'static Core = Box::leak(Box::new(core));
         Box::leak(Box::new(scratch));
-        let session = greeted(core, SessionKind::Full);
+        let session = greeted(core, SessionGrant::OWNER);
         let (reading, read) = mpsc::channel();
         let (go, gone) = mpsc::channel::<()>();
         let (done, answered) = mpsc::channel();
@@ -2889,8 +2977,8 @@ mod tests {
         let core: &'static Core = Box::leak(Box::new(core));
         Box::leak(Box::new(scratch));
         let (status, create) = (
-            greeted(core, SessionKind::Full),
-            greeted(core, SessionKind::Full),
+            greeted(core, SessionGrant::OWNER),
+            greeted(core, SessionGrant::OWNER),
         );
         // Waits until `seen` says the library's lock is as wanted.
         let until = |seen: fn(&RwLock<Option<LibraryStore>>) -> bool, what: &str| {

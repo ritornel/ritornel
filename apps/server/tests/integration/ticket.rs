@@ -176,7 +176,7 @@ async fn a_ticket_opens_one_socket_of_the_kind_the_credential_holds() {
         // the socket's URL.
         let mut socket = with_ticket(endpoint, &issued.ticket, None).await.unwrap();
         let descriptor = call(&mut socket, 1, "server.hello", hello()).await;
-        assert_eq!(descriptor["result"]["sessionKind"], "full");
+        assert_eq!(descriptor["result"]["tokenRole"], "owner");
         assert_eq!(
             descriptor["result"]["serverId"],
             running.server.server_id().to_string()
@@ -213,7 +213,7 @@ async fn the_desktops_page_opens_the_socket_with_a_ticket_and_gets_events() {
             .await
             .unwrap();
         let descriptor = call(&mut socket, 1, "server.hello", hello()).await;
-        assert_eq!(descriptor["result"]["sessionKind"], "full");
+        assert_eq!(descriptor["result"]["tokenRole"], "owner");
         let subscribed = call(
             &mut socket,
             2,

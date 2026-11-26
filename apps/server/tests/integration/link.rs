@@ -15,10 +15,10 @@ use ritornel_client::contract::methods::{
 use ritornel_client::contract::{
     Awake, CONTRACT_VERSION, ClientKind, ErrorCode, Event, HelloParams, InviteLink,
     LinkInviteParams, LinkJoinParams, LinkListenParams, LinkPingParams, LinkRequest, LinkStatus,
-    ListKind, ListOpenParams, ListenTaken, NoParams, PlaySource, PlaybackCommandParams,
-    PlaybackGetParams, PlaybackPlayParams, PlaybackStatus, Query, QueueWindowParams,
-    RatingSetParams, Row, ServerRole, SetBy, SetServerSettingsParams, SourcesAddParams, Topic,
-    Window, capability, hex, link_request_proof, route,
+    ListKind, ListOpenParams, ListenTaken, NoParams, Permission, PermissionSet, PlaySource,
+    PlaybackCommandParams, PlaybackGetParams, PlaybackPlayParams, PlaybackStatus, Query,
+    QueueWindowParams, RatingSetParams, Row, ServerRole, SetBy, SetServerSettingsParams,
+    SourcesAddParams, TokenRole, Topic, Window, capability, hex, link_request_proof, route,
 };
 use ritornel_client::{Client, Credential};
 use ritornel_engine::{OsEntropy, SystemClock};
@@ -197,6 +197,7 @@ async fn invite(hub: &Server, client: &Client) -> String {
     client
         .call::<LinkInvite>(&LinkInviteParams {
             routes: vec![hub.endpoint().to_string()],
+            ..Default::default()
         })
         .await
         .unwrap()
@@ -463,6 +464,7 @@ async fn only_a_hub_listening_beyond_loopback_invites_and_only_an_empty_server_j
         let refused = desk_client
             .call::<LinkInvite>(&LinkInviteParams {
                 routes: vec!["127.0.0.1:1".to_owned()],
+                ..Default::default()
             })
             .await
             .unwrap_err();
@@ -519,6 +521,7 @@ async fn a_satellite_opens_a_socket_at_its_hub_with_its_link_session_and_no_tick
         let refused = linked
             .call::<LinkInvite>(&LinkInviteParams {
                 routes: vec![hub.endpoint().to_string()],
+                ..Default::default()
             })
             .await
             .unwrap_err();
@@ -1780,6 +1783,7 @@ async fn a_satellite_stops_in_time_while_its_hub_does_not_answer_and_its_listens
         let link = hub_client
             .call::<LinkInvite>(&LinkInviteParams {
                 routes: vec![relay.address.to_string()],
+                ..Default::default()
             })
             .await
             .unwrap()
@@ -1950,6 +1954,7 @@ async fn a_satellites_client_that_unsubscribes_is_unsubscribed_at_the_hub() {
         let link = hub_client
             .call::<LinkInvite>(&LinkInviteParams {
                 routes: vec![relay.address.to_string()],
+                ..Default::default()
             })
             .await
             .unwrap()
@@ -2417,7 +2422,7 @@ async fn the_hub_reports_what_plays_on_the_satellite_and_its_open_output() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_limited_controller_routes_to_a_linked_player_and_replays_its_receipt() {
-    use ritornel_contract::{SessionKind, methods::PlayersListCall};
+    use ritornel_contract::{TokenRole, methods::PlayersListCall};
     use serde_json::json;
 
     bounded(async {
@@ -2439,7 +2444,7 @@ async fn a_limited_controller_routes_to_a_linked_player_and_replays_its_receipt(
             }
             observer.next_event().await.unwrap();
         }
-        let (tx, rx) = hub.connect_in_memory(SessionKind::Limited);
+        let (tx, rx) = hub.connect_in_memory(TokenRole::Guest);
         let limited = Client::over_memory(tx, rx);
         limited
             .hello(&HelloParams {
@@ -2830,6 +2835,7 @@ async fn the_player_loads_hub_checked_tracks_without_validation_round_trips() {
         let link = controller
             .call::<LinkInvite>(&LinkInviteParams {
                 routes: vec![relay.address.to_string()],
+                ..Default::default()
             })
             .await
             .unwrap()
@@ -3537,6 +3543,283 @@ async fn a_move_to_a_satellite_and_repeat_one_each_show_a_new_now_playing() {
             assert_eq!(fields["duration"], "40");
         }
         assert!(fake.scrobbled().is_empty());
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scoped_invites_enforce_delegation_http_permissions_and_report_role_in_link_status() {
+    bounded(async {
+        let scratch = Scratch::new();
+        let (hub, hub_client, desk, desk_client) = two(&scratch).await;
+
+        // Caller with AccessManage + LibraryRead + PlaybackControl can invite Guest, not Monitor or Personal.
+        let limited_inviter_perms = PermissionSet::from_slice(&[
+            Permission::LibraryRead,
+            Permission::PlaybackControl,
+            Permission::AccessManage,
+        ]);
+        let (tx, rx) = hub.connect_in_memory_with(limited_inviter_perms);
+        let limited_inviter = Client::over_memory(tx, rx);
+        limited_inviter
+            .hello(&HelloParams {
+                presence: None,
+                name: "inviter".to_owned(),
+                kind: ClientKind::Cli,
+                version: "1".to_owned(),
+                contract_version: CONTRACT_VERSION,
+            })
+            .await
+            .unwrap();
+        let err = limited_inviter
+            .call::<LinkInvite>(&LinkInviteParams {
+                routes: vec![hub.endpoint().to_string()],
+                role: Some(TokenRole::Personal),
+                permissions: None,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(code(&err), Some(ErrorCode::Forbidden));
+        let err = limited_inviter
+            .call::<LinkInvite>(&LinkInviteParams {
+                routes: vec![hub.endpoint().to_string()],
+                role: Some(TokenRole::Monitor),
+                permissions: None,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(code(&err), Some(ErrorCode::Forbidden));
+        // Passing both role and permissions, or empty permissions, is invalid.
+        let err = hub_client
+            .call::<LinkInvite>(&LinkInviteParams {
+                routes: vec![hub.endpoint().to_string()],
+                role: Some(TokenRole::Guest),
+                permissions: Some(vec![Permission::LibraryRead]),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(code(&err), Some(ErrorCode::Invalid));
+        let err = hub_client
+            .call::<LinkInvite>(&LinkInviteParams {
+                routes: vec![hub.endpoint().to_string()],
+                role: None,
+                permissions: Some(vec![]),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(code(&err), Some(ErrorCode::Invalid));
+
+        // Invite desk with Guest role (via the limited inviter).
+        let guest_invite = limited_inviter
+            .call::<LinkInvite>(&LinkInviteParams {
+                routes: vec![hub.endpoint().to_string()],
+                role: Some(TokenRole::Guest),
+                permissions: None,
+            })
+            .await
+            .unwrap()
+            .link;
+        join(&desk_client, &guest_invite).await.unwrap();
+
+        // Hub's link.status reports the satellite's granted role and permissions.
+        let status = hub_client
+            .call::<LinkStatusCall>(&NoParams {})
+            .await
+            .unwrap();
+        assert_eq!(status.satellites.len(), 1);
+        assert_eq!(status.satellites[0].token_role, Some(TokenRole::Guest));
+        assert_eq!(
+            status.satellites[0].permissions,
+            vec![Permission::LibraryRead, Permission::PlaybackControl]
+        );
+
+        let guest_token = {
+            let db =
+                rusqlite::Connection::open(scratch.data_dir("desk").join("server.db")).unwrap();
+            db.query_row("SELECT token FROM hub_link", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap()
+        };
+        let guest_cred = Credential::new(&guest_token);
+        // Guest lacks status:read -> /v1/health is 403.
+        assert_eq!(
+            ritornel_client::get(hub.endpoint(), route::HEALTH, Some(&guest_cred))
+                .await
+                .unwrap()
+                .status,
+            403
+        );
+        // Guest has library:read -> /v1/art/* is NOT 403 (404 for unknown art ID).
+        let art_path = format!(
+            "{}/{}/96",
+            route::ART,
+            ritornel_client::contract::Id::from_bytes([1; 16])
+        );
+        assert_eq!(
+            ritornel_client::get(hub.endpoint(), &art_path, Some(&guest_cred))
+                .await
+                .unwrap()
+                .status,
+            404
+        );
+
+        // Now invite a Monitor satellite and verify the reverse on HTTP routes.
+        let monitor_server = start(&scratch, "monitor").await;
+        let monitor_local = client(&scratch, "monitor", &monitor_server).await;
+        let monitor_invite = hub_client
+            .call::<LinkInvite>(&LinkInviteParams {
+                routes: vec![hub.endpoint().to_string()],
+                role: Some(TokenRole::Monitor),
+                permissions: None,
+            })
+            .await
+            .unwrap()
+            .link;
+        join(&monitor_local, &monitor_invite).await.unwrap();
+        let monitor_token = {
+            let db =
+                rusqlite::Connection::open(scratch.data_dir("monitor").join("server.db")).unwrap();
+            db.query_row("SELECT token FROM hub_link", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap()
+        };
+        let monitor_cred = Credential::new(&monitor_token);
+        // Owner cannot invite a satellite with hub-machine administration roles/permissions.
+        let err = hub_client
+            .call::<LinkInvite>(&LinkInviteParams {
+                routes: vec![hub.endpoint().to_string()],
+                role: Some(TokenRole::Owner),
+                permissions: None,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(code(&err), Some(ErrorCode::Forbidden));
+        let err = hub_client
+            .call::<LinkInvite>(&LinkInviteParams {
+                routes: vec![hub.endpoint().to_string()],
+                role: None,
+                permissions: Some(vec![Permission::LibraryRead, Permission::FoldersManage]),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(code(&err), Some(ErrorCode::Forbidden));
+
+        // Monitor has status:read -> /v1/health is 200.
+        assert_eq!(
+            ritornel_client::get(hub.endpoint(), route::HEALTH, Some(&monitor_cred))
+                .await
+                .unwrap()
+                .status,
+            200
+        );
+        // Monitor lacks library:read -> /v1/art/*, /v1/audio/*, /v1/cache/* are 403.
+        assert_eq!(
+            ritornel_client::get(hub.endpoint(), &art_path, Some(&monitor_cred))
+                .await
+                .unwrap()
+                .status,
+            403
+        );
+        let audio_path = format!(
+            "{}/{}/{}/1",
+            route::AUDIO,
+            ritornel_client::contract::Id::from_bytes([1; 16]),
+            ritornel_client::contract::Id::from_bytes([2; 16]),
+        );
+        assert_eq!(
+            ritornel_client::get(hub.endpoint(), &audio_path, Some(&monitor_cred))
+                .await
+                .unwrap()
+                .status,
+            403
+        );
+        let cache_path = format!("{}/{}", route::CACHE_DERIVATIVE, "00".repeat(32));
+        assert_eq!(
+            ritornel_client::get(hub.endpoint(), &cache_path, Some(&monitor_cred))
+                .await
+                .unwrap()
+                .status,
+            403
+        );
+
+        // Over WebSocket, a Monitor link can ping and list servers, but is refused
+        // link.tracks, link.copies, and link.listen.
+        let monitor_ws = Client::connect(hub.endpoint(), &monitor_cred)
+            .await
+            .unwrap();
+        monitor_ws
+            .hello(&HelloParams {
+                presence: None,
+                name: "monitor".to_owned(),
+                kind: ClientKind::Server,
+                version: "1".to_owned(),
+                contract_version: CONTRACT_VERSION,
+            })
+            .await
+            .unwrap();
+        monitor_ws.servers().await.unwrap();
+        monitor_ws
+            .call::<LinkPing>(&LinkPingParams {
+                playing: false,
+                player: None,
+            })
+            .await
+            .unwrap();
+        for forbidden_method in ["link.tracks", "link.copies", "link.listen"] {
+            let err = monitor_ws
+                .call_raw(forbidden_method, serde_json::json!({}))
+                .await
+                .unwrap_err();
+            assert_eq!(code(&err), Some(ErrorCode::Forbidden), "{forbidden_method}");
+        }
+        drop(monitor_ws);
+
+        monitor_server.stop().await.unwrap();
+        desk.stop().await.unwrap();
+        hub.stop().await.unwrap();
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_conflicting_peer_key_does_not_consume_the_invite() {
+    bounded(async {
+        let scratch = Scratch::new();
+        let (hub, hub_client, desk, desk_client) = two(&scratch).await;
+        join(&desk_client, &invite(&hub, &hub_client).await)
+            .await
+            .unwrap();
+
+        // Issue a fresh invite.
+        let raw_invite = invite(&hub, &hub_client).await;
+        let parsed = InviteLink::parse(&raw_invite).unwrap();
+
+        // An imposter tries to claim desk's server_id with a different keypair.
+        let imposter_key = ritornel_engine::Signer::from_seed([0x99; 32]);
+        let proof = link_request_proof(parsed.hub, &parsed.secret);
+        let forged = LinkRequest {
+            secret: hex::encode(&parsed.secret),
+            server_id: desk.server_id(),
+            name: "imposter".to_owned(),
+            public_key: hex::encode(&imposter_key.public_key()),
+            proof: hex::encode(&imposter_key.sign(&proof)),
+            contract_version: CONTRACT_VERSION,
+        };
+        let answer = ritornel_client::post(hub.endpoint(), route::LINK, None, &forged)
+            .await
+            .unwrap();
+        assert_eq!(answer.status, 409);
+
+        // The invite was NOT consumed: another server can still join with it.
+        let legit = start(&scratch, "legit").await;
+        let legit_client = client(&scratch, "legit", &legit).await;
+        join(&legit_client, &raw_invite).await.unwrap();
+
+        legit.stop().await.unwrap();
+        desk.stop().await.unwrap();
+        hub.stop().await.unwrap();
     })
     .await;
 }

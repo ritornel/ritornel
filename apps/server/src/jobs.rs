@@ -407,13 +407,13 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
 
-    use ritornel_contract::{CONTRACT_VERSION, Frame, Id, Request, RequestId, SessionKind};
+    use ritornel_contract::{CONTRACT_VERSION, Frame, Id, Request, RequestId};
     use ritornel_engine::{JobState, ScanSettings};
     use serde_json::{Value, json};
 
     use super::scan_with;
     use crate::dispatch::Core;
-    use crate::session::Session;
+    use crate::session::{Session, SessionGrant};
 
     fn call(core: &Core, session: &Session, method: &str, params: Value) -> Value {
         let request = Frame::Request(Request {
@@ -434,7 +434,7 @@ mod tests {
     #[test]
     fn a_scan_cancelled_before_commit_does_not_commit_the_prepared_step() {
         let (core, scratch) = crate::testing::core();
-        let session = core.open_session(SessionKind::Full).unwrap();
+        let session = core.open_session(SessionGrant::OWNER).unwrap();
         call(
             &core,
             &session,

@@ -578,7 +578,18 @@ pub(crate) fn read_identity(connection: &Connection) -> Result<Option<ServerIden
         .optional()?)
 }
 
-/// Adds a `full` session for the person at this machine and points the
+/// Encodes a permission set as a canonical JSON array of wire names.
+pub(crate) fn permissions_to_json(permissions: ritornel_contract::PermissionSet) -> String {
+    serde_json::to_string(&permissions.to_vec()).unwrap_or_else(|_| "[]".to_owned())
+}
+
+/// Decodes a stored JSON array of permission names into a [`ritornel_contract::PermissionSet`].
+pub(crate) fn permissions_from_json(raw: &str) -> Result<ritornel_contract::PermissionSet, Error> {
+    let parsed: Vec<ritornel_contract::Permission> = serde_json::from_str(raw)?;
+    Ok(ritornel_contract::PermissionSet::from_slice(&parsed))
+}
+
+/// Adds an `owner` session for the person at this machine and points the
 /// local-credential setting at it. Only the token's hash is stored.
 fn issue_local_credential(
     transaction: &Transaction<'_>,
@@ -586,12 +597,15 @@ fn issue_local_credential(
     entropy: &dyn Entropy,
 ) -> Result<SessionToken, Error> {
     let token = SessionToken::generate(entropy)?;
+    let perms = permissions_to_json(ritornel_contract::PermissionSet::ALL);
     transaction.execute(
-        "INSERT INTO session (public_id, subject_kind, label, kind, token_hash, created_at_ms)
-         VALUES (?1, 'person', ?2, 'full', ?3, ?4)",
+        "INSERT INTO session
+           (public_id, subject_kind, label, kind, role, permissions_json, token_hash, created_at_ms)
+         VALUES (?1, 'person', ?2, 'full', 'owner', ?3, ?4, ?5)",
         (
             new_id(now_ms, entropy)?.as_bytes(),
             LOCAL_CREDENTIAL_LABEL,
+            &perms,
             token.hash(),
             now_ms,
         ),
@@ -936,6 +950,51 @@ mod tests {
             [("Invented music".into(), "/invented/music".into())]
         );
         assert!(!store.watching().unwrap());
+    }
+
+    #[test]
+    fn migrating_schema_three_backfills_session_roles_and_permissions() {
+        use ritornel_contract::{PermissionSet, TokenRole};
+
+        let scratch = Scratch::new();
+        let path = scratch.path().join("server.db");
+        let mut db = Connection::open(&path).unwrap();
+        migrate::run(&mut db, &migrate::SERVER[..3], &FixedClock::at(T0)).unwrap();
+        db.execute_batch(include_str!("../saved/server/0003.sql"))
+            .unwrap();
+        drop(db);
+
+        let store = on_disk(&path).unwrap();
+        assert_eq!(store.migrations_applied(), migrate::SERVER.len() - 3);
+        let rows: Vec<(String, Option<String>, String)> = store
+            .reader
+            .call(|connection| {
+                let mut stmt = connection
+                    .prepare("SELECT label, role, permissions_json FROM session ORDER BY id")?;
+                let mapped =
+                    stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+                Ok(mapped.collect::<Result<_, _>>()?)
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].0, "local owner");
+        assert_eq!(rows[0].1.as_deref(), Some("owner"));
+        assert_eq!(
+            permissions_from_json(&rows[0].2).unwrap(),
+            PermissionSet::for_role(TokenRole::Owner)
+        );
+        assert_eq!(rows[1].0, "Invented desk");
+        assert_eq!(rows[1].1.as_deref(), Some("personal"));
+        assert_eq!(
+            permissions_from_json(&rows[1].2).unwrap(),
+            PermissionSet::for_role(TokenRole::Personal)
+        );
+        assert_eq!(rows[2].0, "Invented guest");
+        assert_eq!(rows[2].1.as_deref(), Some("guest"));
+        assert_eq!(
+            permissions_from_json(&rows[2].2).unwrap(),
+            PermissionSet::for_role(TokenRole::Guest)
+        );
     }
 
     #[test]

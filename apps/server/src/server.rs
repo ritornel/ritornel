@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use ritornel_contract::local::Preparing;
-use ritornel_contract::{Id, SessionKind};
+use ritornel_contract::{Id, PermissionSet, TokenRole};
 use ritornel_engine::transcode::{
     Encoder, EncoderId, LameEncoder, OpusEncoder, TranscodeCache, TranscodePool,
 };
@@ -403,11 +403,24 @@ impl Server {
         self.listening.endpoint()
     }
 
-    /// Opens a session on the in-memory transport and returns its two ends:
-    /// where a client sends frames, as text, and where it receives them.
-    /// It is for tests, which join `ritornel-client` to it.
-    pub fn connect_in_memory(&self, kind: SessionKind) -> (Sender<String>, Receiver<String>) {
-        memory::attach(&self.core, kind)
+    /// Opens a session on the in-memory transport with a named role's
+    /// permissions and returns its two ends: where a client sends frames,
+    /// as text, and where it receives them. It is for tests, which join
+    /// `ritornel-client` to it.
+    pub fn connect_in_memory(&self, role: TokenRole) -> (Sender<String>, Receiver<String>) {
+        memory::attach(&self.core, crate::session::SessionGrant::for_role(role))
+    }
+
+    /// Opens a session on the in-memory transport with an arbitrary set of
+    /// permissions, for tests that exercise custom grants.
+    pub fn connect_in_memory_with(
+        &self,
+        permissions: PermissionSet,
+    ) -> (Sender<String>, Receiver<String>) {
+        memory::attach(
+            &self.core,
+            crate::session::SessionGrant::custom(permissions.matching_role(), permissions),
+        )
     }
 
     /// Renames the server, keeps its row in the library's registry of
@@ -707,7 +720,7 @@ mod tests {
             .await
             .unwrap();
             let controller = async |s: &Server| {
-                let (out, incoming) = s.connect_in_memory(ritornel_contract::SessionKind::Full);
+                let (out, incoming) = s.connect_in_memory(TokenRole::Owner);
                 let c = Client::over_memory(out, incoming);
                 c.call_raw("server.hello", json!({"name":"listener", "kind":"cli", "version":"1", "contractVersion":ritornel_contract::CONTRACT_VERSION})).await.unwrap();
                 c
@@ -943,7 +956,7 @@ mod tests {
         watched(|| async {
             let scratch = Scratch::new();
             let server = start(&scratch).await;
-            let (to_server, mut from_server) = server.connect_in_memory(SessionKind::Full);
+            let (to_server, mut from_server) = server.connect_in_memory(TokenRole::Owner);
 
             // The database is busy, as under a long write, and a call
             // arrives that has to wait for it.
@@ -965,7 +978,7 @@ mod tests {
             drop(busy);
             let answer: Value = serde_json::from_str(&from_server.recv().await.unwrap()).unwrap();
             assert_eq!(answer["id"], 1);
-            assert_eq!(answer["result"]["sessionKind"], "full");
+            assert_eq!(answer["result"]["tokenRole"], "owner");
             server.stop().await.unwrap();
         });
     }
@@ -984,7 +997,7 @@ mod tests {
                 ..Bounds::default()
             };
             let server = start_with(&scratch, bounds).await;
-            let (_to_server, from_server) = server.connect_in_memory(SessionKind::Full);
+            let (_to_server, from_server) = server.connect_in_memory(TokenRole::Owner);
             let session = only_session(&server).await;
 
             // The client reads nothing. The channel holds as many frames as
@@ -1089,7 +1102,7 @@ mod tests {
         watched(|| async {
             let scratch = Scratch::new();
             let server = start(&scratch).await;
-            let (_to_server, from_server) = server.connect_in_memory(SessionKind::Full);
+            let (_to_server, from_server) = server.connect_in_memory(TokenRole::Owner);
             only_session(&server).await;
 
             drop(server);

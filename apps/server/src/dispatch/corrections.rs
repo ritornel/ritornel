@@ -556,7 +556,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
-    use ritornel_contract::{CONTRACT_VERSION, ErrorCode, Frame, Request, RequestId, SessionKind};
+    use ritornel_contract::{CONTRACT_VERSION, ErrorCode, Frame, Request, RequestId};
     use ritornel_engine::{OsEntropy, ScanSettings, ServerStore, SystemClock, run_scan};
     use ritornel_source::{Catalogue, Error, Question, Reply};
     use serde_json::{Value, json};
@@ -564,7 +564,7 @@ mod tests {
     use super::{Core, Stores};
     use crate::Bounds;
     use crate::data_dir::DataDir;
-    use crate::session::Session;
+    use crate::session::{Session, SessionGrant};
     use crate::testing::Scratch;
 
     /// The engine's invented disc: three tracks of 75, 120 and 90 sectors.
@@ -730,7 +730,7 @@ mod tests {
         if let Some(catalogue) = catalogue {
             core.set_catalogue(catalogue);
         }
-        let session = core.open_session(SessionKind::Full).unwrap();
+        let session = core.open_session(SessionGrant::OWNER).unwrap();
         let hello = json!({ "name": "test", "kind": "cli", "version": "1", "contractVersion": CONTRACT_VERSION });
         call(&core, &session, "server.hello", hello).unwrap();
         call(

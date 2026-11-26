@@ -7,13 +7,14 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 pub(super) async fn cached(
     State(core): State<Arc<Core>>,
+    Extension(grant): Extension<SessionGrant>,
     Extension(peer): Extension<Option<Peer>>,
     Extension(layer): Extension<ArtifactLayer>,
     Path(key): Path<String>,
     method: Method,
     headers: HeaderMap,
 ) -> Response {
-    if peer.is_none() {
+    if peer.is_none() || !grant.permissions.contains(Permission::LibraryRead) {
         return StatusCode::FORBIDDEN.into_response();
     }
     let Some(key) = hex::decode_array::<32>(&key) else {

@@ -618,7 +618,7 @@ mod tests {
 
     use std::sync::Arc;
 
-    use ritornel_contract::{CONTRACT_VERSION, ErrorCode, Frame, Request, RequestId, SessionKind};
+    use ritornel_contract::{CONTRACT_VERSION, ErrorCode, Frame, Request, RequestId};
     use ritornel_engine::{JobState, OsEntropy, ServerStore, ServiceKey};
     use ritornel_lastfm::fake::{API_KEY, API_SECRET};
     use serde_json::{Value, json};
@@ -627,7 +627,7 @@ mod tests {
     use crate::Bounds;
     use crate::data_dir::DataDir;
     use crate::lastfm::{Auto, Lastfm, LastfmRun, SERVICE, SYNC_JOB, import_tick};
-    use crate::session::Session;
+    use crate::session::{Session, SessionGrant};
     use crate::testing::{Scratch, SetClock};
 
     /// 2026-11-16 12:00 UTC.
@@ -686,7 +686,7 @@ mod tests {
     }
 
     fn hello(core: &Core, kind: &str) -> Arc<Session> {
-        let session = core.open_session(SessionKind::Full).unwrap();
+        let session = core.open_session(SessionGrant::OWNER).unwrap();
         let hello = json!({
             "name": "test", "kind": kind, "version": "1", "contractVersion": CONTRACT_VERSION
         });
