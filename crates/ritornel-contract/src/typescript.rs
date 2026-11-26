@@ -407,7 +407,7 @@ fn the_committed_typescript_is_what_the_contract_generates() {
 }
 
 /// The contract's version and the digest of the wire it was set for,
-/// committed beside `contract.ts`. `scripts/check-contract.sh` compares it
+/// committed beside `contract.ts`. `scripts/check-contract.py` compares it
 /// with main's: a wire that differs from main's is one version above it.
 const VERSION_FILE: &str = "contract/contract.version";
 
@@ -438,14 +438,14 @@ fn wire_digest(text: &str) -> String {
 fn version_file(digest: &str) -> String {
     format!(
         "# The contract version, and a digest of the wire it was set for. Written by\n\
-         # `mise run contract`. scripts/check-contract.sh refuses a wire that differs\n\
+         # `mise run contract`. scripts/check-contract.py refuses a wire that differs\n\
          # from main's under main's version: raise CONTRACT_VERSION, once, for it.\n\
          version {CONTRACT_VERSION}\ndigest {digest}\n"
     )
 }
 
 /// Whether the version changed with the wire is checked against main's, by
-/// `scripts/check-contract.sh`; here, that the file is this build's.
+/// `scripts/check-contract.py`; here, that the file is this build's.
 #[test]
 fn the_version_file_is_this_builds_version_and_wire() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))

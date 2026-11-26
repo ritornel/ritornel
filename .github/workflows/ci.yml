@@ -93,7 +93,7 @@ jobs:
       # pull request leaves it. origin/main was fetched in the step above.
       - if: github.event_name == 'pull_request'
         run: mise run contract-version
-      - run: scripts/check-docs.sh
+      - run: python scripts/check-docs.py
       - run: mise run licenses
 
   linux:

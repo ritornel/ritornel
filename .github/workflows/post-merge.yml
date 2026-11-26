@@ -46,7 +46,7 @@ jobs:
             ${{ matrix.name == 'Linux' && 'pkg-config libfontconfig-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev' || '' }}
           workspaces: apps/desktop
           shared-key: desktop-release
-          disable-tools: conda:ffmpeg,aqua:EmbarkStudios/cargo-deny,aqua:nextest-rs/nextest/cargo-nextest
+          disable-tools: conda:ffmpeg,aqua:EmbarkStudios/cargo-deny,aqua:nextest-rs/nextest/cargo-nextest,python
       - run: mise run desktop:release
 
   player-arm64:

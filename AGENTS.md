@@ -6,7 +6,7 @@ Ritornel is a music player for a collection you own: a server, `ritornel-server`
 
 `mise.toml` holds the tasks and pins the tools, and `mise tasks` lists them. A new checkout needs `mise trust` and `mise install` once.
 
-- `mise run check` runs the local equivalent of pull-request CI.
+- `mise run check` runs the local equivalent of pull-request CI, on macOS, Linux and Windows.
 - `mise run docs` checks `docs/internals/` citations, doc structure and rustdoc intra-doc links.
 - `mise run test` runs the tests. Some run `ritornelctl` against `ritornel-server` and take the server from the whole workspace's build, which `cargo test --package` alone does not rebuild.
 - `mise run schema` writes `schema/` again after a migration is added, and `mise run contract` writes `contract/contract.ts` again after a call or a wire type changes. A test fails when either is out of date. A wire that differs from main's needs `CONTRACT_VERSION` one above main's, and one raise covers every pull request of a change: `mise run contract-version` checks it.
@@ -14,7 +14,7 @@ Ritornel is a music player for a collection you own: a server, `ritornel-server`
 
 ## Good to know
 
-- Dependencies point one way: contract ← domain ← engine ← server, and contract ← client ← each client program. `scripts/check-deps.sh` checks it, and a new client or plugin gets a line there.
+- Dependencies point one way: contract ← domain ← engine ← server, and contract ← client ← each client program. `scripts/check-deps.py` checks it, and a new client or plugin gets a line there.
 - A call is defined once, in the method table in `crates/ritornel-contract/src/methods.rs`.
 - A migration that is on `main` is not edited, because the server refuses a database whose recorded checksum differs. A schema change is a new numbered file.
 - The desktop app, `apps/desktop`, is a Cargo workspace of its own, so the server builds without any desktop library.
@@ -35,7 +35,7 @@ Ritornel is a music player for a collection you own: a server, `ritornel-server`
 
 CI runs the tests in parallel on small, busy machines, Windows' slowest of all, so a test that counts on how long something takes fails there now and then. A test waits for what it checks, never for time to pass.
 
-- **Wait on an event or a condition, not a fixed sleep.** Look again until it holds, inside the test's `WAIT`: `while partial(&scratch).is_empty() { sleep(20 ms) }`, not `sleep(500 ms)` and hope. `scripts/check-test-sleeps.sh`, part of `mise run check`, asks every sleep in a test for a `// sleep:` comment that says why no event will do.
+- **Wait on an event or a condition, not a fixed sleep.** Look again until it holds, inside the test's `WAIT`: `while partial(&scratch).is_empty() { sleep(20 ms) }`, not `sleep(500 ms)` and hope. `scripts/check-test-sleeps.py`, part of `mise run check`, asks every sleep in a test for a `// sleep:` comment that says why no event will do.
 - **Use the clock the code takes.** Where code takes a `Clock`, a `now` or tokio's time, give it a fixed or paused one: `#[tokio::test(start_paused = true)]`, `elastic.scroll_at(&mut top, wheel, max, t0 + Duration::from_millis(10))`. Add a narrow seam where it is cheap.
 - **A deadline is a backstop, and says what never happened.** `assert!(Instant::now() < deadline, "the decoder never {what}")`, with a deadline of a minute. An upper bound on elapsed time is only for a claim about time, and the wait it proves against is made far longer than the bound: the stop test sets `Bounds::hub_call_wait` to a minute and asserts `took < 30 s`, rather than racing the default eight seconds.
 - **Hold what a test must catch.** Hold the null output where the test looks (`AudioRenderer::held`), or play slowly enough that each step outlasts any look, rather than race a short track at speed.

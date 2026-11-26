@@ -5,6 +5,9 @@
 idiomatic_version_file_enable_tools = ["rust"]
 
 [tools]
+# Runs the checks in scripts/ (`deps`, `sleeps`, `contract-version`, `docs`),
+# the same code on macOS, Linux and Windows.
+python = "3.15.1"
 # For making the audio fixtures again, and the tones `scripts/desktop.sh
 # tones` plays. No aqua package provides ffmpeg; conda-forge builds it for
 # macOS and Linux.
@@ -46,19 +49,19 @@ run = "cargo fmt --all --check"
 
 [tasks.deps]
 description = "Check that dependencies point one way"
-run = "scripts/check-deps.sh"
+run = "python scripts/check-deps.py"
 
 [tasks.sleeps]
 description = "Check that every sleep in a test says why no event will do"
-run = "scripts/check-test-sleeps.sh"
+run = "python scripts/check-test-sleeps.py"
 
 [tasks.contract-version]
 description = "Check that a change to the contract raises its version once, against main's"
-run = ["scripts/check-contract-tests.sh", "scripts/check-contract.sh"]
+run = ["python scripts/check-contract-tests.py", "python scripts/check-contract.py"]
 
 [tasks.docs]
 description = "Check docs/internals citations, doc rules and rustdoc intra-doc links"
-run = ["scripts/check-docs.sh", { task = "rustdoc" }]
+run = ["python scripts/check-docs.py", { task = "rustdoc" }]
 
 # Each system documents its own platform code, so CI runs this on each.
 [tasks.rustdoc]
