@@ -65,7 +65,7 @@ const MAX_PICTURES: usize = 64;
 struct CardSnapshot {
     entry_id: Option<Id>,
     art_id: Option<Id>,
-    playing: bool,
+    advancing: bool,
     repeat: Repeat,
     shuffle: bool,
     queue_revision: Option<u64>,
@@ -100,7 +100,7 @@ impl CardSnapshot {
         Self {
             entry_id,
             art_id,
-            playing: player.playing(),
+            advancing: player.advancing(),
             repeat: state.map_or(Repeat::Off, |s| s.repeat),
             shuffle: state.is_some_and(|s| s.shuffle),
             queue_revision: up_next.map(|q| q.revision),
@@ -482,7 +482,6 @@ impl UpNextCard {
     fn now_row(
         &self,
         track: &TrackSummary,
-        eq_seconds: f32,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
@@ -528,7 +527,7 @@ impl UpNextCard {
                     .flex_none()
                     .flex()
                     .justify_center()
-                    .child(crate::marks::eq(eq_seconds, 13., theme::acc())),
+                    .child(self.player.read(cx).equalizer(cx).draw(theme::acc())),
             )
     }
 
@@ -783,8 +782,6 @@ impl Render for UpNextCard {
         let more = total.saturating_sub(entries.len() as u64);
         let repeat = state.as_ref().map_or(Repeat::Off, |state| state.repeat);
         let shuffle = state.as_ref().is_some_and(|state| state.shuffle);
-        let playing = player.playing();
-        let eq_seconds = player.eq_seconds();
         // How long what is listed has left to play, with the rest of the song on.
         let ahead: u64 = entries
             .iter()
@@ -811,7 +808,6 @@ impl Render for UpNextCard {
         if !carrying {
             self.target = None;
         }
-        let mut animating = now.is_some() && playing && !crate::platform::reduce_motion();
 
         // Songs just added, in the accent for a moment.
         let arrived = match self.fresh_since {
@@ -823,7 +819,7 @@ impl Render for UpNextCard {
                     self.fresh_since = None;
                     0.
                 } else {
-                    animating = true;
+                    window.request_animation_frame();
                     1. - crate::shell::bezier(0., 0., 0.58, 1., t)
                 }
             }
@@ -985,9 +981,6 @@ impl Render for UpNextCard {
         } else {
             css_shadow(10., 30., gpui::rgba(0x00000033))
         };
-        if animating {
-            window.request_animation_frame();
-        }
         let height = f32::from(window.viewport_size().height) - TOP - BOTTOM;
 
         div()
@@ -1045,7 +1038,7 @@ impl Render for UpNextCard {
                                 .text_color(theme::faint())
                                 .child("Now playing"),
                         )
-                        .child(self.now_row(&now, eq_seconds, window, cx))
+                        .child(self.now_row(&now, window, cx))
                     })
                     .child(body)
                     .children(foot),

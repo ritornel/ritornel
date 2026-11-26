@@ -615,14 +615,6 @@ impl Speaker {
         let picker = places.picker.as_ref()?;
         let chosen = places.chosen_id(cx);
         let clock = crate::away::clock();
-        let still = crate::platform::reduce_motion();
-        let seconds = if still {
-            0.
-        } else {
-            self.picker_opened
-                .map_or(0., |at| at.elapsed().as_secs_f32())
-        };
-        let mut animating = false;
         let rows: Vec<_> = picker
             .rows
             .iter()
@@ -635,7 +627,6 @@ impl Speaker {
                     row.name.clone()
                 };
                 let playing = plays(row);
-                animating |= playing && !still;
                 let at = picker.at == Some(id);
                 let choosable = row.reachable;
                 div()
@@ -693,16 +684,20 @@ impl Speaker {
                             ),
                     )
                     .when(playing, |row| {
-                        row.child(crate::marks::eq(seconds, 13., theme::acc()))
+                        row.child(
+                            crate::marks::Equalizer::playback(
+                                Duration::ZERO,
+                                self.picker_opened,
+                                cx,
+                            )
+                            .draw(theme::acc()),
+                        )
                     })
                     .when(chosen == Some(id), |row| {
                         row.child(icon("check", 14., theme::acc()))
                     })
             })
             .collect();
-        if animating {
-            window.request_animation_frame();
-        }
         let widget = Rc::clone(&self.icon_bounds);
         let closes = self.places.downgrade();
         let tallest = (f32::from(window.viewport_size().height)

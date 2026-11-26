@@ -144,13 +144,16 @@ fn main() {
     type Reopen = Box<dyn FnMut(&mut App)>;
     let reopen: Rc<RefCell<Option<Reopen>>> = Rc::default();
     let on_reopen = reopen.clone();
-    let app = gpui_platform::application().with_assets(icons::Icons);
+    let platform = gpui_platform::current_platform(false);
+    let scene_clock = marks::SceneClock(std::time::Instant::now());
+    let app = gpui::Application::with_platform(platform).with_assets(icons::Icons);
     app.on_reopen(move |cx| {
         if let Some(reopen) = on_reopen.borrow_mut().as_mut() {
             reopen(cx);
         }
     });
     app.run(move |cx: &mut App| {
+        cx.set_global(scene_clock);
         frame::menus(cx);
         input::bind_keys(cx);
         // Whatever the system needs set up: on a Mac, reading what a
@@ -224,8 +227,6 @@ fn main() {
             display,
             width: args.width,
             height: args.height,
-            // A measure and a script run whether or not the window has focus.
-            unfocused_frames: args.measure.is_some() || args.script.is_some(),
             measure: args.measure.map(|seconds| Measure {
                 seconds,
                 out: args.out.clone(),
@@ -252,7 +253,6 @@ fn main() {
                         display,
                         width: args.width,
                         height: args.height,
-                        unfocused_frames: false,
                         measure: None,
                     };
                     if open_main(again, reopening.clone(), cx).is_err() {
@@ -290,8 +290,6 @@ struct Opening {
     display: Option<gpui::DisplayId>,
     width: f32,
     height: f32,
-    /// Draw at full rate when the window does not have focus.
-    unfocused_frames: bool,
     /// The measure's fling, on the first window only.
     measure: Option<Measure>,
 }
@@ -315,7 +313,6 @@ fn open_main(
         display,
         width,
         height,
-        unfocused_frames,
         measure,
     } = opening;
     let bounds = Bounds::centered(display, size(px(width), px(height)), cx);
@@ -331,11 +328,8 @@ fn open_main(
             appears_transparent: true,
             traffic_light_position: Some(point(px(20.), px(19.))),
         }),
-        inactive_frame_interval: if unfocused_frames {
-            None
-        } else {
-            WindowOptions::default().inactive_frame_interval
-        },
+        // Visible playback indicators keep their cadence when focus moves away.
+        inactive_frame_interval: None,
         ..Default::default()
     };
     cx.open_window(options, move |window, cx| {

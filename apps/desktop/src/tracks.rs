@@ -204,12 +204,10 @@ impl Tracks {
         &self,
         at: usize,
         song: &SongRow,
-        playing: (Option<Id>, bool, f32),
+        playing_now: Option<Id>,
         stars: u32,
         cx: &mut Context<Self>,
-    ) -> (Div, bool) {
-        let (playing_now, paused, eq_seconds) = playing;
-        let mut animating = false;
+    ) -> Div {
         let by = song
             .artist_credit
             .as_ref()
@@ -226,14 +224,13 @@ impl Tracks {
         // Play takes the number's place, its target running from the row's
         // edge to the title, the whole height.
         let number_cell = if current {
-            animating |= !paused;
             div()
                 .w(px(26.))
                 .h_full()
                 .flex()
                 .items_center()
                 .justify_end()
-                .child(crate::marks::eq(eq_seconds, 13., theme::acc()))
+                .child(self.player.read(cx).equalizer(cx).draw(theme::acc()))
         } else {
             div()
                 .relative()
@@ -454,14 +451,14 @@ impl Tracks {
                     .child(time)
                     .child(plus),
             );
-        (div().child(row), animating)
+        div().child(row)
     }
 }
 
 impl Render for Tracks {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let player = self.player.read(cx);
-        let playing = (player.appearance(), !player.playing(), player.eq_seconds());
+        let playing = player.appearance();
         let stars: Vec<u32> = self
             .songs
             .iter()
@@ -472,7 +469,6 @@ impl Render for Tracks {
                 )
             })
             .collect();
-        let mut animating = false;
         self.menued = crate::menu::marked(window, cx).filter(|(key, _)| key.starts_with("song:"));
         let mut list = div().w(px(self.width)).flex().flex_col();
         if self.heading {
@@ -504,9 +500,8 @@ impl Render for Tracks {
                 let mut each = div().flex_1().min_w_0().flex().flex_col();
                 for at in column * rows..((column + 1) * rows).min(songs.len()) {
                     if let Some(song) = songs.get(at) {
-                        let (row, moving) =
+                        let row =
                             self.row(at, song, playing, stars.get(at).copied().unwrap_or(0), cx);
-                        animating |= moving;
                         each = each.child(row);
                     }
                 }
@@ -537,15 +532,10 @@ impl Render for Tracks {
                     .enumerate()
                     .filter(|(_, song)| song.disc.unwrap_or(1) == *disc)
                 {
-                    let (row, moving) =
-                        self.row(at, song, playing, stars.get(at).copied().unwrap_or(0), cx);
-                    animating |= moving;
+                    let row = self.row(at, song, playing, stars.get(at).copied().unwrap_or(0), cx);
                     list = list.child(row);
                 }
             }
-        }
-        if animating {
-            window.request_animation_frame();
         }
         list
     }

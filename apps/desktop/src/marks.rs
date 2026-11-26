@@ -1,9 +1,11 @@
 //! Small marks drawn wherever a song appears: its five stars and the three
 //! bars of the song playing.
 
+use std::time::{Duration, Instant};
+
 use gpui::{
-    Context, Div, InteractiveElement, IntoElement, ParentElement, SharedString,
-    StatefulInteractiveElement, Styled, div, px,
+    Context, Div, InteractiveElement, ParentElement, SharedString, StatefulInteractiveElement,
+    Styled, div, prelude::FluentBuilder, px,
 };
 
 use crate::theme;
@@ -72,34 +74,98 @@ pub(crate) fn stars<V: 'static>(
     row
 }
 
-/// CSS's `ease-in-out`, `cubic-bezier(0.42, 0, 0.58, 1)`, at `t`.
-fn ease_in_out(t: f32) -> f32 {
-    crate::shell::bezier(0.42, 0., 0.58, 1., t)
+/// GPUI starts its shared sprite clock when it creates the application.
+/// Sample that origin so a sprite can follow elapsed playback across pauses.
+pub(crate) struct SceneClock(pub Instant);
+impl gpui::Global for SceneClock {}
+
+const EQ_PERIOD: Duration = Duration::from_millis(1800);
+
+pub(crate) struct Equalizer {
+    /// At rest, the held phase. In motion, the offset from GPUI's clock.
+    phase: f32,
+    moving: bool,
 }
 
-/// The mark of the song playing: three bars that move while it plays and
-/// hold while it is paused. `seconds` is how long it has played, which the
-/// player keeps; each bar rises and falls over 0.9 seconds, a third of the
-/// way behind the one before.
-pub(crate) fn eq(seconds: f32, side: f32, color: gpui::Rgba) -> impl IntoElement {
-    let unit = side / 16.;
-    let mut bars = div().relative().size(px(side)).flex_none();
-    for (at, x) in [3., 6.9, 10.8].into_iter().enumerate() {
-        let t = (seconds + 0.3 * at as f32) / 0.9;
-        // `alternate`: up one cycle, down the next.
-        let phase = t.rem_euclid(2.);
-        let along = if phase <= 1. { phase } else { 2. - phase };
-        let scale = 0.35 + 0.65 * ease_in_out(along);
-        let height = 10. * unit * scale;
-        bars = bars.child(
-            div()
-                .absolute()
-                .left(px(x * unit))
-                .top(px(13. * unit - height))
-                .w(px(2.2 * unit))
-                .h(px(height))
-                .bg(color),
-        );
+impl Equalizer {
+    pub(crate) fn playback(played: Duration, since: Option<Instant>, cx: &gpui::App) -> Self {
+        if cx.reduce_motion() {
+            return Self {
+                phase: 0.,
+                moving: false,
+            };
+        }
+        let start = since.map_or(Duration::ZERO, |start| {
+            start.duration_since(cx.global::<SceneClock>().0)
+        });
+        let phase = (played.as_secs_f64() - start.as_secs_f64()) / EQ_PERIOD.as_secs_f64();
+        Self {
+            phase: phase.rem_euclid(1.) as f32,
+            moving: since.is_some(),
+        }
     }
-    bars
+
+    pub(crate) fn draw(self, color: gpui::Rgba) -> Div {
+        let side = 13.;
+        // The upper edge of the strip traces our ease-in-out height curve.
+        // Each bar clips a narrow slice of it, 300 ms ahead of its neighbour.
+        // GPUI can translate this mask in the retained scene between presents.
+        const WAVE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="404" height="10">
+            <path d="M0 6.5 c42 0 58 -6.5 100 -6.5 s58 6.5 100 6.5
+                      s58 -6.5 100 -6.5 s58 6.5 100 6.5 h4 V10 H0 Z"/>
+        </svg>"#;
+        let unit = side / 16.;
+        let cycle = 200. * unit;
+        let pan = gpui::TimedTransformation::new(EQ_PERIOD).to(gpui::Transformation::translate(
+            gpui::point(px(-cycle), px(0.)),
+        ));
+        let mut bars = div().relative().size(px(side)).flex_none();
+        for (index, x) in [3., 6.9, 10.8].into_iter().enumerate() {
+            let phase = (self.phase + index as f32 / 6.).fract();
+            bars = bars.child(
+                div()
+                    .absolute()
+                    .left(px(x * unit))
+                    .top(px(3. * unit))
+                    .w(px(2.2 * unit))
+                    .h(px(10. * unit))
+                    .overflow_hidden()
+                    .child(
+                        gpui::svg()
+                            .data(WAVE)
+                            .absolute()
+                            .left(px(-phase * cycle))
+                            .top_0()
+                            .w(px(404. * unit))
+                            .h(px(10. * unit))
+                            .text_color(color)
+                            .when(self.moving, |wave| wave.with_timed_transformation(pan)),
+                    ),
+            );
+        }
+        bars
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[gpui::test]
+    fn resuming_starts_at_the_held_phase_on_the_shared_clock(cx: &mut gpui::TestAppContext) {
+        let origin = Instant::now();
+        cx.update(|cx| {
+            cx.set_global(SceneClock(origin));
+            let played = Duration::from_millis(450);
+            let held = Equalizer::playback(played, None, cx);
+            assert!(!held.moving);
+            assert_eq!(held.phase, 0.25);
+
+            let paused_until = Duration::from_millis(3150);
+            let resumed = Equalizer::playback(played, Some(origin + paused_until), cx);
+            let scene_phase = (paused_until.as_secs_f64() / EQ_PERIOD.as_secs_f64()) as f32;
+            assert!(resumed.moving);
+            assert_eq!((scene_phase + resumed.phase).fract(), held.phase);
+        });
+    }
 }
