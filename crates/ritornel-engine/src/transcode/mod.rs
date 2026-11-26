@@ -5,6 +5,11 @@ mod cli;
 mod package;
 pub use cache::{CacheEntry, Derivative, Pin, PinOwner, TranscodeCache};
 pub use package::{Artwork, Codec, Package, PackageSource, Tags};
+mod pool;
+pub use pool::{
+    Batch, BatchItem, BatchProgress, Cover, Encoding, Master, PackageAudio, Packaging,
+    TranscodePool,
+};
 mod profile;
 mod selection;
 
@@ -78,6 +83,27 @@ impl Pcm {
 
 fn decode_error(error: crate::playback::RenderError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+}
+
+fn copy(
+    reader: &mut impl io::Read,
+    writer: &mut impl Write,
+    cancel: &AtomicBool,
+) -> io::Result<()> {
+    use io::BufRead;
+    let mut input = io::BufReader::with_capacity(64 * 1024, reader);
+    loop {
+        check_cancel(cancel)?;
+        let block = match input.fill_buf() {
+            Ok([]) => return Ok(()),
+            Ok(block) => block,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        writer.write_all(block)?;
+        let count = block.len();
+        input.consume(count);
+    }
 }
 
 fn check_cancel(cancel: &AtomicBool) -> io::Result<()> {

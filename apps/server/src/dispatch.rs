@@ -95,7 +95,7 @@ pub(crate) enum Received {
 #[derive(Debug)]
 pub(crate) struct Stores {
     /// `server.db`.
-    server: ServerStore,
+    server: Arc<ServerStore>,
     adding_source: Mutex<()>,
     /// `library.db`, on a server that is a hub. Creating a library puts it
     /// here, and holds this for writing while it does, so that of two calls
@@ -104,9 +104,9 @@ pub(crate) struct Stores {
 }
 
 impl Stores {
-    pub(crate) fn new(server: ServerStore, library: Option<LibraryStore>) -> Self {
+    pub(crate) fn new(server: impl Into<Arc<ServerStore>>, library: Option<LibraryStore>) -> Self {
         Self {
-            server,
+            server: server.into(),
             adding_source: Mutex::default(),
             library: RwLock::new(library),
         }
@@ -706,7 +706,9 @@ impl Core {
             .into_inner()
             .unwrap_or_else(PoisonError::into_inner)
             .map_or(Ok(()), |library| library.close().map_err(Error::Library));
-        stores.server.close()?;
+        Arc::try_unwrap(stores.server)
+            .map_err(|_| Error::Runtime(std::io::Error::other("server store is still in use")))?
+            .close()?;
         library
     }
 

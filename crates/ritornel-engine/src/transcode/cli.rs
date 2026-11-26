@@ -246,7 +246,7 @@ fn wait(child: &mut Child, check: impl Fn() -> io::Result<()>) -> io::Result<Exi
     }
 }
 
-fn encode(
+pub(super) fn encode(
     cmd: &mut Command,
     pcm: Pcm,
     profile: Profile,

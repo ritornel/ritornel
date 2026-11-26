@@ -101,6 +101,10 @@ A producer works in a private `.part` directory under `cache/tmp/`. It finishes 
 
 A hit updates the index and acquires the caller’s pin in one transaction. The cache leaves file modification times alone. Above its byte budget (10 GiB by default), it removes unpinned packages first, then unpinned derivatives, in least-recently-used order within each layer. Releasing a pin retries eviction. The byte budget applies separately from `cacheBytes`, which covers pulled masters. The cache keeps the last measured size for up to 65,536 recently evicted keys.
 
+Each server owns one `TranscodePool`. Its dedicated threads start on demand, up to one fewer than the available cores, with a minimum of one. `ensure_batch` admits work as threads become available. Workers check a master against its scanned file facts and pipe decoded PCM straight into the encoder. Another track can encode while a completed derivative is being packaged. A package hit can be served even after its derivative was evicted. The cache serializes pin changes, renames and eviction with a publication lock. Master reads, encoding, packaging and hashing run concurrently outside that lock, and all file operations run outside SQLite transactions.
+
+Concurrent requests for one key await a shared result. Each caller can cancel its job or drop its wait. The last waiter to leave signals the worker to stop and the encoder supervisor kills and reaps its child. A retry waits for that attempt to leave the key before taking a worker. Each completed item reports its input index, batch counts and byte size. The returned batch keeps its files pinned in request order until dropped. A separate cache thread handles lookups and deferred pin releases while all encoder workers are busy. Batches sharing a flight share its pin until the last lease drops.
+
 ## Storage split
 
 Two WAL-mode SQLite files cannot commit atomically together, so state lives in the file whose transaction must commit it: everything that follows a library to another machine lives in `library.db`, and everything describing this specific machine lives in `server.db`.

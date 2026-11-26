@@ -335,7 +335,7 @@ fn sampled_hash_uses_each_end_once() {
     use std::io::Write;
     file.write_all(&bytes).unwrap();
     file.rewind().unwrap();
-    let (length, full, sampled) = hashes(&mut file).unwrap();
+    let (length, full, sampled) = hashes(&mut file, &AtomicBool::new(false)).unwrap();
     assert_eq!(length, size as u64);
     assert_eq!(full, blake3::hash(&bytes));
     let mut ends = blake3::Hasher::new();
@@ -400,4 +400,26 @@ fn competing_producers_return_the_same_published_bytes_and_both_hold_pins() {
     assert!(a.path().exists());
     cache.release(&db, pin(3).id).unwrap();
     assert!(!a.path().exists());
+}
+
+#[test]
+fn eviction_can_skip_an_unremovable_file_and_meet_the_budget() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = store();
+    let cache = TranscodeCache::open(&db, temp.path(), pin(1).id, 2).unwrap();
+    let id = encoder();
+    let build = |n| {
+        cache
+            .derivative(&db, spec(&id, n), pin(n + 1), |out, _| fs::write(out, [n]))
+            .unwrap()
+    };
+    let first = build(1);
+    let second = build(2);
+    cache.release(&db, pin(2).id).unwrap();
+    cache.release(&db, pin(3).id).unwrap();
+    fs::remove_file(first.path()).unwrap();
+    fs::create_dir(first.path()).unwrap();
+    let third = build(3);
+    assert!(third.path().is_file());
+    assert!(!second.path().exists());
 }
