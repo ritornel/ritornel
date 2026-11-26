@@ -47,7 +47,7 @@ What differs between systems sits in a `platform` module in each crate that need
 
 ### Linux
 
-- **The arm64 player is built natively in CI, not cross-compiled.** CI's post-merge `player-arm64` job builds and tests the headless player on GitHub's arm64 Linux runner on pushes to `main`, linking ALSA as any Linux machine does. Cross-compiling would need an aarch64 sysroot with ALSA's development files. Every code pull request still lints the `--no-default-features --features audio-output` configuration in the Linux job.
+- **The arm64 player is built natively in CI, not cross-compiled.** The `player-arm64` job in `.github/workflows/post-merge.yml` builds and tests the headless player on GitHub's arm64 Linux runner on pushes to `main`, linking ALSA as any Linux machine does. Cross-compiling would need an aarch64 sysroot with ALSA's development files. Every code pull request still lints the `--no-default-features --features audio-output` configuration in the Linux job.
 - **Sound goes through ALSA's `default` device, not `cpal`'s PipeWire or PulseAudio hosts.** ALSA needs only `libasound`, and on a desktop with a sound server, `default` routes to that server. The output opens as 32-bit float at the device's own rate and channels, as on macOS.
 - **MPRIS is served with `zbus` directly, not through `souvlaki`.** `souvlaki`'s Linux backend wakes every 10 ms while a player is registered, panics when there is no session bus, does not advance reported position between updates, and never emits `Seeked`. The `zbus` implementation avoids all four:
   - it wakes only for a change or a call;

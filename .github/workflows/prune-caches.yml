@@ -1,0 +1,56 @@
+name: Prune caches
+
+# Runs each time CI or Post-merge finishes a run on main, so the run after
+# whichever finished last sees every cache both saved. Each run deletes only
+# caches a newer one of the same kind already replaced, so one that runs
+# before the other workflow has saved its caches deletes nothing that is
+# still the newest of its kind.
+on:
+  workflow_run:
+    workflows: [CI, Post-merge]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  actions: write
+
+jobs:
+  prune-caches:
+    # Deletes each cache on main that a newer one of the same kind replaced,
+    # such as the whole set saved before Cargo.lock last changed. A PR
+    # restores the newest of a kind when its own key is not found, so nothing
+    # restores the older ones, and left to the quota they would evict newer
+    # caches instead. A pull request from a fork's main also has the head
+    # branch main, so only pushes count.
+    name: Prune replaced caches
+    if: >-
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.conclusion != 'cancelled'
+    # One prune at a time, so two never delete the same cache. A newer one
+    # waiting replaces an older one waiting, and sees everything it would
+    # have. On the job, not the workflow, so a run whose job is skipped never
+    # takes the waiting place from one that prunes.
+    concurrency:
+      group: prune-caches
+      cancel-in-progress: false
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          declare -A kept
+          gh api --paginate "repos/$GH_REPO/actions/caches?ref=refs/heads/main&per_page=100" \
+            --jq '.actions_caches[] | "\(.created_at) \(.id) \(.key)"' |
+            sort -r |
+            while read -r created id key; do
+              # The key without the hashes at its end: the kind of cache.
+              kind=$(sed -E 's/(-p[0-9]+)?(-[0-9a-f]{8,})+$//' <<<"$key")
+              if [[ -n ${kept[$kind]:-} ]]; then
+                echo "deleting $key, saved $created: ${kept[$kind]} replaced it"
+                gh api --method DELETE "repos/$GH_REPO/actions/caches/$id" > /dev/null
+              else
+                kept[$kind]=$key
+              fi
+            done
