@@ -5,7 +5,7 @@
 idiomatic_version_file_enable_tools = ["rust"]
 
 [tools]
-# Runs the checks in scripts/ (`deps`, `sleeps`, `contract-version`, `docs`),
+# Runs the checks in scripts/ (`deps`, `sleeps`, `build-version`, `contract-version`, `docs`),
 # the same code on macOS, Linux and Windows.
 python = "3.15.1"
 # For making the audio fixtures again, and the tones `scripts/desktop.sh

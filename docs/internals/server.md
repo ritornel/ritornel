@@ -217,7 +217,7 @@ Logs (`apps/server/src/logs.rs`) write daily-rotated JSON lines under `<data-dir
 
 ## Build identity
 
-The server, `ritornelctl`, and the desktop app each run `crates/ritornel-build` from their Cargo build script. A clean checkout tagged `v0.1.0` reports `0.1.0` when that is the package version. Three commits later it reports, for example, `0.1.0+dev.3.a1b2c3d4`. These SemVer build metadata leave version precedence unchanged. Tracked edits append `.dirty`, including on the tag itself (`0.1.0+dev.0.a1b2c3d4.dirty`). Untracked files do not count.
+The server, `ritornelctl`, and the desktop app each run `crates/ritornel-build` from their Cargo build script. A clean checkout tagged `v0.1.0` reports `0.1.0` when that is the package version. Three commits later it reports, for example, `0.1.0+dev.3.a1b2c3d4`. SemVer build metadata does not affect version precedence. Tracked edits append `.dirty`, including on the tag itself (`0.1.0+dev.0.a1b2c3d4.dirty`). Untracked files do not count.
 
 A development build omits the distance if the package tag is missing or unreachable, if a shallow checkout cannot supply full history, or if any other `v*` tag points at HEAD. The commit is the first eight lowercase hex digits of the SHA, or `unknown` if the SHA is unavailable or invalid.
 
@@ -225,7 +225,7 @@ For sandboxed builds, a nonempty `RITORNEL_BUILD_COMMIT` supplies the SHA and di
 
 The helper emits `RITORNEL_VERSION_DISPLAY`, `RITORNEL_VERSION_COMMIT`, and `RITORNEL_VERSION_DIRTY` (`0` or `1`). The display version appears in both command-line programs' `--version`, the server's startup log, `server.hello` from each client or satellite, the backup manifest's `serverVersion`, and the desktop About panel. The server reports it in `server.status`, which supplies the server version shown by clients. Last.fm and MusicBrainz HTTP user agents and the Spotify import reader identifier use the plain package version.
 
-Cargo watches all four build inputs. In Git mode it also watches the worktree's HEAD reflog and the common repository's packed refs and tags directory when they exist. Editing a tracked file alone can leave the cached dirty flag stale. Fresh builds read the current tree, and install or CI scripts can pass explicit build inputs for a reproducible stamp. `mise run build-version`, part of `mise run check`, requires the root workspace and desktop package versions to match and checks every exact `v*` tag against that version.
+Cargo watches all four build inputs. When Git supplies the inputs, Cargo also watches the worktree's HEAD reflog and the common repository's packed refs and tags directory when they exist. Editing a tracked file alone can leave the cached dirty flag stale. Fresh builds read the current tree, and install or CI scripts can pass explicit build inputs for a reproducible stamp. `mise run build-version`, part of `mise run check`, requires the root workspace and desktop package versions to match and checks every exact `v*` tag against that version.
 
 ## Workspace and tooling
 

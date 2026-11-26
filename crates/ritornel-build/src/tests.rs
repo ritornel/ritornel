@@ -22,6 +22,13 @@ fn normalizes_the_entire_sha_before_shortening() {
 fn explicit_commit_never_consults_git() {
     for (tag, distance, dirty, expected) in [
         (Some(RELEASE), None, None, "1.2.3-beta.1"),
+        (Some(RELEASE), Some(""), None, "1.2.3-beta.1"),
+        (
+            Some(RELEASE),
+            Some(""),
+            Some("1"),
+            "1.2.3-beta.1+dev.0.abcdef01.dirty",
+        ),
         (Some(RELEASE), Some("0"), Some("0"), "1.2.3-beta.1"),
         (
             Some(RELEASE),
@@ -129,7 +136,12 @@ fn git_uses_only_the_package_tag_and_complete_history_for_distance() {
             match args {
                 ["rev-parse", "HEAD"] => Some(SHA),
                 ["tag", "--points-at", "HEAD", "--list", "v*"] => Some(tags),
-                ["status", "--porcelain", "--untracked-files=no"] => Some(status),
+                [
+                    "--no-optional-locks",
+                    "status",
+                    "--porcelain",
+                    "--untracked-files=no",
+                ] => Some(status),
                 ["rev-parse", "--is-shallow-repository"] => Some(shallow),
                 ["describe", "--tags", "--match", RELEASE, "--long"] => described,
                 _ => unreachable!(),

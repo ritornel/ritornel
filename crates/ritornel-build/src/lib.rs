@@ -47,7 +47,7 @@ fn identity(
         return from_git();
     };
     let distance = if read(TAG).as_deref() == Some(release_tag) {
-        match read(DISTANCE) {
+        match read(DISTANCE).filter(|s| !s.is_empty()) {
             None => Some(0),
             Some(n) => n.parse().ok(),
         }
@@ -67,7 +67,12 @@ fn git_identity(tag: &str, git: impl Fn(&[&str]) -> Option<String>) -> Identity 
     let probes = (
         git(&["rev-parse", "HEAD"]),
         git(&["tag", "--points-at", "HEAD", "--list", "v*"]),
-        git(&["status", "--porcelain", "--untracked-files=no"]),
+        git(&[
+            "--no-optional-locks",
+            "status",
+            "--porcelain",
+            "--untracked-files=no",
+        ]),
     );
     let (Some(sha), Some(tags), Some(status)) = probes else {
         return Identity::new("", None, false);
@@ -101,7 +106,7 @@ fn watch_git() {
     let paths = [
         head_log,
         common.as_ref().map(|dir| dir.join("packed-refs")),
-        common.as_ref().map(|dir| dir.join("refs/tags")),
+        common.as_ref().map(|dir| dir.join("refs").join("tags")),
     ];
     for path in paths.into_iter().flatten().filter(|path| path.exists()) {
         println!("cargo:rerun-if-changed={}", path.display());
