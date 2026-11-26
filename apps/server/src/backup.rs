@@ -53,8 +53,8 @@ use tracing::{info, warn};
 use crate::data_dir::DataDir;
 use crate::error::io_error;
 use crate::platform::{
-    close_to_others, create_new_private_dir, create_private_dir, create_private_file, plain_path,
-    rename_dir, rename_new_file, sync_dir,
+    close_to_others, create_new_private_dir, create_private_dir, create_private_file,
+    no_hard_links, plain_path, rename_dir, rename_new_file, sync_dir,
 };
 
 /// The version of `backup.json`.
@@ -404,10 +404,10 @@ fn inferred(place: &Path) -> Result<Owner, BackupError> {
     let mut found = Vec::new();
     for entry in std::fs::read_dir(place).map_err(cannot_list)? {
         let path = entry.map_err(cannot_list)?.path();
+        // Its name as it is, so one that is not UTF-8 is looked at too.
         let is_backup = path
             .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with("ritornel-backup-"));
+            .is_some_and(|name| name.as_encoded_bytes().starts_with(b"ritornel-backup-"));
         if !is_backup {
             continue;
         }
@@ -493,14 +493,7 @@ fn name_owner(place: &Path, ours: &Path) -> Result<(), BackupError> {
         // A disk without hard links, such as FAT or exFAT: the file is
         // made in place, still only if it is not there, and a reader may
         // find it empty for as long as it takes to write.
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::Unsupported
-                    | std::io::ErrorKind::PermissionDenied
-                    | std::io::ErrorKind::CrossesDevices
-            ) =>
-        {
+        Err(error) if no_hard_links(&error) => {
             let _ = std::fs::remove_file(&partial);
             write_synced(&file, text.as_bytes()).inspect_err(|error| {
                 if !matches!(error, BackupError::Io { source, .. } if source.kind() == std::io::ErrorKind::AlreadyExists)

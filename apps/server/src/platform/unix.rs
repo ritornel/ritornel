@@ -54,6 +54,17 @@ pub(crate) fn rename_new_file(from: &Path, to: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Whether [`rename_new_file`] failed because the disk has no hard
+/// links, such as FAT or exFAT, rather than for what any file may fail.
+pub(crate) fn no_hard_links(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::Unsupported
+            | std::io::ErrorKind::PermissionDenied
+            | std::io::ErrorKind::CrossesDevices
+    )
+}
+
 /// Renames the folder at `from` to `to`, and nothing more: a caller that
 /// needs the new name to survive a loss of power syncs the folder that
 /// holds it after ([`sync_dir`]), as `backup::publish` does.

@@ -137,6 +137,12 @@ pub(crate) fn rename_new_file(from: &Path, to: &Path) -> std::io::Result<()> {
     ritornel_windows::file::rename_through(from, to)
 }
 
+/// Whether [`rename_new_file`] failed because the disk has no hard links:
+/// never, since a rename needs none.
+pub(crate) fn no_hard_links(_error: &std::io::Error) -> bool {
+    false
+}
+
 /// Renames the folder at `from` to `to`, asking for the rename to be
 /// written through to the disk before this returns. It fails if something
 /// is at `to`.
