@@ -25,8 +25,8 @@ use std::time::{Duration, Instant};
 use gpui::{
     App, AppContext, Bounds, ClickEvent, Context, Entity, FocusHandle, FontWeight, Global,
     InteractiveElement, IntoElement, ParentElement, Render, StatefulInteractiveElement, Styled,
-    Subscription, Task, TitlebarOptions, Window, WindowBounds, WindowHandle, WindowOptions,
-    actions, canvas, div, prelude::FluentBuilder, px, size,
+    Subscription, Task, TitlebarOptions, Window, WindowBounds, WindowControlArea, WindowHandle,
+    WindowOptions, actions, canvas, div, prelude::FluentBuilder, px, size,
 };
 use jiff::tz::TimeZone;
 
@@ -370,57 +370,6 @@ impl Settings {
         }
     }
 
-    fn toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let tab = |section: Section| {
-            let on = section == self.section;
-            let group = format!("tab-{}", section.id());
-            div()
-                .id(section.id())
-                .group(group.clone())
-                .flex()
-                .flex_col()
-                .items_center()
-                .gap(px(2.))
-                .min_w(px(64.))
-                .pt(px(5.))
-                .px(px(8.))
-                .pb(px(4.))
-                .rounded(px(6.))
-                .text_size(px(11.))
-                .line_height(px(controls::SMALL_LINE))
-                .text_color(theme::dim())
-                .when(on, |tab| tab.bg(theme::fill()))
-                .when(!on, |tab| {
-                    tab.hover(theme::hovered_ink).active(theme::pressed)
-                })
-                // The press must not start a window drag.
-                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .on_click(cx.listener(move |settings, _: &ClickEvent, _, cx| {
-                    settings.go(section, cx);
-                }))
-                .child(
-                    gpui::svg()
-                        .path(section.icon())
-                        .size(px(22.))
-                        .flex_none()
-                        .text_color(if on { theme::acc() } else { theme::dim() })
-                        .when(!on, |icon| icon.group_hover(group, theme::hovered_ink)),
-                )
-                .child(
-                    div()
-                        .when(on, |label| label.text_color(theme::ink()))
-                        .child(section.title()),
-                )
-        };
-        div()
-            .flex()
-            .justify_center()
-            .gap(px(4.))
-            .pt(px(2.))
-            .pb(px(7.))
-            .children(Section::ALL.map(tab))
-    }
-
     fn section(&self, window: &Window, cx: &App) -> gpui::AnyElement {
         let model = self.model.read(cx);
         let active = window.is_window_active();
@@ -498,24 +447,15 @@ impl Render for Settings {
         .top_0()
         .left_0()
         .size_full();
-        let header = div()
-            .id("header")
-            .px(px(12.))
-            .border_b_1()
-            .border_color(theme::line())
-            // A press here moves the window, as a title bar's does.
-            .on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
-                window.start_window_move();
-            })
-            .child(
-                div()
-                    .h(px(28.))
-                    .font_weight(FontWeight(600.))
-                    .line_height(px(28.))
-                    .text_center()
-                    .child(title),
-            )
-            .child(self.toolbar(cx));
+        let settings = cx.entity().clone();
+        let header = header(
+            title,
+            self.section,
+            platform::CHROME.app_buttons,
+            Rc::new(move |section, _, cx| {
+                settings.update(cx, |settings, cx| settings.go(section, cx));
+            }),
+        );
         let section = div()
             .pt(px(20.))
             .px(px(24.))
@@ -543,5 +483,190 @@ impl Render for Settings {
                     .child(measure),
             )
             .children(crate::drawn::layer(window, cx))
+    }
+}
+
+type OnSection = Rc<dyn Fn(Section, &mut Window, &mut App)>;
+
+/// The window's header: title, section toolbar, and on systems where the
+/// app draws its own caption buttons, a close button flush in the top-right
+/// corner (Settings is neither resizable nor minimizable).
+fn header(
+    title: &'static str,
+    current: Section,
+    app_buttons: bool,
+    on_select: OnSection,
+) -> impl IntoElement {
+    let title_height = if app_buttons { 32. } else { 28. };
+    div()
+        .id("header")
+        .relative()
+        .px(px(12.))
+        .border_b_1()
+        .border_color(theme::line())
+        // On Windows the area answers the system's hit test as the caption.
+        .window_control_area(WindowControlArea::Drag)
+        // Elsewhere a press here moves the window, as a title bar's does.
+        .when(!app_buttons, |header| {
+            header.on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
+                window.start_window_move();
+            })
+        })
+        .child(
+            div()
+                .h(px(title_height))
+                .font_weight(FontWeight(600.))
+                .line_height(px(title_height))
+                .text_center()
+                .debug_selector(|| "settings-title".into())
+                .child(title),
+        )
+        .child(toolbar(current, on_select))
+        .when(app_buttons, |header| {
+            header.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .right_0()
+                    .debug_selector(|| "settings-close".into())
+                    .child(crate::frame::close_button(title_height)),
+            )
+        })
+}
+
+fn toolbar(current: Section, on_select: OnSection) -> impl IntoElement {
+    let tab = move |section: Section| {
+        let on = section == current;
+        let group = format!("tab-{}", section.id());
+        let go = Rc::clone(&on_select);
+        div()
+            .id(section.id())
+            .group(group.clone())
+            .debug_selector(move || format!("settings-tab-{}", section.id()))
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(px(2.))
+            .min_w(px(64.))
+            .pt(px(5.))
+            .px(px(8.))
+            .pb(px(4.))
+            .rounded(px(6.))
+            .text_size(px(11.))
+            .line_height(px(controls::SMALL_LINE))
+            .text_color(theme::dim())
+            .when(on, |tab| tab.bg(theme::fill()))
+            .when(!on, |tab| {
+                tab.hover(theme::hovered_ink).active(theme::pressed)
+            })
+            // The press must not start a window drag.
+            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(move |_: &ClickEvent, window, cx| go(section, window, cx))
+            .child(
+                gpui::svg()
+                    .path(section.icon())
+                    .size(px(22.))
+                    .flex_none()
+                    .text_color(if on { theme::acc() } else { theme::dim() })
+                    .when(!on, |icon| icon.group_hover(group, theme::hovered_ink)),
+            )
+            .child(
+                div()
+                    .when(on, |label| label.text_color(theme::ink()))
+                    .child(section.title()),
+            )
+    };
+    div()
+        .flex()
+        .justify_center()
+        .gap(px(4.))
+        .pt(px(2.))
+        .pb(px(7.))
+        .children(Section::ALL.map(tab))
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::VisualContext;
+
+    use super::*;
+
+    struct HeaderHost {
+        section: Section,
+        app_buttons: bool,
+    }
+
+    impl Render for HeaderHost {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let host = cx.entity().clone();
+            div().w(px(WIDTH)).child(header(
+                self.section.title(),
+                self.section,
+                self.app_buttons,
+                Rc::new(move |section, _, cx| {
+                    host.update(cx, |host, cx| {
+                        host.section = section;
+                        cx.notify();
+                    });
+                }),
+            ))
+        }
+    }
+
+    #[gpui::test]
+    fn app_buttons_draws_close_button_flush_top_right_and_tabs_stay_clickable(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (host, cx) = cx.add_window_view(|_, _| HeaderHost {
+            section: Section::Library,
+            app_buttons: true,
+        });
+        cx.simulate_window_resize(cx.window_handle(), size(px(WIDTH), px(FIRST_HEIGHT)));
+        assert!(cx.refresh().is_ok());
+
+        let close = cx.debug_bounds("settings-close");
+        assert!(
+            close.is_some(),
+            "close caption button should render when app_buttons is true"
+        );
+        if let Some(close) = close {
+            assert_eq!(close.origin.y, px(0.));
+            assert_eq!(close.right(), px(WIDTH));
+            assert_eq!(close.size.width, px(46.));
+            assert_eq!(close.size.height, px(32.));
+        }
+
+        let title = cx.debug_bounds("settings-title");
+        assert!(title.is_some(), "title row should render");
+        if let Some(title) = title {
+            assert_eq!(title.size.height, px(32.));
+        }
+
+        let appearance = cx.debug_bounds("settings-tab-appearance");
+        assert!(appearance.is_some(), "Appearance tab should render");
+        if let Some(appearance) = appearance {
+            cx.simulate_click(appearance.center(), gpui::Modifiers::none());
+        }
+        assert_eq!(
+            host.read_with(cx, |host, _| host.section),
+            Section::Appearance
+        );
+    }
+
+    #[gpui::test]
+    fn without_app_buttons_draws_no_close_button(cx: &mut gpui::TestAppContext) {
+        let (_host, cx) = cx.add_window_view(|_, _| HeaderHost {
+            section: Section::Library,
+            app_buttons: false,
+        });
+        cx.simulate_window_resize(cx.window_handle(), size(px(WIDTH), px(FIRST_HEIGHT)));
+        assert!(cx.refresh().is_ok());
+
+        assert!(cx.debug_bounds("settings-close").is_none());
+        let title = cx.debug_bounds("settings-title");
+        assert!(title.is_some(), "title row should render");
+        if let Some(title) = title {
+            assert_eq!(title.size.height, px(28.));
+        }
     }
 }

@@ -387,48 +387,63 @@ fn menu_button() -> impl IntoElement {
 /// system does the rest, Maximize's snap layouts included. The glyphs are
 /// Segoe Fluent Icons', as Windows 11's own buttons have them.
 fn caption_buttons() -> impl IntoElement {
-    let button = |id: &'static str, glyph: &'static str, area: WindowControlArea, close: bool| {
-        div()
-            .id(id)
-            .window_control_area(area)
-            // GPUI answers the system's hit test with the first area under
-            // the pointer, outermost first: the bar's caption, unless each
-            // button hides what is behind it.
-            .occlude()
-            .w(px(46.))
-            .h(px(TITLE_BAR))
-            .flex()
-            .items_center()
-            .justify_center()
-            .font_family("Segoe Fluent Icons")
-            .text_size(px(10.))
-            .text_color(theme::dim())
-            .hover(move |style| {
-                if close {
-                    style
-                        .bg(gpui::rgb(0xc42b1c))
-                        .text_color(gpui::rgb(0xffffff))
-                } else {
-                    theme::hovered_ink(theme::hovered(style))
-                }
-            })
-            .active(theme::pressed)
-            .child(glyph)
-    };
     div()
         .flex()
         .ml(px(8.))
-        .child(button(
+        .child(caption_button(
             "minimize",
             "\u{E921}",
             WindowControlArea::Min,
             false,
+            TITLE_BAR,
         ))
-        .child(button(
+        .child(caption_button(
             "maximize",
             "\u{E922}",
             WindowControlArea::Max,
             false,
+            TITLE_BAR,
         ))
-        .child(button("close", "\u{E8BB}", WindowControlArea::Close, true))
+        .child(close_button(TITLE_BAR))
+}
+
+/// A single close caption button for a non-resizable, non-minimizable
+/// window whose title bar is the app's (such as Settings on Windows).
+pub(crate) fn close_button(height: f32) -> impl IntoElement {
+    caption_button("close", "\u{E8BB}", WindowControlArea::Close, true, height)
+}
+
+fn caption_button(
+    id: &'static str,
+    glyph: &'static str,
+    area: WindowControlArea,
+    close: bool,
+    height: f32,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .window_control_area(area)
+        // GPUI answers the system's hit test with the first area under
+        // the pointer, outermost first: the bar's caption, unless each
+        // button hides what is behind it.
+        .occlude()
+        .w(px(46.))
+        .h(px(height))
+        .flex()
+        .items_center()
+        .justify_center()
+        .font_family("Segoe Fluent Icons")
+        .text_size(px(10.))
+        .text_color(theme::dim())
+        .hover(move |style| {
+            if close {
+                style
+                    .bg(gpui::rgb(0xc42b1c))
+                    .text_color(gpui::rgb(0xffffff))
+            } else {
+                theme::hovered_ink(theme::hovered(style))
+            }
+        })
+        .active(theme::pressed)
+        .child(glyph)
 }
