@@ -2056,7 +2056,14 @@ fn the_track_after_one_whose_output_was_closed_is_joined_again_once_it_plays() {
     // Ticks while it is closed prepare nothing.
     rig.wait(1_000);
     assert_eq!(rig.fake.queued(), None);
-    rig.resume();
+    // The resume opens nothing but the output; the next tick prepares it.
+    let request = rig.request("playback.resume");
+    let catalog = Away::new(&rig.library, &rig.away);
+    rig.player
+        .resume(request, &rig.server, Some(&catalog))
+        .unwrap();
+    assert_eq!(rig.fake.queued(), None);
+    rig.tick();
     assert_eq!(rig.fake.queued(), Some(file(1)));
     rig.pass(41_000);
     let state = rig.player.state();
@@ -2261,9 +2268,15 @@ fn a_kept_master_let_go_while_the_output_was_closed_is_fetched_again_and_its_lis
     assert_eq!(open.ended, None);
     rig.fake.track(file(0), 240_000);
     let wanted = rig.player.wanted().unwrap();
+    let began = rig.began.len();
     rig.fetched(wanted, Ok(()));
     assert_eq!(rig.fake.loads().last(), Some(&(file(0), 60_000)));
-    rig.pass(180_000);
+    // Said to begin again once, as it is heard.
+    assert_eq!(rig.began.len(), began);
+    rig.pass(1_000);
+    assert_eq!(rig.began.len(), began + 1);
+    rig.pass(179_000);
+    assert_eq!(rig.began.len(), began + 1);
     let [listen] = rig.staged().try_into().unwrap();
     assert_eq!(
         (
@@ -2272,6 +2285,104 @@ fn a_kept_master_let_go_while_the_output_was_closed_is_fetched_again_and_its_lis
         ),
         ("finished", 240_000)
     );
+}
+
+impl Rig {
+    /// Plays the first track, a master fetched as a satellite fetches it,
+    /// pauses it a minute in, closes the output, and lets the master go:
+    /// resume then waits for it to be fetched again.
+    fn paused_with_master_let_go(&mut self) {
+        self.elsewhere(&[0]);
+        self.play(0);
+        let wanted = self.player.wanted().unwrap();
+        self.hand_back(wanted, Ok(()));
+        self.pass(60_000);
+        self.pause();
+        self.wait(super::CLOSE_OUTPUT_AFTER_MS);
+        self.fake.broken(file(0), "missing");
+        self.resume();
+        assert_eq!(self.player.state().status, Status::Buffering);
+    }
+}
+
+#[test]
+fn a_seek_while_a_master_let_go_is_fetched_again_moves_the_listen_it_carries_on() {
+    let mut rig = Rig::new();
+    rig.paused_with_master_let_go();
+    rig.seek(100_000);
+    rig.fake.track(file(0), 240_000);
+    let wanted = rig.player.wanted().unwrap();
+    rig.fetched(wanted, Ok(()));
+    assert_eq!(rig.fake.loads().last(), Some(&(file(0), 100_000)));
+    rig.pass(140_000);
+    let [listen] = rig.staged().try_into().unwrap();
+    assert_eq!(
+        (
+            listen.ended.unwrap().end_reason.as_str(),
+            listen.heard.ms_played,
+            listen.heard.ranges_json.as_str(),
+            listen.heard.seek_count,
+        ),
+        ("finished", 200_000, "[[0,60000],[100000,240000]]", 1)
+    );
+}
+
+#[test]
+fn a_file_changed_while_its_output_was_closed_is_not_played_even_where_the_library_knows_it() {
+    let mut rig = Rig::new();
+    rig.paused_with_output_closed(60_000);
+    // Another file of the same length is in its place, and the library
+    // already reads it, as a satellite's cache does: it is not played
+    // under the listen of the file it replaced.
+    let changed = super::FileFacts {
+        size_bytes: 1_000,
+        mtime_ms: 1,
+    };
+    rig.fake.replace(file(0), changed);
+    let item = rig.items[0];
+    rig.library
+        .write(
+            WriteRequest {
+                method: "test.facts",
+                command: None,
+                client: None,
+            },
+            move |write| {
+                write.connection().execute(
+                    "UPDATE source_item SET size_bytes = ?1, mtime_ms = ?2 WHERE id = ?3",
+                    (1_000, 1, item),
+                )?;
+                Ok(String::new())
+            },
+        )
+        .unwrap();
+    rig.resume();
+    assert_eq!(rig.queue()[0].2.as_deref(), Some("file_changed"));
+    assert_eq!(rig.fake.loads().last(), Some(&(file(1), 0)));
+    let [listen] = rig.staged().try_into().unwrap();
+    assert_eq!(listen.ended.unwrap().end_reason.as_str(), "error");
+}
+
+#[test]
+fn an_output_that_cannot_be_opened_afresh_in_place_of_a_stale_one_says_so() {
+    let mut rig = Rig::new();
+    rig.play(0);
+    rig.pass(60_000);
+    rig.pause();
+    rig.wait(5_000);
+    rig.fake.go_stale();
+    rig.resume();
+    rig.fake.refuse_output(true);
+    let revision = rig.player.state().revision;
+    rig.between_ticks(1_000);
+    let events = rig.player.tick(&rig.server, Some(&rig.library)).unwrap();
+    assert!(events.contains(&super::PlayerEvent::State), "{events:?}");
+    let state = rig.player.state();
+    assert!(state.revision > revision);
+    assert_eq!((state.status, state.position_ms), (Status::Paused, 60_000));
+    assert!(state.output_failing.is_some());
+    let [lost] = rig.staged().try_into().unwrap();
+    assert_eq!(lost.ended.unwrap().end_reason.as_str(), "output_lost");
 }
 
 #[test]

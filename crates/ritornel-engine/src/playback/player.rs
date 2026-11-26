@@ -884,6 +884,18 @@ impl Player {
         library: &dyn Catalog,
         events: &mut Vec<PlayerEvent>,
     ) -> Result<(), Error> {
+        self.start_entry(server, library, events, true)
+    }
+
+    /// As [`start`](Self::start), preparing what follows before the track
+    /// plays only if `prepare_first`: otherwise the next tick does.
+    fn start_entry(
+        &mut self,
+        server: &ServerStore,
+        library: &dyn Catalog,
+        events: &mut Vec<PlayerEvent>,
+        prepare_first: bool,
+    ) -> Result<(), Error> {
         self.paused_buffering = false;
         let roots = roots(server)?;
         loop {
@@ -891,7 +903,12 @@ impl Player {
                 self.status = Status::Stopped;
                 return Ok(());
             };
+            let held = self.recorder.held().is_some();
             let opened = self.open(&entry, library, &roots)?;
+            // A held listen that another copy ended is saved at once.
+            if held && self.recorder.held().is_none() {
+                self.save(server, events);
+            }
             self.display = library.track(entry.appearance)?;
             match opened {
                 Opened::Elsewhere => {
@@ -911,12 +928,21 @@ impl Player {
                     self.output_failing = None;
                     // Before it plays, so that its decoder has the next
                     // before it can reach its end, however short it is.
-                    self.prepare_next(server, Some(library))?;
+                    if prepare_first {
+                        self.prepare_next(server, Some(library))?;
+                    }
                     self.renderer.play();
                     self.status = Status::Playing;
                     self.failures_in_a_row = 0;
                     self.last_progress_mono = self.setup.timekeeper.mono_ms();
                     return Ok(());
+                }
+                // A listen held across a closed output ends as one the
+                // output lost, and play continues it.
+                Opened::Failed(failure)
+                    if failure.is_output() && self.recorder.held().is_some() =>
+                {
+                    return self.lose_output(server, &failure, events);
                 }
                 Opened::Failed(failure) if failure.is_output() => {
                     self.output_failed(&failure, events);
@@ -928,8 +954,11 @@ impl Player {
                     );
                 }
                 Opened::Failed(failure) => {
-                    let now = (self.setup.clock.now_ms(), self.setup.timekeeper.mono_ms());
-                    self.recorder.close_held(EndReason::Error, now);
+                    if self.recorder.held().is_some() {
+                        let now = (self.setup.clock.now_ms(), self.setup.timekeeper.mono_ms());
+                        self.recorder.close_held(EndReason::Error, now);
+                        self.save(server, events);
+                    }
                     events.push(PlayerEvent::Failed {
                         entry: entry.entry_id,
                         reason: failure.to_string(),
@@ -1032,6 +1061,8 @@ impl Player {
                         let now = (self.setup.clock.now_ms(), self.setup.timekeeper.mono_ms());
                         self.recorder.close_held(EndReason::Replaced, now);
                     }
+                    // Carried on, it is said to begin again once heard.
+                    self.began_unsaid |= continues.is_some();
                     self.register(span, &listen, from_ms, continues);
                     return Ok(Opened::Loaded(Box::new(Loaded {
                         span,
@@ -1231,7 +1262,6 @@ impl Player {
                 }
                 self.recorder.paused();
                 self.status = Status::Paused;
-                self.began_unsaid = false;
                 self.sync(server, events);
                 self.changed(events);
             }
@@ -1283,10 +1313,11 @@ impl Player {
                 }
                 self.renderer.play();
                 // Through an output opened again, it is said to begin once
-                // it is heard, should that output never play.
+                // it is heard, should that output never play: so too where
+                // a pause came before it was.
                 if reopening {
                     self.began_unsaid = true;
-                } else {
+                } else if !self.began_unsaid {
                     events.extend(self.began());
                 }
                 self.changed(&mut events);
@@ -1380,6 +1411,9 @@ impl Player {
                 .and_then(|track| track.duration_ms)
                 .unwrap_or(i64::MAX);
             self.position_ms = position_ms.clamp(0, end.max(0));
+            // A listen held while its track is opened afresh moves too.
+            self.recorder.seek_held(self.position_ms);
+            self.sync(server, events);
             return Ok(());
         };
         let target = position_ms.clamp(0, loaded.duration_ms);
@@ -1625,11 +1659,29 @@ impl Player {
         {
             return Ok(());
         }
+        let output = (
+            self.renderer.name(),
+            self.renderer.rate(),
+            self.renderer.channels(),
+        );
+        // Before it opens again: should it move on, the next track resets it.
+        self.reopened_stale = true;
         self.close_output(events);
-        if self.output_closed && self.reopen(server, library, events)? {
+        let reopened = self.output_closed
+            && self
+                .reopen(server, library, events)
+                .inspect_err(|_| self.status = Status::Paused)?;
+        if reopened {
             self.renderer.play();
         }
-        self.reopened_stale = true;
+        let now = (
+            self.renderer.name(),
+            self.renderer.rate(),
+            self.renderer.channels(),
+        );
+        if !reopened || now != output {
+            self.changed(events);
+        }
         Ok(())
     }
 
@@ -1668,12 +1720,23 @@ impl Player {
                 self.lose_output(server, &failure, events)?;
                 return Ok(false);
             }
-            Err(_) => {
-                let library = library.ok_or(no_library())?;
+            // Gone, as a master a satellite kept and has let go is: the
+            // entry is opened afresh. A file changed is never played under
+            // the listen of the one it replaced.
+            Err(failure) if failure.reason == "missing" => {
                 self.position_ms = from_ms;
                 self.loaded = None;
+                let library = library.ok_or(no_library())?;
                 self.start_reason = loaded.listen.start_reason;
-                self.start(server, library, events)?;
+                // What it continues is the listen held, if any.
+                if self.open_listen().is_some() {
+                    self.resume_listen = None;
+                }
+                self.start_entry(server, library, events, false)?;
+                return Ok(false);
+            }
+            Err(failure) => {
+                self.fail_track(server, library, &failure, events)?;
                 return Ok(false);
             }
         }

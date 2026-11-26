@@ -1982,6 +1982,11 @@ fn an_output_told_to_play_is_stale_only_if_it_has_not_asked_once_since() {
     eventually("the hold", || hold.waiting().is_some());
     held.pause();
     held.play();
+    // A last callback that ran as the play was sent, before it arrived,
+    // does not count as one that took it.
+    held.shared
+        .callbacks
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     eventually("the output going stale", || held.stale());
     assert_eq!(held.progress().lost, None);
 }

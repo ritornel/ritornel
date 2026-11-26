@@ -312,9 +312,10 @@ pub struct AudioRenderer {
     gain: ReplayGain,
     /// Whether the output was last told to play.
     playing: bool,
-    /// When it was, on the output's clock, and how many callbacks had run.
+    /// When it was, on the output's clock.
     played_at: u64,
-    callbacks_at_play: u64,
+    /// `Play` messages sent to the callback.
+    plays: u64,
     /// How long it may ask for no frames while playing: [`STALL`], but for
     /// a test.
     stall_after: Duration,
@@ -445,7 +446,7 @@ impl AudioRenderer {
             gain: ReplayGain::Off,
             playing: false,
             played_at: 0,
-            callbacks_at_play: 0,
+            plays: 0,
             stall_after: STALL,
             opened_at: output::now(),
             stale_after: STALE,
@@ -810,11 +811,12 @@ impl Renderer for AudioRenderer {
     fn play(&mut self) {
         self.playing = true;
         self.played_at = output::now();
-        self.callbacks_at_play = self.shared.callbacks.load(Ordering::SeqCst);
         if let Some(decoding) = &mut self.decoding {
             decoding.decoder.start();
         }
-        self.send(Message::Play);
+        if self.send(Message::Play) {
+            self.plays += 1;
+        }
     }
 
     fn pause(&mut self) {
@@ -890,10 +892,13 @@ impl Renderer for AudioRenderer {
             return false;
         }
         if self.playing {
-            // Read first: a callback that runs after it still counts.
-            let callbacks = self.shared.callbacks.load(Ordering::SeqCst);
-            let since = Duration::from_nanos(output::now().saturating_sub(self.played_at));
-            callbacks == self.callbacks_at_play && since >= self.stale_after
+            // Now first: a callback that takes the play between the two
+            // reads then counts. One that ran as the play was sent, but
+            // before it arrived, does not.
+            let now = output::now();
+            let taken = self.shared.plays.load(Ordering::SeqCst);
+            taken < self.plays
+                && Duration::from_nanos(now.saturating_sub(self.played_at)) >= self.stale_after
         } else {
             self.silent_since(self.opened_at) >= self.stale_after
         }
