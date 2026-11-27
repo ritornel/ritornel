@@ -1,9 +1,12 @@
 //! Small marks drawn wherever a song appears: its five stars and the three
 //! bars of the song playing.
 
+use std::time::{Duration, Instant};
+
 use gpui::{
-    Context, Div, InteractiveElement, IntoElement, ParentElement, SharedString,
-    StatefulInteractiveElement, Styled, div, px,
+    Bounds, ContentMask, Context, Div, InteractiveElement, IntoElement, ParentElement,
+    SharedString, StatefulInteractiveElement, Styled, canvas, div, point, prelude::FluentBuilder,
+    px, size,
 };
 
 use crate::theme;
@@ -72,34 +75,183 @@ pub(crate) fn stars<V: 'static>(
     row
 }
 
-/// CSS's `ease-in-out`, `cubic-bezier(0.42, 0, 0.58, 1)`, at `t`.
-fn ease_in_out(t: f32) -> f32 {
-    crate::shell::bezier(0.42, 0., 0.58, 1., t)
+/// Sampled just before GPUI constructs the application, as an approximation
+/// of the private epoch it uses to advance timed sprite transformations.
+pub(crate) struct SceneClock(pub Instant);
+impl gpui::Global for SceneClock {}
+
+const EQ_PERIOD: Duration = Duration::from_millis(1800);
+// The 16-unit artwork occupies a 13-point square in a row.
+const EQ_SIDE: f32 = 13.;
+const UNIT: f32 = EQ_SIDE / 16.;
+// Each half of the Bézier wave runs for 100 SVG units. Two full cycles
+// plus four units cover a moving bar at every starting phase.
+const CYCLE_WIDTH: f32 = 200.;
+const STRIP_WIDTH: f32 = 2. * CYCLE_WIDTH + 4.;
+const WAVE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="404" height="10">
+    <path d="M0 6.5 c42 0 58 -6.5 100 -6.5 s58 6.5 100 6.5
+              s58 -6.5 100 -6.5 s58 6.5 100 6.5 h4 V10 H0 Z"/>
+</svg>"#;
+
+/// Three staggered bars that follow playback and hold their height on pause.
+pub(crate) struct Equalizer {
+    /// At rest, the held phase. In motion, the offset from GPUI's clock.
+    phase: f32,
+    moving: bool,
 }
 
-/// The mark of the song playing: three bars that move while it plays and
-/// hold while it is paused. `seconds` is how long it has played, which the
-/// player keeps; each bar rises and falls over 0.9 seconds, a third of the
-/// way behind the one before.
-pub(crate) fn eq(seconds: f32, side: f32, color: gpui::Rgba) -> impl IntoElement {
-    let unit = side / 16.;
-    let mut bars = div().relative().size(px(side)).flex_none();
-    for (at, x) in [3., 6.9, 10.8].into_iter().enumerate() {
-        let t = (seconds + 0.3 * at as f32) / 0.9;
-        // `alternate`: up one cycle, down the next.
-        let phase = t.rem_euclid(2.);
-        let along = if phase <= 1. { phase } else { 2. - phase };
-        let scale = 0.35 + 0.65 * ease_in_out(along);
-        let height = 10. * unit * scale;
-        bars = bars.child(
-            div()
-                .absolute()
-                .left(px(x * unit))
-                .top(px(13. * unit - height))
-                .w(px(2.2 * unit))
-                .h(px(height))
-                .bg(color),
+impl Equalizer {
+    pub(crate) fn playback(played: Duration, since: Option<Instant>, cx: &gpui::App) -> Self {
+        if cx.reduce_motion() {
+            return Self {
+                phase: 0.,
+                moving: false,
+            };
+        }
+        let start = since
+            .zip(cx.try_global::<SceneClock>())
+            .map_or(Duration::ZERO, |(start, clock)| {
+                start.saturating_duration_since(clock.0)
+            });
+        let phase = (played.as_secs_f64() - start.as_secs_f64()) / EQ_PERIOD.as_secs_f64();
+        Self {
+            phase: phase.rem_euclid(1.) as f32,
+            moving: since.is_some(),
+        }
+    }
+
+    pub(crate) fn for_picker(opened: Option<Instant>, cx: &gpui::App) -> Self {
+        Self::playback(Duration::ZERO, opened, cx)
+    }
+
+    pub(crate) fn draw(self, color: gpui::Rgba) -> Div {
+        let cycle = px(CYCLE_WIDTH * UNIT);
+        let pan = gpui::TimedTransformation::new(EQ_PERIOD)
+            .to(gpui::Transformation::translate(point(-cycle, px(0.))))
+            .with_max_fps(30.);
+        let strip = size(px(STRIP_WIDTH * UNIT), px(10. * UNIT));
+        let mut bars = div().relative().size(px(EQ_SIDE)).flex_none();
+        // Each bar reveals a slice of the same ease-in-out curve,
+        // 300 ms ahead of its neighbour.
+        for (x, stagger) in [(3., 0.), (6.9, 1. / 6.), (10.8, 2. / 6.)] {
+            let phase = (self.phase + stagger).fract();
+            let wave = gpui::svg()
+                .data(WAVE)
+                .w(strip.width)
+                .h(strip.height)
+                .text_color(color)
+                .when(self.moving, |wave| wave.with_timed_transformation(pan));
+            let bar = canvas(
+                move |bounds, window, cx| {
+                    // Layout rounds the bar's width and position independently.
+                    // A scroll offset can put it between pixels again. Round its
+                    // absolute corners as a quad would before GPUI expands the clip.
+                    let clip = ContentMask {
+                        bounds: Bounds::from_corners(
+                            window.pixel_snap_point(bounds.origin),
+                            window.pixel_snap_point(bounds.bottom_right()),
+                        ),
+                    };
+                    let origin = clip.bounds.origin - point(cycle * phase, px(0.));
+                    let mut wave = wave.into_any_element();
+                    window.with_content_mask(Some(clip), |window| {
+                        wave.prepaint_as_root(origin, strip.into(), window, cx);
+                    });
+                    (clip, wave)
+                },
+                |_, (clip, mut wave), window, cx| {
+                    window.with_content_mask(Some(clip), |window| wave.paint(window, cx));
+                },
+            );
+            bars = bars.child(
+                bar.absolute()
+                    .left(px(x * UNIT))
+                    .top(px(3. * UNIT))
+                    .w(px(2.2 * UNIT))
+                    .h(px(10. * UNIT)),
+            );
+        }
+        bars
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[gpui::test]
+    fn bar_clips_keep_the_original_widths_and_gaps_at_both_scales(cx: &mut gpui::TestAppContext) {
+        struct Marks;
+        impl gpui::Render for Marks {
+            fn render(&mut self, _: &mut gpui::Window, _: &mut Context<Self>) -> impl IntoElement {
+                canvas(
+                    |bounds, window, cx| {
+                        let mut mark = Equalizer::for_picker(Some(Instant::now()), cx)
+                            .draw(theme::ink())
+                            .into_any_element();
+                        // A subpixel scroll after layout: outward rounding would
+                        // make each clip a device pixel wider.
+                        let origin = bounds.origin + point(px(0.375), px(0.375));
+                        mark.prepaint_as_root(
+                            origin,
+                            size(px(EQ_SIDE), px(EQ_SIDE)).into(),
+                            window,
+                            cx,
+                        );
+                        mark
+                    },
+                    |_, mut mark, window, cx| mark.paint(window, cx),
+                )
+                .size(px(EQ_SIDE))
+            }
+        }
+        let (_, cx) = cx.add_window_view(|_, _| Marks);
+        let mut edges = |scale| {
+            cx.simulate_scale_factor_change(scale);
+            cx.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                let mut edges: Vec<_> = window
+                    .rendered_scene()
+                    .monochrome_sprites
+                    .iter()
+                    .map(|sprite| {
+                        assert_ne!(sprite.animation, gpui::SpriteAnimationId::NONE);
+                        let b = sprite.content_mask.bounds;
+                        (
+                            b.left().0 as i32,
+                            b.right().0 as i32,
+                            b.top().0 as i32,
+                            b.bottom().0 as i32,
+                        )
+                    })
+                    .collect();
+                edges.sort_unstable();
+                edges
+            })
+        };
+        // (left, right, top, bottom) in device pixels.
+        assert_eq!(edges(1.), [(2, 4, 2, 10), (6, 8, 2, 10), (9, 11, 2, 10)]);
+        assert_eq!(
+            edges(2.),
+            [(6, 10, 6, 22), (12, 16, 6, 22), (19, 23, 6, 22)]
         );
     }
-    bars
+
+    #[gpui::test]
+    fn resuming_starts_at_the_held_phase_on_the_shared_clock(cx: &mut gpui::TestAppContext) {
+        let origin = Instant::now();
+        cx.update(|cx| {
+            cx.set_global(SceneClock(origin));
+            let played = Duration::from_millis(450);
+            let held = Equalizer::playback(played, None, cx);
+            assert!(!held.moving);
+            assert_eq!(held.phase, 0.25);
+
+            let paused_until = Duration::from_millis(3150);
+            let resumed = Equalizer::playback(played, Some(origin + paused_until), cx);
+            let scene_phase = (paused_until.as_secs_f64() / EQ_PERIOD.as_secs_f64()) as f32;
+            assert!(resumed.moving);
+            assert_eq!((scene_phase + resumed.phase).fract(), held.phase);
+        });
+    }
 }

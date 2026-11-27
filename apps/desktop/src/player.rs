@@ -403,7 +403,7 @@ pub(crate) struct Player {
     ticker: Option<Task<()>>,
     /// How long the bars of the song playing have moved, and since when
     /// they have been moving: they hold while it is paused.
-    eq_base: f32,
+    eq_base: Duration,
     eq_since: Option<Instant>,
     rated: Ratings,
     /// What is being said, and since when.
@@ -464,7 +464,7 @@ impl Player {
                 player.stale = false;
                 player.sounds_unanswered = 0;
                 player.tick.playing = false;
-                player.ticker = None;
+                player.carry(cx);
                 cx.notify();
             }
             // Only the place followed: the others' events pass.
@@ -518,7 +518,7 @@ impl Player {
                 playing: false,
             },
             ticker: None,
-            eq_base: 0.,
+            eq_base: Duration::ZERO,
             eq_since: None,
             rated: Ratings::default(),
             toast: None,
@@ -588,7 +588,7 @@ impl Player {
     /// while the place is out of reach.
     pub(crate) fn position(&self) -> u64 {
         let duration = self.state.as_ref().and_then(|state| state.duration_ms);
-        if self.tick.playing && !self.out_of_reach {
+        if self.advancing() && !self.out_of_reach {
             carried(self.tick.position_ms, self.tick.at.elapsed(), duration)
         } else {
             self.tick.position_ms
@@ -748,12 +748,13 @@ impl Player {
         self.buffering_wakes = None;
     }
 
-    /// How far the bars of the song playing have moved, in seconds.
-    pub(crate) fn eq_seconds(&self) -> f32 {
-        self.eq_base
-            + self
-                .eq_since
-                .map_or(0., |since| since.elapsed().as_secs_f32())
+    /// Whether the playback clock is advancing between progress reports.
+    pub(crate) fn advancing(&self) -> bool {
+        self.tick.playing
+    }
+
+    pub(crate) fn equalizer(&self, cx: &gpui::App) -> crate::marks::Equalizer {
+        crate::marks::Equalizer::playback(self.eq_base, self.eq_since, cx)
     }
 
     /// Moves the position on while playing, a few times a second.
@@ -761,7 +762,7 @@ impl Player {
         match (self.tick.playing, self.eq_since) {
             (true, None) => self.eq_since = Some(Instant::now()),
             (false, Some(since)) => {
-                self.eq_base += since.elapsed().as_secs_f32();
+                self.eq_base += since.elapsed();
                 self.eq_since = None;
             }
             _ => {}
@@ -1662,6 +1663,124 @@ mod tests {
             "output": {"name": "null", "mode": "shared", "sampleRateHz": 44100, "channels": 2}
         }))
         .unwrap_or_else(|error| unreachable!("an invented state reads: {error}"))
+    }
+
+    #[gpui::test]
+    fn only_visible_playing_rows_put_animation_in_the_scene(cx: &mut gpui::TestAppContext) {
+        use crate::{tracks::Tracks, upnext::UpNextCard};
+        use gpui::{AppContext, IntoElement, ParentElement, Render, Styled, Window, div, px};
+
+        struct Page {
+            tracks: Entity<Tracks>,
+            card: Option<Entity<UpNextCard>>,
+            scroll: f32,
+        }
+
+        impl Render for Page {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .flex()
+                    .size_full()
+                    .child(
+                        div()
+                            .relative()
+                            .w(px(450.))
+                            .h(px(100.))
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .absolute()
+                                    .top(px(-self.scroll))
+                                    .child(self.tracks.clone()),
+                            ),
+                    )
+                    .child(div().w(px(340.)).h_full().children(self.card.clone()))
+            }
+        }
+
+        let song = Id::from_bytes([1; 16]);
+        let link = cx.update(crate::link::unlinked);
+        cx.update(|cx| cx.set_global(crate::marks::SceneClock(Instant::now())));
+        let player = cx.new(|cx| Player::new(&link, cx));
+        let tracks = cx.new(|cx| Tracks::new(player.clone(), false, cx));
+        let row = serde_json::from_value(serde_json::json!({
+            "appearanceId": song, "recordingId": song, "playCount": 0, "copies": [], "loved": false
+        }))
+        .unwrap_or_else(|error| unreachable!("an invented row reads: {error}"));
+        tracks.update(cx, |tracks, cx| {
+            tracks.width = 450.;
+            let album = PlayContext {
+                kind: ritornel_contract::ContextKind::Album,
+                reference: None,
+            };
+            tracks.set(vec![row], 1, None, album, cx);
+        });
+        let card = cx.new(|cx| UpNextCard::new(link, player.clone(), cx));
+        let (page, cx) = cx.add_window_view(|_, _| Page {
+            tracks,
+            card: Some(card),
+            scroll: 0.,
+        });
+        let mut revision = 0;
+        let mut playback = |status, cx: &mut gpui::VisualTestContext| {
+            revision += 1;
+            let mut state = state_of(revision, status, song);
+            state.track = Some(
+                serde_json::from_value(serde_json::json!({"appearanceId": song}))
+                    .unwrap_or_else(|error| unreachable!("an invented track reads: {error}")),
+            );
+            player.update(cx, |player, cx| player.took(state, cx));
+        };
+        let check = |expected, cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                let animated = window
+                    .rendered_scene()
+                    .monochrome_sprites
+                    .iter()
+                    .filter(|sprite| sprite.animation != gpui::SpriteAnimationId::NONE)
+                    .count();
+                assert_eq!(animated, expected, "retained equalizer sprites");
+                assert_eq!(
+                    window.simulate_next_frame(cx),
+                    0,
+                    "a view asked for a redraw"
+                );
+            });
+        };
+
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        assert!(cx.update(|window, _| window.is_window_active()));
+        playback("playing", cx);
+        check(6, cx);
+        cx.deactivate_window();
+        assert!(!cx.update(|window, _| window.is_window_active()));
+        check(6, cx);
+        playback("paused", cx);
+        check(0, cx);
+        playback("playing", cx);
+        check(6, cx);
+        playback("stopped", cx);
+        check(0, cx);
+        playback("playing", cx);
+        page.update(cx, |page, cx| {
+            page.card = None;
+            cx.notify();
+        });
+        check(3, cx);
+        page.update(cx, |page, cx| {
+            page.scroll = 110.;
+            cx.notify();
+        });
+        check(0, cx);
+        page.update(cx, |page, cx| {
+            page.scroll = 0.;
+            cx.notify();
+        });
+        check(3, cx);
+        cx.update(|_, cx| cx.set_reduce_motion(true));
+        check(0, cx);
     }
 
     #[gpui::test]

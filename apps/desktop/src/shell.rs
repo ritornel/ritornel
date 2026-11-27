@@ -1610,6 +1610,7 @@ impl Render for Shell {
             cx.set_global(upnext::Rail(rail));
         }
         let still = crate::platform::reduce_motion();
+        cx.set_reduce_motion(still);
         let mut animating = false;
         let mut layers: Vec<AnyElement> = Vec::new();
         let shown = self.shown();

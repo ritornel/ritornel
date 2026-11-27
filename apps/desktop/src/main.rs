@@ -144,13 +144,18 @@ fn main() {
     type Reopen = Box<dyn FnMut(&mut App)>;
     let reopen: Rc<RefCell<Option<Reopen>>> = Rc::default();
     let on_reopen = reopen.clone();
-    let app = gpui_platform::application().with_assets(icons::Icons);
+    // GPUI starts its sprite clock inside with_platform. Sample the time after
+    // platform setup so that resuming the bars preserves their held phase.
+    let platform = gpui_platform::current_platform(false);
+    let scene_clock = marks::SceneClock(std::time::Instant::now());
+    let app = gpui::Application::with_platform(platform).with_assets(icons::Icons);
     app.on_reopen(move |cx| {
         if let Some(reopen) = on_reopen.borrow_mut().as_mut() {
             reopen(cx);
         }
     });
     app.run(move |cx: &mut App| {
+        cx.set_global(scene_clock);
         frame::menus(cx);
         input::bind_keys(cx);
         // Whatever the system needs set up: on a Mac, reading what a

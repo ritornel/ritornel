@@ -80,8 +80,9 @@ runtime-shaders = ["gpui_platform/runtime_shaders"]
 
 [dev-dependencies]
 # GPUI's test platform: windows, focus and input without a display, for
-# the tests of what has the keys (`search.rs`).
-gpui = { package = "gpui-pre", version = "=0.3.13", features = ["test-support"] }
+# the tests of what has the keys (`search.rs`). `bench-support` exposes the
+# rendered scene so tests can inspect animated sprites without a GPU.
+gpui = { package = "gpui-pre", version = "=0.3.13", features = ["test-support", "bench-support"] }
 
 [workspace]
 
