@@ -1016,18 +1016,21 @@ impl Core {
                 self.wake_watch();
                 added
             }),
-            methods::TranscodeStart::NAME => {
-                run::<methods::TranscodeStart>(params, |p| self.start_transcode(stores, p))
-            }
+            methods::TranscodeStart::NAME => run::<methods::TranscodeStart>(params, |p| {
+                self.start_transcode(stores, p, show_paths)
+            }),
             methods::TranscodePrune::NAME => run::<methods::TranscodePrune>(params, |p| {
                 self.enqueue_transcode::<methods::TranscodePrune>(
                     stores,
                     &p,
                     p.idempotency_key,
+                    show_paths,
                     || Ok("{}".into()),
                 )
             }),
-            ScanStart::NAME => run::<ScanStart>(params, |params| self.scan_start(stores, &params)),
+            ScanStart::NAME => run::<ScanStart>(params, |params| {
+                self.scan_start(stores, &params, show_paths)
+            }),
             LibrarySetWatching::NAME => run::<LibrarySetWatching>(params, |params| {
                 self.library_set_watching(stores, &params)
             }),
@@ -1047,7 +1050,7 @@ impl Core {
                 run::<JobsGet>(params, |params| self.jobs_get(stores, &params, show_paths))
             }
             JobsCancel::NAME => {
-                run::<JobsCancel>(params, |params| self.jobs_cancel(stores, &params))
+                run::<JobsCancel>(params, |params| self.jobs_cancel(stores, &params, session))
             }
             LibraryStats::NAME => run::<LibraryStats>(params, |_| self.library_stats(stores)),
             IdentityDryRun::NAME => {
@@ -1237,24 +1240,24 @@ impl Core {
             LastfmSignOut::NAME => {
                 run::<LastfmSignOut>(params, |params| self.lastfm_sign_out(stores, &params))
             }
-            LastfmSync::NAME => {
-                run::<LastfmSync>(params, |params| self.lastfm_sync(stores, &params))
-            }
+            LastfmSync::NAME => run::<LastfmSync>(params, |params| {
+                self.lastfm_sync(stores, &params, show_paths)
+            }),
             LastfmSetScrobbling::NAME => run::<LastfmSetScrobbling>(params, |params| {
                 self.lastfm_set_scrobbling(stores, &params)
             }),
             ImportsStage::NAME => {
                 run::<ImportsStage>(params, |params| self.imports_stage(stores, &params))
             }
-            ImportsDryRun::NAME => {
-                run::<ImportsDryRun>(params, |params| self.imports_dry_run(stores, &params))
-            }
-            ImportsApply::NAME => {
-                run::<ImportsApply>(params, |params| self.imports_apply(stores, &params))
-            }
-            ImportsUndo::NAME => {
-                run::<ImportsUndo>(params, |params| self.imports_undo(stores, &params))
-            }
+            ImportsDryRun::NAME => run::<ImportsDryRun>(params, |params| {
+                self.imports_dry_run(stores, &params, show_paths)
+            }),
+            ImportsApply::NAME => run::<ImportsApply>(params, |params| {
+                self.imports_apply(stores, &params, show_paths)
+            }),
+            ImportsUndo::NAME => run::<ImportsUndo>(params, |params| {
+                self.imports_undo(stores, &params, show_paths)
+            }),
             ImportsGet::NAME => {
                 run::<ImportsGet>(params, |params| self.imports_get(stores, &params))
             }

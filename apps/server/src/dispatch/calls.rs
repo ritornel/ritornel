@@ -79,7 +79,8 @@ pub(crate) fn job_for(job: &ritornel_engine::Job, show_paths: bool) -> Job {
         bytes: unsigned(job.bytes),
         failed: unsigned(job.failed),
         skipped: unsigned(job.skipped),
-        label: job.label.clone(),
+        // A scan's progress names the file it is at.
+        label: if show_paths { job.label.clone() } else { None },
         error: if show_paths { job.error.clone() } else { None },
         created_at: job.created_at_ms,
         started_at: job.started_at_ms,
@@ -89,11 +90,6 @@ pub(crate) fn job_for(job: &ritornel_engine::Job, show_paths: bool) -> Job {
             .then(|| serde_json::from_str(job.checkpoint_json.as_deref()?).ok())
             .flatten(),
     }
-}
-
-/// A job as the contract carries it, with full details included.
-pub(crate) fn job(changed: &ritornel_engine::Job) -> Job {
-    job_for(changed, true)
 }
 
 fn no_library() -> RpcError {
@@ -494,6 +490,7 @@ impl Core {
         &self,
         stores: &Stores,
         params: &ScanStartParams,
+        show_paths: bool,
     ) -> Result<ScanStarted, RpcError> {
         let source = Self::library(stores, |library| {
             library.source(params.source_id).map_err(in_library)
@@ -532,7 +529,7 @@ impl Core {
                 status: ReceiptStatus::Accepted,
                 revision: None,
             },
-            job: job(&started),
+            job: job_for(&started, show_paths),
         })
     }
 
@@ -596,11 +593,32 @@ impl Core {
 
     /// `jobs.cancel`: a request. A queued job is cancelled at once, and a
     /// running one stops after the step in flight.
+    ///
+    /// A session cancels only a job it could have started: a transcode
+    /// needs `server:manage` to cancel as it did to start.
     pub(super) fn jobs_cancel(
         &self,
         stores: &Stores,
         params: &JobCancelParams,
+        session: &crate::session::Session,
     ) -> Result<JobCancelled, RpcError> {
+        let found = stores
+            .server
+            .job(params.job_id)
+            .map_err(stored)?
+            .ok_or_else(Self::no_job)?;
+        if let Some(started_by) = ritornel_contract::methods::method(&found.kind)
+            && !session.has_all(started_by.needs)
+        {
+            return Err(RpcError::new(
+                ErrorCode::Forbidden,
+                format!(
+                    "cancelling a {} job requires what starting one does",
+                    found.kind
+                ),
+            ));
+        }
+        let show_paths = session.has(ritornel_contract::Permission::FoldersManage);
         let command = Command {
             id: params.idempotency_key,
             fingerprint: fingerprint::<JobsCancel>(params)?,
@@ -621,7 +639,7 @@ impl Core {
                 },
                 revision: None,
             },
-            job: job(&asked),
+            job: job_for(&asked, show_paths),
         })
     }
 
@@ -691,5 +709,40 @@ impl Core {
     /// `identity.review`: the bindings marked for review.
     pub(super) fn identity_review(&self, stores: &Stores) -> Result<ReviewList, RpcError> {
         Self::library(stores, |library| library.review().map_err(in_library))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_job_shows_no_path_to_a_session_without_folders() {
+        let scanning = ritornel_engine::Job {
+            id: 1,
+            public_id: ritornel_contract::Id::from_bytes([1; 16]),
+            kind: ScanStart::NAME.to_owned(),
+            target: None,
+            target_kind: None,
+            params_json: "{}".to_owned(),
+            state: ritornel_engine::JobState::Running,
+            step: 0,
+            checkpoint_json: None,
+            cancel_requested: false,
+            done: 1,
+            total: Some(2),
+            bytes: 0,
+            failed: 0,
+            skipped: 0,
+            label: Some("Invented Artist/Invented Album/01 Song.flac".to_owned()),
+            error: Some("/srv/invented/music: permission denied".to_owned()),
+            created_at_ms: 0,
+            started_at_ms: None,
+            finished_at_ms: None,
+        };
+        let shown = job_for(&scanning, true);
+        assert!(shown.label.is_some() && shown.error.is_some());
+        let hidden = job_for(&scanning, false);
+        assert_eq!((hidden.label, hidden.error), (None, None));
     }
 }

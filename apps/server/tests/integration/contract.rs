@@ -1003,6 +1003,35 @@ async fn status_of(endpoint: SocketAddr, path: &str, credential: Option<&Credent
 }
 
 #[tokio::test]
+async fn a_job_is_cancelled_only_by_a_session_that_could_start_it() {
+    use ritornel_client::contract::methods::TranscodePrune;
+    use ritornel_client::contract::transcode::TranscodePruneParams;
+    bounded(async {
+        let running = start().await;
+        let (outgoing, incoming) = running.server.connect_in_memory(TokenRole::Owner);
+        let owner = Client::over_memory(outgoing, incoming);
+        owner.hello(&hello()).await.unwrap();
+        owner.create_library(key()).await.unwrap();
+        let job = owner
+            .call::<TranscodePrune>(&TranscodePruneParams {
+                idempotency_key: key(),
+            })
+            .await
+            .unwrap()
+            .job;
+        // A personal session may cancel what it may start, but a prune of
+        // the transcode cache needs server:manage, which it lacks.
+        let (outgoing, incoming) = running.server.connect_in_memory(TokenRole::Personal);
+        let personal = Client::over_memory(outgoing, incoming);
+        personal.hello(&hello()).await.unwrap();
+        let (code, _, _) = refused(personal.cancel_job(key(), job.job_id).await);
+        assert_eq!(code, ErrorCode::Forbidden);
+        owner.cancel_job(key(), job.job_id).await.unwrap();
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn a_limited_session_may_not_ask_for_the_status_or_change_anything() {
     bounded(async {
         let running = start().await;

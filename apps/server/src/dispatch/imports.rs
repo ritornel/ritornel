@@ -10,7 +10,7 @@ use ritornel_contract::{
 use ritornel_engine::{Command, NewJob, StoredRun};
 
 use super::{Core, Stores, fingerprint};
-use crate::dispatch::calls::job;
+use crate::dispatch::calls::job_for;
 use crate::dispatch::playback::refused;
 use crate::imports::{APPLY_JOB, DRY_RUN_JOB, Refused, RunJobParams, Staging, UNDO_JOB, stale};
 
@@ -102,6 +102,7 @@ impl Core {
         &self,
         stores: &Stores,
         params: &ImportsRunParams,
+        show_paths: bool,
     ) -> Result<Option<ImportsJobStarted>, RpcError> {
         let command = Command {
             id: params.idempotency_key,
@@ -114,7 +115,7 @@ impl Core {
                 status: ReceiptStatus::Accepted,
                 revision: None,
             },
-            job: job(&started),
+            job: job_for(&started, show_paths),
         }))
     }
 
@@ -125,6 +126,7 @@ impl Core {
         stores: &Stores,
         params: &ImportsRunParams,
         kind: &'static str,
+        show_paths: bool,
     ) -> Result<ImportsJobStarted, RpcError> {
         let command = Command {
             id: params.idempotency_key,
@@ -157,7 +159,7 @@ impl Core {
                 status: ReceiptStatus::Accepted,
                 revision: None,
             },
-            job: job(&started),
+            job: job_for(&started, show_paths),
         })
     }
 
@@ -183,9 +185,10 @@ impl Core {
         &self,
         stores: &Stores,
         params: &ImportsRunParams,
+        show_paths: bool,
     ) -> Result<ImportsJobStarted, RpcError> {
         no_library(stores)?;
-        if let Some(replayed) = self.replayed::<ImportsDryRun>(stores, params)? {
+        if let Some(replayed) = self.replayed::<ImportsDryRun>(stores, params, show_paths)? {
             return Ok(replayed);
         }
         // An applied run keeps the report it was applied with.
@@ -200,16 +203,17 @@ impl Core {
             .with_detail("reason", "applied"));
         }
         self.whole_run(params)?;
-        self.start_run_job::<ImportsDryRun>(stores, params, DRY_RUN_JOB)
+        self.start_run_job::<ImportsDryRun>(stores, params, DRY_RUN_JOB, show_paths)
     }
 
     pub(super) fn imports_apply(
         &self,
         stores: &Stores,
         params: &ImportsRunParams,
+        show_paths: bool,
     ) -> Result<ImportsJobStarted, RpcError> {
         no_library(stores)?;
-        if let Some(replayed) = self.replayed::<ImportsApply>(stores, params)? {
+        if let Some(replayed) = self.replayed::<ImportsApply>(stores, params, show_paths)? {
             return Ok(replayed);
         }
         let run = self.whole_run(params)?;
@@ -222,16 +226,17 @@ impl Core {
         {
             return Err(RpcError::new(ErrorCode::Invalid, why).with_detail("reason", "dry_run"));
         }
-        self.start_run_job::<ImportsApply>(stores, params, APPLY_JOB)
+        self.start_run_job::<ImportsApply>(stores, params, APPLY_JOB, show_paths)
     }
 
     pub(super) fn imports_undo(
         &self,
         stores: &Stores,
         params: &ImportsRunParams,
+        show_paths: bool,
     ) -> Result<ImportsJobStarted, RpcError> {
         no_library(stores)?;
-        if let Some(replayed) = self.replayed::<ImportsUndo>(stores, params)? {
+        if let Some(replayed) = self.replayed::<ImportsUndo>(stores, params, show_paths)? {
             return Ok(replayed);
         }
         let stored = Self::library(stores, |library| {
@@ -243,7 +248,7 @@ impl Core {
                 "no run of that ID was applied to this library",
             ));
         }
-        self.start_run_job::<ImportsUndo>(stores, params, UNDO_JOB)
+        self.start_run_job::<ImportsUndo>(stores, params, UNDO_JOB, show_paths)
     }
 
     pub(super) fn imports_get(

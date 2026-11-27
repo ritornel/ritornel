@@ -103,6 +103,7 @@ impl Core {
         &self,
         _: &Stores,
         _: &LastfmSyncParams,
+        _: bool,
     ) -> Result<LastfmSyncStarted, RpcError> {
         Err(not_built())
     }
@@ -134,7 +135,7 @@ mod enabled {
     use ritornel_engine::{Command, LibraryStore, NewJob, ServiceSession, SettingChange};
 
     use super::*;
-    use crate::dispatch::calls::job;
+    use crate::dispatch::calls::job_for;
     use crate::dispatch::fingerprint;
     use crate::dispatch::playback::refused;
     use crate::lastfm::{
@@ -371,7 +372,7 @@ mod enabled {
                 last: last.as_ref().and_then(|ended| {
                     Some(LastImport {
                         ended: ended.finished_at_ms?,
-                        state: job(ended).state,
+                        state: job_for(ended, false).state,
                         failure: ended.error.clone(),
                     })
                 }),
@@ -490,6 +491,7 @@ mod enabled {
             &self,
             stores: &Stores,
             params: &LastfmSyncParams,
+            show_paths: bool,
         ) -> Result<LastfmSyncStarted, RpcError> {
             self.lastfm_or_refuse()?.client()?;
             let session = Self::session(stores)?;
@@ -507,7 +509,7 @@ mod enabled {
             let (started, _) = self.start_sync(stores, &session, params)?;
             Ok(LastfmSyncStarted {
                 receipt: receipt(params.idempotency_key, ReceiptStatus::Accepted),
-                job: job(&started),
+                job: job_for(&started, show_paths),
             })
         }
 
