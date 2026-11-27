@@ -48,12 +48,12 @@ impl Fanout {
     /// The rule for `reorder` is the coarse one of "Large lists" in
     /// docs/internals/contract.md:
     /// a change of play counts or ratings reorders only views that sort or
-    /// filter on them, a change of portraits none, and any other change
-    /// reorders every view. No view sorts or filters on plays, ratings or
-    /// portraits, so a change of them alone reorders none: only the views
-    /// whose rows show them are told, to read their windows again in place.
-    /// A listen delivered while others browse costs them a window's read in
-    /// a list of songs, and nothing anywhere else.
+    /// filter on them (`View::by_plays`, `View::by_ratings`), a change of
+    /// portraits none, and any other change reorders every view. The other
+    /// views whose rows show plays or ratings are told to read their
+    /// windows again in place. A listen delivered while others browse costs
+    /// them a window's read in a list of songs, a new view where the list
+    /// is in order of plays, and nothing anywhere else.
     pub(crate) fn changed(&self, committed: Committed) {
         let revision = revision(committed.revision);
         let sessions: Vec<Arc<Session>> = self.lock().values().filter_map(Weak::upgrade).collect();
@@ -66,12 +66,11 @@ impl Fanout {
         if changed.is_empty() {
             return;
         }
-        // Plays and ratings show only on songs, portraits only on artists,
-        // and none of them orders a list.
-        let plays_only = matches!(
-            changed.as_slice(),
-            [LibraryChange::Stats] | [LibraryChange::Ratings]
-        );
+        // Plays and ratings show only on songs, and portraits only on
+        // artists, where they order nothing.
+        let stats_only = matches!(changed.as_slice(), [LibraryChange::Stats]);
+        let ratings_only = matches!(changed.as_slice(), [LibraryChange::Ratings]);
+        let plays_only = stats_only || ratings_only;
         let portraits = is_portraits(committed.method);
         for session in sessions {
             session.publish(Event::Library(LibraryEvent {
@@ -79,14 +78,18 @@ impl Fanout {
                 changed: changed.clone(),
             }));
             for (view, held) in session.held_views() {
-                if plays_only && !held.shows_plays() || portraits && held.kind != ListKind::Artists
+                // A view in order of what changed, or filtered by it, may
+                // hold other rows now, in another order.
+                let reordered = stats_only && held.by_plays || ratings_only && held.by_ratings;
+                if plays_only && !held.shows_plays() && !reordered
+                    || portraits && held.kind != ListKind::Artists
                 {
                     continue;
                 }
                 session.publish(Event::List(ListEvent {
                     view,
                     library_revision: revision,
-                    reorder: !plays_only && !portraits,
+                    reorder: reordered || !plays_only && !portraits,
                 }));
             }
         }
@@ -395,6 +398,9 @@ mod tests {
             revision: 1,
             ids: vec![1, 2, 3],
             sections: Vec::new(),
+            find: ritornel_engine::Find::Name,
+            by_plays: false,
+            by_ratings: false,
         })
     }
 
@@ -445,6 +451,45 @@ mod tests {
                 .map(|event| (event.view.as_str(), event.reorder))
                 .collect::<Vec<_>>(),
             [("songs", false)]
+        );
+    }
+
+    #[test]
+    fn a_view_in_order_of_plays_or_stars_is_replaced_when_they_change() {
+        let (session, fanout) = watching();
+        let ordered = |by_plays, by_ratings| {
+            Arc::new(View {
+                by_plays,
+                by_ratings,
+                ..(*view(ListKind::Albums)).clone()
+            })
+        };
+        session.hold_view("most played".to_owned(), ordered(true, false));
+        session.hold_view("rated".to_owned(), ordered(false, true));
+        let told_after = |method| {
+            fanout.changed(Committed {
+                revision: 9,
+                method,
+                shown: true,
+            });
+            let (_, lists) = told(&session);
+            lists
+                .into_iter()
+                .map(|event| (event.view, event.reorder))
+                .collect::<Vec<_>>()
+        };
+        // A listen: the records in order of plays may be in another order,
+        // the songs read their counts again, and nothing else is told.
+        assert_eq!(
+            told_after(ritornel_engine::INGEST_METHOD),
+            [
+                ("most played".to_owned(), true),
+                ("songs".to_owned(), false)
+            ]
+        );
+        assert_eq!(
+            told_after(RatingsSet::NAME),
+            [("rated".to_owned(), true), ("songs".to_owned(), false)]
         );
     }
 

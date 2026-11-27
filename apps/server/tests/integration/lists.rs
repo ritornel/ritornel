@@ -13,9 +13,9 @@ use std::process::Command;
 use std::time::Duration;
 
 use ritornel_client::contract::{
-    AlbumTile, CONTRACT_VERSION, ClientKind, ErrorCode, Event, FILTER_VERSION, Filter, HelloParams,
-    ListKind, ListLocateParams, ListOpenParams, ListOpened, MEDIA_TOKEN_PARAM, Predicate, Query,
-    Replaces, Row, Sort, SortKey, Topic, Window, route,
+    AlbumTile, CONTRACT_VERSION, ClientKind, ErrorCode, Event, FILTER_VERSION, Filter, GroupBy,
+    HelloParams, ListKind, ListLocateParams, ListOpenParams, ListOpened, MEDIA_TOKEN_PARAM,
+    Predicate, Query, Replaces, Row, Sort, SortKey, Topic, Window, route,
 };
 use ritornel_client::{Client, Credential};
 use ritornel_engine::invent::{ChurnKind, Churned};
@@ -254,6 +254,45 @@ async fn sections_are_letters_years_or_stretches_of_time(via: Via) {
             || first.chars().all(char::is_alphabetic),
         "{first}"
     );
+    // Grouped as the query says, whatever its order: the records of three
+    // tracks or more by title, a decade at a time, newest first.
+    let mut by_decade = open(ListKind::Albums, Some(SortKey::Title), Some((0, 500)));
+    by_decade.query.group_by = Some(GroupBy::Decade);
+    by_decade.query.filter = Some(Filter {
+        version: FILTER_VERSION,
+        predicate: Predicate::MinTracks { count: 3 },
+    });
+    let opened = client.list_open(&by_decade).await.unwrap();
+    let sections = client.list_sections(&opened.view).await.unwrap().sections;
+    assert!(sections.len() > 1, "{sections:?}");
+    assert!(
+        sections
+            .windows(2)
+            .all(|pair| pair[0].label > pair[1].label),
+        "{sections:?}"
+    );
+    for section in &sections {
+        let tile = album(&opened.rows[section.index as usize]);
+        assert_eq!(format!("{}s", tile.year.unwrap() / 10 * 10), section.label);
+    }
+    assert!(opened.rows.iter().all(|row| album(row).track_count >= 3));
+    // A decade typed is found, as a year is in an order by year.
+    let last = sections.last().unwrap();
+    let located = client
+        .list_locate(&ListLocateParams {
+            view: opened.view.clone(),
+            id: None,
+            prefix: Some(last.label.clone()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(located.index, Some(last.index));
+    // And with no grouping, the same rows have no sections.
+    by_decade.query.group_by = Some(GroupBy::None);
+    let flat = client.list_open(&by_decade).await.unwrap();
+    assert_eq!(flat.total, opened.total);
+    let sections = client.list_sections(&flat.view).await.unwrap().sections;
+    assert!(sections.is_empty(), "{sections:?}");
 }
 
 async fn a_row_is_found_by_its_id_and_by_the_start_of_its_name(via: Via) {

@@ -142,9 +142,9 @@ pub use link::{
 };
 pub use list::{
     AlbumRef, AlbumTile, ArtistRow, CopyRole, Credit, FILTER_VERSION, Filter, Format, GoneRow,
-    ListClosed, ListKind, ListLocateParams, ListLocated, ListOpenParams, ListOpened, ListSections,
-    ListSupport, ListWindow, ListWindowParams, Predicate, PredicateName, Quality, Query, Replaces,
-    Row, Section, Shelf, SongRow, Sort, SortKey, TrackCopy, ViewParams, Window,
+    GroupBy, ListClosed, ListKind, ListLocateParams, ListLocated, ListOpenParams, ListOpened,
+    ListSections, ListSupport, ListWindow, ListWindowParams, Predicate, PredicateName, Quality,
+    Query, Replaces, Row, Section, Shelf, SongRow, Sort, SortKey, TrackCopy, ViewParams, Window,
 };
 pub use media::{ART_SIZES, MEDIA_TOKEN_PARAM, MediaToken};
 pub use methods::{METHODS, Method, MethodInfo, MethodKind, MethodVisitor, visit_methods};
@@ -183,7 +183,7 @@ pub use ticket::{SocketTicket, TICKET_PARAM};
 /// one contract. A server refuses a client whose number is not its own,
 /// and a satellite refuses a hub of another ("Session and frames" in
 /// docs/internals/contract.md).
-pub const CONTRACT_VERSION: u32 = 7;
+pub const CONTRACT_VERSION: u32 = 8;
 
 /// The capability flags a server may list in its descriptor.
 pub mod capability {

@@ -1,11 +1,14 @@
 //! Views over an invented library: membership, order, sections, rows,
 //! search, locating and rows that have gone.
 
-use ritornel_contract::{FILTER_VERSION, Filter, ListKind, Predicate, Query, Row, Sort, SortKey};
+use ritornel_contract::{
+    FILTER_VERSION, Filter, GroupBy, ListKind, Predicate, Query, Row, Sort, SortKey,
+};
 
 use super::fold;
-use crate::invent::testing::{Library, library};
-use crate::{View, WriteRequest};
+use crate::invent::testing::{Library, NOW, library, library_drawing};
+use crate::invent::{PlaysPlan, invent_plays};
+use crate::{Find, View, WriteRequest};
 
 fn query(sort: SortKey) -> Query {
     Query {
@@ -1056,4 +1059,656 @@ fn loose_songs_after_the_last_album_do_not_hide_it_from_type_to_find() {
         rig.library.list_locate_prefix(&view, "Moss").unwrap(),
         Some(0)
     );
+}
+
+// ------------------------------------------------- groupings, filters, plays
+
+/// A query in `sort`, grouped as `group` says.
+fn grouped(sort: SortKey, group: GroupBy) -> Query {
+    Query {
+        group_by: Some(group),
+        ..query(sort)
+    }
+}
+
+/// A query in `sort` of the rows `predicate` holds for.
+fn filtered(sort: SortKey, predicate: Predicate) -> Query {
+    Query {
+        filter: Some(Filter {
+            version: FILTER_VERSION,
+            predicate,
+        }),
+        ..query(sort)
+    }
+}
+
+fn album(row: &Row) -> &ritornel_contract::AlbumTile {
+    match row {
+        Row::Album(album) => album,
+        other => panic!("{other:?}"),
+    }
+}
+
+fn song(row: &Row) -> &ritornel_contract::SongRow {
+    match row {
+        Row::Song(song) => song,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The rows of each section of a view, with the section's label: the
+/// sections must begin at the first row, rise, and stay within the view.
+fn by_section(resolved: &View, rows: &[Row]) -> Vec<(String, Vec<Row>)> {
+    assert_eq!(
+        resolved.sections.first().map(|section| section.index),
+        Some(0)
+    );
+    let ends = resolved
+        .sections
+        .iter()
+        .skip(1)
+        .map(|section| section.index)
+        .chain([rows.len() as u64]);
+    resolved
+        .sections
+        .iter()
+        .zip(ends)
+        .map(|(section, end)| {
+            assert!(section.index < end, "{section:?} ends at {end}");
+            (
+                section.label.clone(),
+                rows[section.index as usize..end as usize].to_vec(),
+            )
+        })
+        .collect()
+}
+
+fn decade_of(year: Option<i64>) -> String {
+    year.map_or_else(
+        || "Unknown".to_owned(),
+        |year| format!("{}s", year / 10 * 10),
+    )
+}
+
+fn sorted(mut ids: Vec<i64>) -> Vec<i64> {
+    ids.sort_unstable();
+    ids
+}
+
+/// A library with a history: some of its songs played, most of them more
+/// than once, and some never.
+fn played(albums: usize) -> Library {
+    let library = library_drawing(albums);
+    let plan = PlaysPlan {
+        plays: 600,
+        seed: 3,
+        now_ms: NOW,
+        years: 4,
+        zone: "Europe/London".to_owned(),
+    };
+    invent_plays(&library.store, &plan, |_, _| {}).unwrap();
+    library
+}
+
+#[test]
+fn a_grouping_named_orders_by_group_then_by_the_sort_with_exact_sections() {
+    let library = library(150);
+    let natural = open(&library, ListKind::Albums, &query(SortKey::Title));
+
+    // By decade, newest first, and by title within each.
+    let decades = open(
+        &library,
+        ListKind::Albums,
+        &grouped(SortKey::Title, GroupBy::Decade),
+    );
+    assert_eq!(sorted(decades.ids.clone()), sorted(natural.ids.clone()));
+    let rows_of = rows(&library, &decades);
+    let sections = by_section(&decades, &rows_of);
+    assert!(sections.len() > 2, "{:?}", decades.sections);
+    let labels: Vec<&str> = sections.iter().map(|(label, _)| label.as_str()).collect();
+    let mut newest_first = labels.clone();
+    newest_first.sort_by(|a, b| b.cmp(a));
+    assert_eq!(labels, newest_first);
+    for (label, rows) in &sections {
+        let keys: Vec<String> = rows
+            .iter()
+            .map(|row| {
+                assert_eq!(&decade_of(album(row).year), label);
+                fold::sort_text(album(row).title.as_deref().unwrap_or_default(), None)
+            })
+            .collect();
+        let mut in_order = keys.clone();
+        in_order.sort_by(|a, b| super::open::by_name_for_tests(a, b));
+        assert_eq!(keys, in_order, "{label}");
+    }
+
+    // By letter in an order that is not by name: the letter is the
+    // artist's, A to Z, and each letter starts the years again.
+    let letters = open(
+        &library,
+        ListKind::Albums,
+        &grouped(SortKey::Year, GroupBy::Letter),
+    );
+    let rows_of = rows(&library, &letters);
+    let sections = by_section(&letters, &rows_of);
+    let labels: Vec<String> = sections.iter().map(|(label, _)| label.clone()).collect();
+    let mut a_to_z = labels.clone();
+    a_to_z.sort_by_key(|letter| (letter == "#", letter.clone()));
+    assert_eq!(labels, a_to_z);
+    assert!(labels.len() > 5, "{labels:?}");
+    for (label, rows) in &sections {
+        let years: Vec<i64> = rows.iter().filter_map(|row| album(row).year).collect();
+        assert!(years.windows(2).all(|pair| pair[0] >= pair[1]), "{label}");
+    }
+    // They are the letters an order by artist has, each as long.
+    let by_artist = open(&library, ListKind::Albums, &query(SortKey::Artist));
+    assert_eq!(letters.sections, by_artist.sections);
+    let (first, second) = (letters.sections[0].index, letters.sections[1].index);
+    assert_eq!(
+        sorted(letters.ids[first as usize..second as usize].to_vec()),
+        sorted(by_artist.ids[first as usize..second as usize].to_vec())
+    );
+    // Letters named for an order by name are the sections it has anyway.
+    let named = open(
+        &library,
+        ListKind::Albums,
+        &grouped(SortKey::Title, GroupBy::Letter),
+    );
+    assert_eq!(named.ids, natural.ids);
+    assert_eq!(named.sections, natural.sections);
+}
+
+#[test]
+fn a_grouping_of_none_keeps_the_order_and_has_no_sections() {
+    let library = library(80);
+    for (kind, sort) in [
+        (ListKind::Artists, SortKey::Name),
+        (ListKind::Albums, SortKey::Year),
+        (ListKind::Albums, SortKey::Added),
+        (ListKind::Songs, SortKey::Album),
+    ] {
+        let natural = open(&library, kind, &query(sort));
+        assert!(!natural.sections.is_empty(), "{kind:?} {sort:?}");
+        let flat = open(&library, kind, &grouped(sort, GroupBy::None));
+        assert_eq!(flat.ids, natural.ids, "{kind:?} {sort:?}");
+        assert!(flat.sections.is_empty(), "{kind:?} {sort:?}");
+    }
+}
+
+#[test]
+fn records_group_by_year_shelf_quality_and_when_they_came_in() {
+    let library = library(150);
+    let total = library.invented.groups;
+
+    let years = open(
+        &library,
+        ListKind::Albums,
+        &grouped(SortKey::Artist, GroupBy::Year),
+    );
+    let rows_of = rows(&library, &years);
+    for (label, rows) in by_section(&years, &rows_of) {
+        for row in &rows {
+            assert_eq!(album(row).year.unwrap().to_string(), label);
+        }
+    }
+
+    // Every shelf but the one an artist's page alone has, in the order a
+    // discography files them, each saying which it is.
+    let shelves = open(
+        &library,
+        ListKind::Albums,
+        &grouped(SortKey::Artist, GroupBy::Shelf),
+    );
+    assert_eq!(shelves.ids.len(), total);
+    let filed: Vec<_> = shelves.sections.iter().map(|s| s.shelf.unwrap()).collect();
+    assert!(filed.windows(2).all(|pair| pair[0] < pair[1]), "{filed:?}");
+    assert!(filed.len() > 1, "{filed:?}");
+    assert!(!filed.contains(&ritornel_contract::Shelf::AppearsOn));
+    for section in &shelves.sections {
+        assert_eq!(section.label, section.shelf.unwrap().label());
+    }
+
+    // Quality is the tile's own best copy, best first.
+    let quality = open(
+        &library,
+        ListKind::Albums,
+        &grouped(SortKey::Artist, GroupBy::Quality),
+    );
+    let rows_of = rows(&library, &quality);
+    let sections = by_section(&quality, &rows_of);
+    let order = ["Hi-Res Lossless", "Lossless", "Lossy", "Unknown"];
+    let places: Vec<usize> = sections
+        .iter()
+        .map(|(label, _)| order.iter().position(|known| known == label).unwrap())
+        .collect();
+    assert!(
+        places.windows(2).all(|pair| pair[0] < pair[1]),
+        "{places:?}"
+    );
+    assert!(sections.len() >= 3, "{places:?}");
+    for (label, rows) in &sections {
+        for row in rows {
+            let best = &album(row).quality.as_ref().unwrap().best;
+            let said = match (best.lossless, best.bit_depth, best.sample_rate_hz) {
+                (true, Some(bits), rate) if bits > 16 || rate > 48_000 => "Hi-Res Lossless",
+                (true, ..) => "Lossless",
+                (false, ..) => "Lossy",
+            };
+            assert_eq!(said, label, "{best:?}");
+        }
+    }
+
+    // When they came in: the sections an order by it has, whatever the
+    // order within them.
+    let natural = open(&library, ListKind::Albums, &query(SortKey::Added));
+    let added = open(
+        &library,
+        ListKind::Albums,
+        &grouped(SortKey::Title, GroupBy::Added),
+    );
+    assert_eq!(added.sections, natural.sections);
+    assert_ne!(added.ids, natural.ids);
+    let (first, second) = (added.sections[0].index, added.sections[1].index);
+    assert_eq!(
+        sorted(added.ids[first as usize..second as usize].to_vec()),
+        sorted(natural.ids[first as usize..second as usize].to_vec())
+    );
+}
+
+#[test]
+fn songs_group_by_decade_and_quality() {
+    let library = library(40);
+    let natural = open(&library, ListKind::Songs, &Query::default());
+    let decades = open(
+        &library,
+        ListKind::Songs,
+        &grouped(SortKey::Title, GroupBy::Decade),
+    );
+    assert_eq!(sorted(decades.ids.clone()), sorted(natural.ids.clone()));
+    let rows_of = rows(&library, &decades);
+    for (label, rows) in by_section(&decades, &rows_of) {
+        for row in &rows {
+            assert_eq!(decade_of(song(row).year), label);
+        }
+    }
+    let quality = open(
+        &library,
+        ListKind::Songs,
+        &grouped(SortKey::Album, GroupBy::Quality),
+    );
+    let rows_of = rows(&library, &quality);
+    for (label, rows) in by_section(&quality, &rows_of) {
+        for row in &rows {
+            let lossless = song(row).copies.iter().any(|copy| copy.format.lossless);
+            assert_eq!(lossless, label != "Lossy", "{label}");
+        }
+    }
+}
+
+#[test]
+fn a_grouping_or_a_bound_a_list_does_not_take_is_refused() {
+    let library = library(5);
+    let refused = |kind, query: &Query| {
+        let refused = library.store.list_open(kind, query);
+        assert!(
+            matches!(refused, Err(super::ListError::Invalid(_))),
+            "{refused:?}"
+        );
+    };
+    refused(ListKind::Artists, &grouped(SortKey::Name, GroupBy::Year));
+    refused(ListKind::Songs, &grouped(SortKey::Title, GroupBy::Shelf));
+    refused(ListKind::Albums, &query(SortKey::Rating));
+    refused(
+        ListKind::Songs,
+        &filtered(SortKey::Title, Predicate::MinTracks { count: 3 }),
+    );
+    refused(
+        ListKind::Albums,
+        &filtered(SortKey::Title, Predicate::MinRating { rating: 80 }),
+    );
+    refused(
+        ListKind::Songs,
+        &filtered(SortKey::Title, Predicate::MinRating { rating: 101 }),
+    );
+    refused(
+        ListKind::Songs,
+        &filtered(
+            SortKey::Title,
+            Predicate::All {
+                of: vec![
+                    Predicate::Lossless { lossless: true },
+                    Predicate::Lossless { lossless: false },
+                ],
+            },
+        ),
+    );
+}
+
+#[test]
+fn records_are_filtered_by_tracks_years_and_whether_they_are_lossless() {
+    let library = library(150);
+    let all = open(&library, ListKind::Albums, &Query::default());
+    let every = rows(&library, &all);
+    let ids_where = |keep: &dyn Fn(&ritornel_contract::AlbumTile) -> bool| -> Vec<i64> {
+        all.ids
+            .iter()
+            .zip(&every)
+            .filter(|(_, row)| keep(album(row)))
+            .map(|(id, _)| *id)
+            .collect()
+    };
+    let open_where = |predicate| {
+        open(
+            &library,
+            ListKind::Albums,
+            &filtered(SortKey::Artist, predicate),
+        )
+    };
+
+    let full = open_where(Predicate::MinTracks { count: 3 });
+    assert_eq!(full.ids, ids_where(&|album| album.track_count >= 3));
+    assert!(!full.ids.is_empty() && full.ids.len() < all.ids.len());
+
+    let nineties = open_where(Predicate::YearRange {
+        from: Some(1990),
+        to: Some(1999),
+    });
+    assert_eq!(
+        nineties.ids,
+        ids_where(&|album| album.year.is_some_and(|year| (1990..=1999).contains(&year)))
+    );
+    assert!(!nineties.ids.is_empty());
+    let since = open_where(Predicate::YearRange {
+        from: Some(2000),
+        to: None,
+    });
+    assert_eq!(
+        since.ids,
+        ids_where(&|album| album.year.is_some_and(|year| year >= 2000))
+    );
+
+    let lossless = open_where(Predicate::Lossless { lossless: true });
+    let lossy = open_where(Predicate::Lossless { lossless: false });
+    let is_lossless = |album: &ritornel_contract::AlbumTile| {
+        album
+            .quality
+            .as_ref()
+            .is_some_and(|quality| quality.best.lossless)
+    };
+    assert_eq!(lossless.ids, ids_where(&is_lossless));
+    assert_eq!(lossy.ids, ids_where(&|album| !is_lossless(album)));
+    assert!(!lossless.ids.is_empty() && !lossy.ids.is_empty());
+
+    // Every condition of several holds, and two bounds of a kind are both
+    // kept.
+    let both = open_where(Predicate::All {
+        of: vec![
+            Predicate::MinTracks { count: 2 },
+            Predicate::MinTracks { count: 3 },
+            Predicate::YearRange {
+                from: Some(1980),
+                to: None,
+            },
+            Predicate::YearRange {
+                from: Some(1990),
+                to: Some(1999),
+            },
+            Predicate::Lossless { lossless: true },
+        ],
+    });
+    assert_eq!(
+        both.ids,
+        ids_where(&|album| album.track_count >= 3
+            && album.year.is_some_and(|year| (1990..=1999).contains(&year))
+            && is_lossless(album))
+    );
+    assert!(!both.ids.is_empty());
+    assert!(!both.by_plays && !both.by_ratings);
+}
+
+#[test]
+fn songs_are_filtered_and_ordered_by_plays_and_by_when_they_were_last_played() {
+    let library = played(60);
+    let all = open(&library, ListKind::Songs, &Query::default());
+    assert!(!all.by_plays);
+
+    let by_plays = open(&library, ListKind::Songs, &query(SortKey::Plays));
+    assert!(by_plays.by_plays);
+    assert_eq!(sorted(by_plays.ids.clone()), sorted(all.ids.clone()));
+    assert!(by_plays.sections.is_empty());
+    let rows_of = rows(&library, &by_plays);
+    let counts: Vec<u64> = rows_of.iter().map(|row| song(row).play_count).collect();
+    assert!(counts.windows(2).all(|pair| pair[0] >= pair[1]));
+    assert!(counts[0] > 1 && counts.last() == Some(&0), "{counts:?}");
+
+    let never = filtered(
+        SortKey::Title,
+        Predicate::PlayCount {
+            min: None,
+            max: Some(0),
+        },
+    );
+    let unplayed = open(&library, ListKind::Songs, &never);
+    let heard = filtered(
+        SortKey::Title,
+        Predicate::PlayCount {
+            min: Some(1),
+            max: None,
+        },
+    );
+    let heard = open(&library, ListKind::Songs, &heard);
+    assert!(unplayed.by_plays && heard.by_plays);
+    assert!(
+        rows(&library, &unplayed)
+            .iter()
+            .all(|row| song(row).play_count == 0)
+    );
+    assert!(
+        rows(&library, &heard)
+            .iter()
+            .all(|row| song(row).play_count >= 1)
+    );
+    assert_eq!(unplayed.ids.len() + heard.ids.len(), all.ids.len());
+    assert!(!unplayed.ids.is_empty() && !heard.ids.is_empty());
+    let twice = Predicate::PlayCount {
+        min: Some(2),
+        max: Some(3),
+    };
+    let twice = open(&library, ListKind::Songs, &filtered(SortKey::Plays, twice));
+    assert!(
+        rows(&library, &twice)
+            .iter()
+            .all(|row| (2..=3).contains(&song(row).play_count))
+    );
+
+    // Last played: newest first, with a heading for each stretch of time
+    // and what was never played under its own, last.
+    let recent = open(&library, ListKind::Songs, &query(SortKey::LastPlayed));
+    let rows_of = rows(&library, &recent);
+    let last: Vec<Option<i64>> = rows_of.iter().map(|row| song(row).last_played_at).collect();
+    let dated = last.iter().take_while(|at| at.is_some()).count();
+    assert_eq!(dated, heard.ids.len());
+    assert!(last[..dated].windows(2).all(|pair| pair[0] >= pair[1]));
+    assert!(last[dated..].iter().all(Option::is_none));
+    let never = recent.sections.last().unwrap();
+    assert_eq!(
+        (never.label.as_str(), never.index),
+        ("Never played", dated as u64)
+    );
+    assert!(recent.sections.len() > 2, "{:?}", recent.sections);
+    // Its sections are found by their headings.
+    assert_eq!(recent.find, Find::Sections { names: false });
+    assert_eq!(
+        library.store.list_locate_prefix(&recent, "never").unwrap(),
+        Some(dated as u64)
+    );
+}
+
+#[test]
+fn records_and_artists_are_ordered_and_filtered_by_the_plays_of_their_songs() {
+    let library = played(60);
+    for kind in [ListKind::Albums, ListKind::Artists] {
+        let all = open(&library, kind, &Query::default());
+        let by_plays = open(&library, kind, &query(SortKey::Plays));
+        assert_eq!(sorted(by_plays.ids.clone()), sorted(all.ids.clone()));
+        let unplayed = filtered(
+            all.sort,
+            Predicate::PlayCount {
+                min: None,
+                max: Some(0),
+            },
+        );
+        let unplayed = open(&library, kind, &unplayed);
+        assert!(!unplayed.ids.is_empty() && unplayed.ids.len() < all.ids.len());
+        // What was never played comes last by plays, in the kind's own
+        // order, and last by when it was played.
+        let tail = by_plays.ids.len() - unplayed.ids.len();
+        assert_eq!(by_plays.ids[tail..], unplayed.ids, "{kind:?}");
+        let recent = open(&library, kind, &query(SortKey::LastPlayed));
+        assert_eq!(recent.ids[tail..], unplayed.ids, "{kind:?}");
+        assert_eq!(
+            recent.sections.last().map(|section| section.index),
+            Some(tail as u64)
+        );
+    }
+    // A record's plays are those of the songs on it: the most played
+    // record holds a song that has been played.
+    let by_plays = open(&library, ListKind::Albums, &query(SortKey::Plays));
+    let Some(Row::Album(most)) = rows(&library, &by_plays).into_iter().next() else {
+        panic!("a record")
+    };
+    let songs = open(&library, ListKind::Songs, &query(SortKey::Plays));
+    let most_played = rows(&library, &songs);
+    assert!(
+        most_played
+            .iter()
+            .take_while(|row| song(row).play_count > 0)
+            .any(|row| song(row).album_title == most.title),
+        "{most:?}"
+    );
+}
+
+#[test]
+fn songs_are_filtered_and_ordered_by_their_stars() {
+    let library = library(20);
+    let all = open(&library, ListKind::Songs, &Query::default());
+    let every = rows(&library, &all);
+    for (key, (stars, row)) in [100, 80, 60].into_iter().zip(&every).enumerate() {
+        let key = u8::try_from(key).unwrap();
+        let request = WriteRequest {
+            method: "ratings.set",
+            command: Some(crate::Command {
+                id: crate::Id::from_bytes([key; 16]),
+                fingerprint: crate::Fingerprint::of("ratings.set", &[key]),
+            }),
+            client: None,
+        };
+        library
+            .store
+            .set_rating(request, song(row).recording_id, Some(stars), |_, _| {
+                String::new()
+            })
+            .unwrap();
+    }
+    let rated = |song: &ritornel_contract::SongRow| song.rating;
+    let by_rating = open(&library, ListKind::Songs, &query(SortKey::Rating));
+    assert!(by_rating.by_ratings && !by_rating.by_plays);
+    assert_eq!(by_rating.ids.len(), all.ids.len());
+    let stars: Vec<Option<u32>> = rows(&library, &by_rating)
+        .iter()
+        .map(|row| rated(song(row)))
+        .collect();
+    let given = stars.iter().take_while(|stars| stars.is_some()).count();
+    assert!(given >= 3, "{stars:?}");
+    assert!(stars[..given].windows(2).all(|pair| pair[0] >= pair[1]));
+    assert_eq!(stars[0], Some(100));
+    assert!(stars[given..].iter().all(Option::is_none));
+
+    let four = filtered(SortKey::Title, Predicate::MinRating { rating: 80 });
+    let four = open(&library, ListKind::Songs, &four);
+    assert!(four.by_ratings);
+    let kept = rows(&library, &four);
+    assert!(
+        kept.len() >= 2 && kept.len() < given.max(3) + 1,
+        "{}",
+        kept.len()
+    );
+    assert!(kept.iter().all(|row| rated(song(row)) >= Some(80)));
+    assert!(!all.by_ratings);
+}
+
+#[test]
+fn a_prefix_typed_is_found_by_name_in_each_group_or_by_a_groups_label() {
+    let library = library(150);
+    let locate = |view: &View, typed: &str| library.store.list_locate_prefix(view, typed).unwrap();
+    let key = |row: &Row| fold::sort_text(album(row).title.as_deref().unwrap_or_default(), None);
+
+    // Flat, an order by name is found in as it is with its letters.
+    let natural = open(&library, ListKind::Albums, &query(SortKey::Title));
+    let flat = open(
+        &library,
+        ListKind::Albums,
+        &grouped(SortKey::Title, GroupBy::None),
+    );
+    assert_eq!((natural.find, flat.find), (Find::Name, Find::Name));
+    let rows_of = rows(&library, &natural);
+    let typed: String = key(&rows_of[40]).chars().take(4).collect();
+    assert_eq!(locate(&flat, &typed), locate(&natural, &typed));
+    assert!(locate(&flat, &typed).is_some());
+
+    // Grouped, each group starts the order again: the row found is the
+    // first, in the view's order, whose title begins with what was typed,
+    // though titles before it in the alphabet come after it.
+    let decades = open(
+        &library,
+        ListKind::Albums,
+        &grouped(SortKey::Title, GroupBy::Decade),
+    );
+    assert_eq!(decades.find, Find::Sections { names: true });
+    let rows_of = rows(&library, &decades);
+    let second = decades.sections[1].index as usize;
+    for at in [second + 2, rows_of.len() - 1] {
+        let typed: String = key(&rows_of[at]).chars().take(5).collect();
+        let first = rows_of
+            .iter()
+            .position(|row| key(row).starts_with(&typed))
+            .unwrap();
+        assert_eq!(locate(&decades, &typed), Some(first as u64), "{typed}");
+    }
+    // A name no row begins with is not the row after where it would be,
+    // which is only some other name in the first group. A label is found.
+    assert_eq!(locate(&decades, "zzzzzz"), None);
+    let last = decades.sections.last().unwrap();
+    assert_eq!(locate(&decades, &last.label), Some(last.index));
+    assert_eq!(locate(&decades, &last.label[..3]), Some(last.index));
+    assert_eq!(locate(&decades, "  "), None);
+
+    // Where the order within a group is not by name, only labels are
+    // found: a letter typed is its section.
+    let letters = open(
+        &library,
+        ListKind::Albums,
+        &grouped(SortKey::Year, GroupBy::Letter),
+    );
+    assert_eq!(letters.find, Find::Sections { names: false });
+    let third = &letters.sections[2];
+    assert_eq!(
+        locate(&letters, &third.label.to_lowercase()),
+        Some(third.index)
+    );
+    let added = open(&library, ListKind::Albums, &query(SortKey::Added));
+    assert_eq!(
+        locate(&added, &added.sections[1].label),
+        Some(added.sections[1].index)
+    );
+
+    // And a flat order that is not by name is found in by nothing.
+    let flat = open(
+        &library,
+        ListKind::Albums,
+        &grouped(SortKey::Year, GroupBy::None),
+    );
+    assert_eq!(flat.find, Find::Nothing);
+    assert_eq!(locate(&flat, &typed), None);
+    assert_eq!(locate(&flat, "19"), None);
 }

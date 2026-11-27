@@ -818,6 +818,9 @@ mod tests {
             revision: 1,
             ids: vec![1, 2, 3],
             sections: Vec::new(),
+            find: ritornel_engine::Find::Name,
+            by_plays: false,
+            by_ratings: false,
         });
         session.hold_view("v".to_owned(), resolved);
         let held: Vec<String> = session.held_views().into_iter().map(|(id, _)| id).collect();

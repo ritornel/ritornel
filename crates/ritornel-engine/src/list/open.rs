@@ -3,10 +3,12 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
-use ritornel_contract::{FILTER_VERSION, Id, ListKind, Predicate, Query, Section, Shelf, SortKey};
+use ritornel_contract::{
+    FILTER_VERSION, GroupBy, Id, ListKind, MAX_RATING, Predicate, Query, Section, Shelf, SortKey,
+};
 use rusqlite::{Connection, OptionalExtension};
 
-use super::{ListError, View, discography, fold};
+use super::{Find, ListError, View, discography, fold, rows};
 use crate::Error;
 
 /// A query, checked against what its kind of list takes.
@@ -14,23 +16,68 @@ use crate::Error;
 pub(super) struct Plan {
     kind: ListKind,
     sort: SortKey,
+    /// The grouping the query names. `None` when it names none, and the
+    /// list takes the sections its order has.
+    group: Option<GroupBy>,
     /// What was typed, folded. `None` when nothing was.
     text: Option<String>,
-    /// The artist a filter names.
+    /// What its filter asks of a row.
+    conditions: Conditions,
+}
+
+/// A range a number must be in, either end of which may be open.
+#[derive(Debug, Clone, Copy, Default)]
+struct Bounds<T> {
+    from: Option<T>,
+    to: Option<T>,
+}
+
+impl<T: Ord + Copy> Bounds<T> {
+    /// Narrows the range to what is also from `from` to `to`.
+    fn narrow(&mut self, from: Option<T>, to: Option<T>) {
+        // `None` is below every `Some`, so the higher lower bound stands.
+        self.from = self.from.max(from);
+        self.to = match (self.to, to) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+    }
+
+    fn is_open(&self) -> bool {
+        self.from.is_none() && self.to.is_none()
+    }
+
+    fn holds(&self, value: T) -> bool {
+        self.from.is_none_or(|from| value >= from) && self.to.is_none_or(|to| value <= to)
+    }
+
+    /// As [`Bounds::holds`], of a number a row may not have: one without
+    /// it is in no range but the open one.
+    fn holds_known(&self, value: Option<T>) -> bool {
+        self.is_open() || value.is_some_and(|value| self.holds(value))
+    }
+}
+
+/// What a filter's conditions come to, gathered from its tree.
+#[derive(Debug, Clone, Default)]
+struct Conditions {
+    /// The artist it names.
     artist: Option<Id>,
     /// Whether the records of others that the artist is credited on a song
     /// of are in it too ([`Predicate::WithArtist`]).
     appears: bool,
     /// Whether it is only songs on no record ([`Predicate::NoRecord`]).
     no_record: bool,
-}
-
-/// What a filter's conditions come to, gathered from its tree.
-#[derive(Debug, Default)]
-struct Conditions {
-    artist: Option<Id>,
-    appears: bool,
-    no_record: bool,
+    /// The fewest tracks a record has ([`Predicate::MinTracks`]).
+    min_tracks: Option<u64>,
+    /// How many times a row has been played ([`Predicate::PlayCount`]).
+    plays: Bounds<u64>,
+    /// The lowest rating a song has ([`Predicate::MinRating`]).
+    min_rating: Option<u32>,
+    /// Whether a row's best copy is lossless ([`Predicate::Lossless`]).
+    lossless: Option<bool>,
+    /// The years a row is from ([`Predicate::YearRange`]).
+    years: Bounds<i64>,
 }
 
 impl Conditions {
@@ -55,6 +102,25 @@ impl Conditions {
             Predicate::ByArtist { artist_id } => name(*artist_id, false)?,
             Predicate::WithArtist { artist_id } => name(*artist_id, true)?,
             Predicate::NoRecord => self.no_record = true,
+            Predicate::MinTracks { count } => {
+                self.min_tracks = self.min_tracks.max(Some(*count));
+            }
+            Predicate::PlayCount { min, max } => self.plays.narrow(*min, *max),
+            Predicate::MinRating { rating } => {
+                if *rating > MAX_RATING {
+                    return Err(ListError::Invalid(format!("a rating is 0 to {MAX_RATING}")));
+                }
+                self.min_rating = self.min_rating.max(Some(*rating));
+            }
+            Predicate::Lossless { lossless } => {
+                if self.lossless.is_some_and(|said| said != *lossless) {
+                    return Err(ListError::Invalid(
+                        "a filter says once whether a copy is lossless".to_owned(),
+                    ));
+                }
+                self.lossless = Some(*lossless);
+            }
+            Predicate::YearRange { from, to } => self.years.narrow(*from, *to),
             Predicate::All { of } => {
                 for each in of {
                     self.gather(kind, each)?;
@@ -97,6 +163,13 @@ impl Plan {
                 "a discography is of one artist: its filter names them".to_owned(),
             ));
         }
+        if let Some(group) = query.group_by
+            && !kind.groupings().contains(&group)
+        {
+            return Err(ListError::Invalid(format!(
+                "a list of {kind:?} cannot be grouped by {group:?}"
+            )));
+        }
         let text = query
             .text
             .as_deref()
@@ -105,11 +178,40 @@ impl Plan {
         Ok(Self {
             kind,
             sort,
+            group: query.group_by,
             text,
-            artist: conditions.artist,
-            appears: conditions.appears,
-            no_record: conditions.no_record,
+            conditions,
         })
+    }
+
+    /// Whether plays decide which rows it has or where they come.
+    fn by_plays(&self) -> bool {
+        matches!(self.sort, SortKey::Plays | SortKey::LastPlayed)
+            || !self.conditions.plays.is_open()
+    }
+
+    /// Whether ratings decide which rows it has or where they come.
+    fn by_ratings(&self) -> bool {
+        self.sort == SortKey::Rating || self.conditions.min_rating.is_some()
+    }
+
+    /// How a prefix typed is found in what it resolves to, with these
+    /// sections: see [`Find`].
+    fn find(&self, sections: &[Section]) -> Find {
+        let by_name = matches!(
+            self.sort,
+            SortKey::Name | SortKey::Artist | SortKey::Title | SortKey::Album
+        );
+        // Letters cut an order by name where it changes letter, so the
+        // order still runs from end to end.
+        let unbroken = matches!(self.group, None | Some(GroupBy::None | GroupBy::Letter));
+        if by_name && unbroken {
+            Find::Name
+        } else if sections.is_empty() {
+            Find::Nothing
+        } else {
+            Find::Sections { names: by_name }
+        }
     }
 }
 
@@ -120,15 +222,18 @@ pub(super) fn resolve(connection: &Connection, plan: &Plan, now_ms: i64) -> Resu
             row.get(0)
         })?;
     let (ids, sections) = match plan.kind {
-        ListKind::Artists => artists(connection, plan)?,
+        ListKind::Artists => artists(connection, plan, now_ms)?,
         ListKind::Albums => albums(connection, plan, now_ms)?,
-        ListKind::Songs => songs(connection, plan)?,
+        ListKind::Songs => songs(connection, plan, now_ms)?,
     };
     Ok(View {
         kind: plan.kind,
         sort: plan.sort,
         revision,
         ids,
+        find: plan.find(&sections),
+        by_plays: plan.by_plays(),
+        by_ratings: plan.by_ratings(),
         sections,
     })
 }
@@ -160,6 +265,288 @@ fn sections<T>(items: &[T], label: impl Fn(&T) -> String) -> Vec<Section> {
     sections
 }
 
+// ---------------------------------------------------------------- groups
+
+/// The group a row is in under a grouping a query names.
+struct Group {
+    /// Where the group comes among the others, lowest first.
+    rank: i64,
+    /// Its heading.
+    label: String,
+    /// The kind of record it holds, under [`GroupBy::Shelf`].
+    shelf: Option<Shelf>,
+}
+
+impl Group {
+    fn new(rank: i64, label: impl Into<String>) -> Self {
+        Self {
+            rank,
+            label: label.into(),
+            shelf: None,
+        }
+    }
+
+    /// A to Z, then `#`.
+    fn letter(letter: char) -> Self {
+        let rank = match letter {
+            'A'..='Z' => i64::from(u32::from(letter) - u32::from('A')),
+            _ => 26,
+        };
+        Self::new(rank, letter)
+    }
+
+    /// Newest first, and no year last.
+    fn year(year: Option<i64>) -> Self {
+        match year {
+            Some(year) => Self::new(-year, year.to_string()),
+            None => Self::new(i64::MAX, "No year"),
+        }
+    }
+
+    /// Newest first, and no year last.
+    fn decade(year: Option<i64>) -> Self {
+        match year {
+            Some(year) => {
+                let decade = year.div_euclid(10) * 10;
+                Self::new(-decade, format!("{decade}s"))
+            }
+            None => Self::new(i64::MAX, "Unknown"),
+        }
+    }
+
+    /// The stretches of time of [`period`], newest first, and what has no
+    /// time under `never`, last.
+    fn when(at_ms: Option<i64>, now_ms: i64, never: &str) -> Self {
+        let Some(at_ms) = at_ms else {
+            return Self::new(i64::MAX, never);
+        };
+        let label = period(at_ms, now_ms);
+        let (year, month) = year_month(at_ms);
+        let rank = match label.as_str() {
+            "This week" => 0,
+            "The last few weeks" => 1,
+            // A month of this year, December first.
+            _ if year == year_month(now_ms).0 => 2 + (12 - month),
+            // A year, after every month of this one.
+            _ => 14 + (year_month(now_ms).0 - year),
+        };
+        Self::new(rank, label)
+    }
+
+    fn quality(tier: Tier) -> Self {
+        Self::new(tier as i64, tier.label())
+    }
+
+    fn shelf(shelf: Shelf) -> Self {
+        Self {
+            rank: shelf as i64,
+            label: shelf.label().to_owned(),
+            shelf: Some(shelf),
+        }
+    }
+}
+
+/// `items`, which are in order, moved into their groups, each keeping its
+/// order within its group, and where each group begins.
+fn grouped<T>(items: Vec<T>, group: impl Fn(&T) -> Group) -> (Vec<T>, Vec<Section>) {
+    let mut keyed: Vec<(Group, T)> = items.into_iter().map(|item| (group(&item), item)).collect();
+    // A stable sort, so the order within a group is the one they came in.
+    keyed.sort_by_key(|(group, _)| group.rank);
+    let mut sections: Vec<Section> = Vec::new();
+    let mut last = None;
+    let mut items = Vec::with_capacity(keyed.len());
+    for (index, (group, item)) in keyed.into_iter().enumerate() {
+        if last != Some(group.rank) {
+            last = Some(group.rank);
+            sections.push(Section {
+                label: group.label,
+                index: index as u64,
+                shelf: group.shelf,
+            });
+        }
+        items.push(item);
+    }
+    (items, sections)
+}
+
+/// What an order by when a row was last played puts a row under: the
+/// stretches of time of [`period`], and what has no dated play last.
+const NEVER_PLAYED: &str = "Never played";
+
+// ---------------------------------------------------------------- plays
+
+/// Counted plays: how many, and when the last dated one was.
+#[derive(Debug, Clone, Copy, Default)]
+struct Played {
+    count: u64,
+    last: Option<i64>,
+}
+
+impl Played {
+    fn add(&mut self, other: Self) {
+        self.count += other.count;
+        self.last = self.last.max(other.last);
+    }
+}
+
+/// The counted plays of each recording that has any, by its canonical
+/// key, through the counted-plays index ("Queries" in
+/// docs/internals/history.md), as a song's row counts them.
+fn plays_by_recording(connection: &Connection) -> Result<HashMap<i64, Played>, Error> {
+    let mut statement = connection.prepare(
+        "SELECT recording_id, count(*), max(event_at_utc_ms) FROM play_event
+         WHERE listener_id = (SELECT min(id) FROM listener) AND counts = 1 AND excluded = 0
+           AND recording_id IS NOT NULL
+         GROUP BY recording_id",
+    )?;
+    let mut plays = HashMap::new();
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let count: i64 = row.get(1)?;
+        plays.insert(
+            row.get(0)?,
+            Played {
+                count: u64::try_from(count).unwrap_or(0),
+                last: row.get(2)?,
+            },
+        );
+    }
+    Ok(plays)
+}
+
+/// The plays of what `sql` pairs each recording with: it gives a key and a
+/// recording's canonical key a row, each pair once.
+fn plays_of(
+    connection: &Connection,
+    sql: &str,
+    plays: &HashMap<i64, Played>,
+) -> Result<HashMap<i64, Played>, Error> {
+    let mut of = HashMap::new();
+    // With no plays at all, nothing has any.
+    if plays.is_empty() {
+        return Ok(of);
+    }
+    let mut statement = connection.prepare(sql)?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        if let Some(played) = plays.get(&row.get::<_, i64>(1)?) {
+            of.entry(row.get(0)?)
+                .or_insert_with(Played::default)
+                .add(*played);
+        }
+    }
+    Ok(of)
+}
+
+/// The plays of each release: those of the recordings on it.
+fn plays_by_release(
+    connection: &Connection,
+    plays: &HashMap<i64, Played>,
+) -> Result<HashMap<i64, Played>, Error> {
+    plays_of(
+        connection,
+        concat!(
+            "SELECT DISTINCT ta.release_id, rc.canonical_id
+             FROM track_appearance ta JOIN recording rc ON rc.id = ta.recording_id
+             WHERE ta.redirect_to_id IS NULL AND ta.release_id IS NOT NULL AND ",
+            reached!("ta")
+        ),
+        plays,
+    )
+}
+
+/// The plays of each artist: those of the recordings of the songs whose
+/// credit names them.
+fn plays_by_artist(
+    connection: &Connection,
+    plays: &HashMap<i64, Played>,
+) -> Result<HashMap<i64, Played>, Error> {
+    plays_of(
+        connection,
+        concat!(
+            "SELECT DISTINCT a.canonical_id, rc.canonical_id
+             FROM track_appearance ta
+             JOIN recording rc ON rc.id = ta.recording_id
+             JOIN artist_credit_name acn ON acn.artist_credit_id = ta.display_artist_credit_id
+             JOIN artist a ON a.id = acn.artist_id
+             WHERE ta.redirect_to_id IS NULL AND ",
+            reached!("ta")
+        ),
+        plays,
+    )
+}
+
+// ---------------------------------------------------------------- quality
+
+/// How good a row's best copy is, best first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tier {
+    HiRes,
+    Lossless,
+    Lossy,
+    Unknown,
+}
+
+impl Tier {
+    /// The tier of a row's best copy, or of a row with none the library
+    /// has read.
+    fn of(best: Option<rows::Grade>) -> Self {
+        match best {
+            Some((true, bits, rate, _)) if bits > 16 || rate > 48_000 => Self::HiRes,
+            Some((true, ..)) => Self::Lossless,
+            Some((false, ..)) => Self::Lossy,
+            None => Self::Unknown,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::HiRes => "Hi-Res Lossless",
+            Self::Lossless => "Lossless",
+            Self::Lossy => "Lossy",
+            Self::Unknown => "Unknown",
+        }
+    }
+}
+
+/// The best copy the library has read of each song, by its key, or with
+/// `of_releases` of any track of each release, by the release's: as a row
+/// says its copies, files that are missing left out.
+fn best_copies(
+    connection: &Connection,
+    of_releases: bool,
+) -> Result<HashMap<i64, rows::Grade>, Error> {
+    let mut statement = connection.prepare(
+        "SELECT ta.id, ta.release_id, aa.lossless, aa.bit_depth, aa.sample_rate_hz,
+                aa.bitrate_kbps
+         FROM assignment asg
+         JOIN source_item si ON si.id = asg.source_item_id
+         JOIN source_item_revision sr ON sr.id = si.current_revision_id
+         JOIN audio_asset aa ON aa.id = sr.audio_asset_id
+         JOIN track_appearance ta ON ta.id = asg.appearance_id
+         WHERE asg.superseded_at_ms IS NULL AND si.item_kind = 'file'
+           AND si.retired_at_ms IS NULL AND si.missing_since_ms IS NULL
+           AND ta.redirect_to_id IS NULL",
+    )?;
+    let mut best: HashMap<i64, rows::Grade> = HashMap::new();
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let key: Option<i64> = row.get(usize::from(of_releases))?;
+        let Some(key) = key else { continue };
+        let bits: Option<u32> = row.get(3)?;
+        let bitrate: Option<u32> = row.get(5)?;
+        let grade = (
+            row.get(2)?,
+            bits.unwrap_or(0),
+            row.get(4)?,
+            bitrate.unwrap_or(0),
+        );
+        let held = best.entry(key).or_insert(grade);
+        *held = (*held).max(grade);
+    }
+    Ok(best)
+}
+
 // ---------------------------------------------------------------- artists
 
 struct ArtistEntry {
@@ -167,7 +554,11 @@ struct ArtistEntry {
     key: String,
 }
 
-fn artists(connection: &Connection, plan: &Plan) -> Result<(Vec<i64>, Vec<Section>), Error> {
+fn artists(
+    connection: &Connection,
+    plan: &Plan,
+    now_ms: i64,
+) -> Result<(Vec<i64>, Vec<Section>), Error> {
     // Those who have a record: the artists a release's credit names. A
     // name that only appears in a song's credit ("Drake feat. Rihanna",
     // which is never split) is not filed among them.
@@ -203,8 +594,37 @@ fn artists(connection: &Connection, plan: &Plan) -> Result<(Vec<i64>, Vec<Sectio
             key: fold::sort_text(&name, sort_name.as_deref()),
         });
     }
-    entries.sort_by(|a, b| by_name(&a.key, &b.key).then(a.id.cmp(&b.id)));
-    let sections = sections(&entries, |entry| fold::letter(&entry.key).to_string());
+    let plays = if plan.by_plays() {
+        plays_by_artist(connection, &plays_by_recording(connection)?)?
+    } else {
+        HashMap::new()
+    };
+    let played = |entry: &ArtistEntry| plays.get(&entry.id).copied().unwrap_or_default();
+    entries.retain(|entry| plan.conditions.plays.holds(played(entry).count));
+    entries.sort_by(|a, b| {
+        let order = match plan.sort {
+            SortKey::Plays => played(b).count.cmp(&played(a).count),
+            SortKey::LastPlayed => most_first(played(a).last, played(b).last),
+            _ => Ordering::Equal,
+        };
+        order
+            .then_with(|| by_name(&a.key, &b.key))
+            .then(a.id.cmp(&b.id))
+    });
+    let (entries, sections) = match plan.group {
+        Some(GroupBy::None) => (entries, Vec::new()),
+        Some(_) => grouped(entries, |entry| Group::letter(fold::letter(&entry.key))),
+        None => {
+            let sections = match plan.sort {
+                SortKey::Plays => Vec::new(),
+                SortKey::LastPlayed => sections(&entries, |entry| {
+                    Group::when(played(entry).last, now_ms, NEVER_PLAYED).label
+                }),
+                _ => sections(&entries, |entry| fold::letter(&entry.key).to_string()),
+            };
+            (entries, sections)
+        }
+    };
     Ok((entries.iter().map(|entry| entry.id).collect(), sections))
 }
 
@@ -506,6 +926,11 @@ fn added(connection: &Connection) -> Result<HashMap<i64, i64>, Error> {
 
 /// Years newest first, and no year last.
 fn newest_first(a: Option<i64>, b: Option<i64>) -> Ordering {
+    most_first(a, b)
+}
+
+/// The most first, and what has none last: years, times and ratings.
+fn most_first(a: Option<i64>, b: Option<i64>) -> Ordering {
     match (a, b) {
         (Some(a), Some(b)) => b.cmp(&a),
         (Some(_), None) => Ordering::Less,
@@ -537,7 +962,8 @@ fn albums(
     plan: &Plan,
     now_ms: i64,
 ) -> Result<(Vec<i64>, Vec<Section>), Error> {
-    let artist = match plan.artist {
+    let conditions = &plan.conditions;
+    let artist = match conditions.artist {
         Some(artist) => match artist_key(connection, artist)? {
             Some(key) => Some(key),
             // An artist the library does not have has no records.
@@ -553,7 +979,7 @@ fn albums(
     let releases = match artist {
         Some(artist) => {
             let mut keys = releases_by(connection, artist)?;
-            let crediting = if plan.appears {
+            let crediting = if conditions.appears {
                 releases_crediting(connection, artist)?
             } else {
                 HashSet::new()
@@ -582,7 +1008,47 @@ fn albums(
         })
         .collect();
     let shown = |tile: &Tile| releases.get(tile.shown);
-    let added = if plan.sort == SortKey::Added {
+    // What only some queries ask of a record is read only for them: how
+    // many tracks the release it shows has, its plays, and its best copy.
+    let tracks = if conditions.min_tracks.is_some() {
+        let shown: Vec<i64> = tiles
+            .iter()
+            .filter_map(|tile| Some(shown(tile)?.id))
+            .collect();
+        rows::track_counts(connection, &shown)?
+    } else {
+        HashMap::new()
+    };
+    let plays = if plan.by_plays() {
+        plays_by_release(connection, &plays_by_recording(connection)?)?
+    } else {
+        HashMap::new()
+    };
+    let played = |tile: &Tile| {
+        shown(tile)
+            .and_then(|release| plays.get(&release.id).copied())
+            .unwrap_or_default()
+    };
+    let copies = if conditions.lossless.is_some() || plan.group == Some(GroupBy::Quality) {
+        best_copies(connection, true)?
+    } else {
+        HashMap::new()
+    };
+    let best = |tile: &Tile| shown(tile).and_then(|release| copies.get(&release.id).copied());
+    tiles.retain(|tile| {
+        let Some(release) = shown(tile) else {
+            return false;
+        };
+        conditions
+            .min_tracks
+            .is_none_or(|fewest| tracks.get(&release.id).map_or(0, |(count, _)| *count) >= fewest)
+            && conditions.plays.holds(played(tile).count)
+            && conditions
+                .lossless
+                .is_none_or(|lossless| best(tile).is_some_and(|best| best.0 == lossless))
+            && conditions.years.holds_known(tile.year)
+    });
+    let added = if plan.sort == SortKey::Added || plan.group == Some(GroupBy::Added) {
         added(connection)?
     } else {
         HashMap::new()
@@ -628,10 +1094,41 @@ fn albums(
                 group_added.get(&b.key).copied(),
             )
             .then_with(|| by_artist(ra, a.year, rb, b.year)),
+            SortKey::Plays => played(b)
+                .count
+                .cmp(&played(a).count)
+                .then_with(|| by_artist(ra, a.year, rb, b.year)),
+            SortKey::LastPlayed => most_first(played(a).last, played(b).last)
+                .then_with(|| by_artist(ra, a.year, rb, b.year)),
             _ => by_artist(ra, a.year, rb, b.year),
         };
         order.then(a.key.cmp(&b.key))
     });
+    if let Some(group) = plan.group {
+        if group == GroupBy::None {
+            return Ok((tiles.iter().map(|tile| tile.key).collect(), Vec::new()));
+        }
+        let (tiles, sections) = grouped(tiles, |tile| {
+            let release = shown(tile);
+            match group {
+                GroupBy::Year => Group::year(tile.year),
+                GroupBy::Decade => Group::decade(tile.year),
+                GroupBy::Added => {
+                    Group::when(group_added.get(&tile.key).copied(), now_ms, "Earlier")
+                }
+                GroupBy::Quality => Group::quality(Tier::of(best(tile))),
+                GroupBy::Shelf => Group::shelf(release.map_or(Shelf::Albums, shelf_of)),
+                GroupBy::Letter | GroupBy::None => Group::letter(release.map_or('#', |release| {
+                    fold::letter(if plan.sort == SortKey::Title {
+                        &release.title_key
+                    } else {
+                        &release.artist_key
+                    })
+                })),
+            }
+        });
+        return Ok((tiles.iter().map(|tile| tile.key).collect(), sections));
+    }
     let sections = match plan.sort {
         SortKey::Discography => {
             let mut sections = sections(&tiles, |tile| shelf(tile).label().to_owned());
@@ -656,6 +1153,10 @@ fn albums(
             group_added
                 .get(&tile.key)
                 .map_or_else(|| "Earlier".to_owned(), |at| period(*at, now_ms))
+        }),
+        SortKey::Plays => Vec::new(),
+        SortKey::LastPlayed => sections(&tiles, |tile| {
+            Group::when(played(tile).last, now_ms, NEVER_PLAYED).label
         }),
         _ => sections(&tiles, |tile| {
             shown(tile)
@@ -730,6 +1231,8 @@ struct Song {
     disc: Option<i64>,
     track: Option<i64>,
     by_artist: bool,
+    /// When it came into the library.
+    added: Option<i64>,
 }
 
 /// Appearances whose title, artist or album matches what was typed, by
@@ -772,8 +1275,13 @@ fn matching(connection: &Connection, needle: &str) -> Result<HashSet<i64>, Error
 /// was about twice as quick as reading every one.
 const LOOK_UP_AT_MOST: usize = 200_000;
 
-fn songs(connection: &Connection, plan: &Plan) -> Result<(Vec<i64>, Vec<Section>), Error> {
-    let artist = match plan.artist {
+fn songs(
+    connection: &Connection,
+    plan: &Plan,
+    now_ms: i64,
+) -> Result<(Vec<i64>, Vec<Section>), Error> {
+    let conditions = &plan.conditions;
+    let artist = match conditions.artist {
         Some(artist) => match artist_key(connection, artist)? {
             Some(key) => Some(key),
             None => return Ok((Vec::new(), Vec::new())),
@@ -790,14 +1298,19 @@ fn songs(connection: &Connection, plan: &Plan) -> Result<(Vec<i64>, Vec<Section>
                       ?1 IS NULL OR EXISTS (
                         SELECT 1 FROM artist_credit_name acn JOIN artist a ON a.id = acn.artist_id
                          WHERE acn.artist_credit_id = ta.display_artist_credit_id
-                           AND a.canonical_id = ?1)
+                           AND a.canonical_id = ?1),
+                      ta.display_added_at_ms
                FROM track_appearance ta JOIN recording rc ON rc.id = ta.recording_id
                WHERE ta.redirect_to_id IS NULL AND ",
         reached!("ta")
     );
     // Songs on no record are found by `track_appearance_release`.
     let loose = format!("{all} AND ta.release_id IS NULL");
-    let columns = if plan.no_record { loose.as_str() } else { all };
+    let columns = if conditions.no_record {
+        loose.as_str()
+    } else {
+        all
+    };
     let read = |row: &rusqlite::Row<'_>| -> Result<Song, rusqlite::Error> {
         let title: Option<String> = row.get(3)?;
         Ok(Song {
@@ -808,6 +1321,7 @@ fn songs(connection: &Connection, plan: &Plan) -> Result<(Vec<i64>, Vec<Section>
             disc: row.get(4)?,
             track: row.get(5)?,
             by_artist: row.get(6)?,
+            added: row.get(7)?,
         })
     };
     let mut songs = Vec::new();
@@ -845,6 +1359,45 @@ fn songs(connection: &Connection, plan: &Plan) -> Result<(Vec<i64>, Vec<Section>
     }
     songs.retain(|song| song.by_artist);
 
+    // What only some queries ask of a song is read only for them: its
+    // plays, its stars and its best copy.
+    let plays = if plan.by_plays() {
+        plays_by_recording(connection)?
+    } else {
+        HashMap::new()
+    };
+    let played = |song: &Song| plays.get(&song.recording).copied().unwrap_or_default();
+    let ratings: HashMap<i64, i64> = if plan.by_ratings() {
+        let recordings: Vec<i64> = songs.iter().map(|song| song.recording).collect();
+        crate::ratings::said(connection, &recordings)?
+            .into_iter()
+            .filter_map(|(recording, said)| Some((recording, said.rating?)))
+            .collect()
+    } else {
+        HashMap::new()
+    };
+    let rating = |song: &Song| ratings.get(&song.recording).copied();
+    let copies = if conditions.lossless.is_some() || plan.group == Some(GroupBy::Quality) {
+        best_copies(connection, false)?
+    } else {
+        HashMap::new()
+    };
+    let best = |song: &Song| copies.get(&song.id).copied();
+    let narrowed = !conditions.plays.is_open()
+        || conditions.min_rating.is_some()
+        || conditions.lossless.is_some();
+    if narrowed {
+        songs.retain(|song| {
+            conditions.plays.holds(played(song).count)
+                && conditions
+                    .min_rating
+                    .is_none_or(|least| rating(song).is_some_and(|stars| stars >= i64::from(least)))
+                && conditions
+                    .lossless
+                    .is_none_or(|lossless| best(song).is_some_and(|best| best.0 == lossless))
+        });
+    }
+
     // In a group shown as one tile, a song on another version is hidden
     // where the version the group shows has the same recording. That needs
     // every version of the groups the songs are on: for a search or a
@@ -852,7 +1405,7 @@ fn songs(connection: &Connection, plan: &Plan) -> Result<(Vec<i64>, Vec<Section>
     let mut on: Vec<i64> = songs.iter().filter_map(|song| song.release).collect();
     on.sort_unstable();
     on.dedup();
-    let releases = if (matched.is_some() || artist.is_some() || plan.no_record)
+    let releases = if (matched.is_some() || artist.is_some() || conditions.no_record || narrowed)
         && on.len() <= LOOK_UP_AT_MOST
     {
         releases_of_groups(connection, &on)?
@@ -873,6 +1426,16 @@ fn songs(connection: &Connection, plan: &Plan) -> Result<(Vec<i64>, Vec<Section>
         .enumerate()
         .map(|(index, release)| (release.id, index))
         .collect();
+    // A song is of the year of its release, as its row says.
+    let year = |song: &Song| {
+        song.release
+            .and_then(|id| release_index.get(&id))
+            .and_then(|index| releases.get(*index))
+            .and_then(|release| release.year)
+    };
+    if !conditions.years.is_open() {
+        songs.retain(|song| conditions.years.holds_known(year(song)));
+    }
     let mut on_shown: HashSet<(i64, i64)> = HashSet::new();
     for song in &songs {
         if let Some(release) = song.release.and_then(|id| release_index.get(&id))
@@ -919,15 +1482,43 @@ fn songs(connection: &Connection, plan: &Plan) -> Result<(Vec<i64>, Vec<Section>
             };
             order.then(a.id.cmp(&b.id))
         }),
-        _ => songs.sort_by(|a, b| by_name(&a.title_key, &b.title_key).then(a.id.cmp(&b.id))),
+        _ => songs.sort_by(|a, b| {
+            let order = match plan.sort {
+                SortKey::Plays => played(b).count.cmp(&played(a).count),
+                SortKey::LastPlayed => most_first(played(a).last, played(b).last),
+                SortKey::Rating => most_first(rating(a), rating(b)),
+                _ => Ordering::Equal,
+            };
+            order
+                .then_with(|| by_name(&a.title_key, &b.title_key))
+                .then(a.id.cmp(&b.id))
+        }),
+    }
+    // The letter a song is under: its record's artist's in an order by
+    // record, a song on none going after them all, and else its title's.
+    let letter = |song: &Song| match plan.sort {
+        SortKey::Album => album_of(song).map_or('#', |release| fold::letter(&release.artist_key)),
+        _ => fold::letter(&song.title_key),
+    };
+    if let Some(group) = plan.group {
+        if group == GroupBy::None {
+            return Ok((songs.iter().map(|song| song.id).collect(), Vec::new()));
+        }
+        let (songs, sections) = grouped(songs, |song| match group {
+            GroupBy::Year => Group::year(year(song)),
+            GroupBy::Decade => Group::decade(year(song)),
+            GroupBy::Added => Group::when(song.added, now_ms, "Earlier"),
+            GroupBy::Quality => Group::quality(Tier::of(best(song))),
+            GroupBy::Letter | GroupBy::Shelf | GroupBy::None => Group::letter(letter(song)),
+        });
+        return Ok((songs.iter().map(|song| song.id).collect(), sections));
     }
     let sections = match plan.sort {
-        SortKey::Album => sections(&songs, |song| {
-            album_of(song)
-                .map_or('#', |release| fold::letter(&release.artist_key))
-                .to_string()
+        SortKey::Plays | SortKey::Rating => Vec::new(),
+        SortKey::LastPlayed => sections(&songs, |song| {
+            Group::when(played(song).last, now_ms, NEVER_PLAYED).label
         }),
-        _ => sections(&songs, |song| fold::letter(&song.title_key).to_string()),
+        _ => sections(&songs, |song| letter(song).to_string()),
     };
     Ok((songs.iter().map(|song| song.id).collect(), sections))
 }
@@ -1075,29 +1666,66 @@ fn filed_under(connection: &Connection, resolved: &View, key: i64) -> Result<Fil
         .map_or(Filed::Gone, Filed::Name))
 }
 
-/// The first row filed at or after `prefix`, found by halving.
+/// Where a prefix typed is in a view, by how the view is found in
+/// ([`Find`]).
 pub(super) fn locate_prefix(
     connection: &Connection,
     resolved: &View,
     prefix: &str,
 ) -> Result<Option<u64>, Error> {
-    if resolved.sort == SortKey::Year {
-        let typed = prefix.trim();
-        // An empty prefix finds nothing, as it does for a name below.
-        if typed.is_empty() {
-            return Ok(None);
+    let names = match resolved.find {
+        Find::Nothing => return Ok(None),
+        Find::Name => {
+            let found = filed_at_or_after(connection, resolved, prefix, 0..resolved.ids.len())?;
+            return Ok(found.map(|(at, _)| at));
         }
-        return Ok(resolved
-            .sections
-            .iter()
-            .find(|section| section.label.starts_with(typed))
-            .map(|section| section.index));
+        Find::Sections { names } => names,
+    };
+    // Each section starts the order again, so a name is looked for in each,
+    // and only one that begins with what was typed is a find: the row after
+    // where it would be is some other name, in the first section.
+    let target = fold::sort_text(prefix, None);
+    if names && !target.is_empty() {
+        let starts = resolved.sections.iter().map(|section| section.index);
+        let ends = starts
+            .clone()
+            .skip(1)
+            .chain(std::iter::once(resolved.ids.len() as u64));
+        for (start, end) in starts.zip(ends) {
+            let rows = usize::try_from(start).unwrap_or(usize::MAX)
+                ..usize::try_from(end).unwrap_or(usize::MAX);
+            if let Some((at, name)) = filed_at_or_after(connection, resolved, prefix, rows)?
+                && name.starts_with(&target)
+            {
+                return Ok(Some(at));
+            }
+        }
     }
+    // Or a section by its label: a year, a decade, "Lossless".
+    let typed = fold::needle(prefix);
+    if typed.is_empty() {
+        return Ok(None);
+    }
+    Ok(resolved
+        .sections
+        .iter()
+        .find(|section| fold::fold(&section.label).starts_with(&typed))
+        .map(|section| section.index))
+}
+
+/// The first row of `rows` filed at or after `prefix`, and what it is
+/// filed under, found by halving: `rows` are in order by name.
+fn filed_at_or_after(
+    connection: &Connection,
+    resolved: &View,
+    prefix: &str,
+    rows: std::ops::Range<usize>,
+) -> Result<Option<(u64, String)>, Error> {
     let target = fold::sort_text(prefix, None);
     if target.is_empty() {
         return Ok(None);
     }
-    let (mut low, mut high) = (0, resolved.ids.len());
+    let (mut low, mut high) = (rows.start, rows.end.min(resolved.ids.len()));
     let mut found = None;
     while low < high {
         let middle = low + (high - low) / 2;
@@ -1118,7 +1746,7 @@ pub(super) fn locate_prefix(
                 low = at + 1;
                 continue;
             }
-            found = Some(at as u64);
+            found = Some((at as u64, name));
         }
         high = middle;
     }

@@ -450,9 +450,13 @@ fn albums(connection: &Connection, keys: &[i64]) -> Result<Vec<Row>, Error> {
         .collect()
 }
 
+/// How good a copy is, best last: whether it is lossless, its bits a
+/// sample, its samples a second, and its bit rate.
+pub(super) type Grade = (bool, u32, u32, u32);
+
 /// How good a format is, best last: lossless before lossy, then more bits,
 /// a higher rate, a higher bit rate.
-fn grade(format: &Format) -> (bool, u32, u32, u32) {
+fn grade(format: &Format) -> Grade {
     (
         format.lossless,
         format.bit_depth.unwrap_or(0),

@@ -608,7 +608,7 @@ mod tests {
                 ritornel_contract::CONTRACT_VERSION,
                 ritornel_engine::LISTEN_RECORD_VERSION
             ),
-            (7, 1),
+            (8, 1),
             "the listen record changed: raise CONTRACT_VERSION too"
         );
     }

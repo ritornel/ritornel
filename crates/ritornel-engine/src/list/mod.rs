@@ -89,14 +89,39 @@ pub struct View {
     pub revision: i64,
     /// The rows, in order, by their keys in `library.db`.
     pub ids: Vec<i64>,
-    /// Where each letter, year or stretch of time begins.
+    /// Where each section begins: a letter, a year, a stretch of time, or
+    /// a group of the grouping the query named.
     pub sections: Vec<Section>,
+    /// How a prefix typed is found in it.
+    pub find: Find,
+    /// Whether plays decide which rows it has or where they come: an order
+    /// by plays or by when a row was last played, or a filter on how many.
+    pub by_plays: bool,
+    /// Whether ratings do: an order by rating, or a filter on one.
+    pub by_ratings: bool,
+}
+
+/// How a prefix typed is found in a view, for type-to-find.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Find {
+    /// The view is in order by name from end to end: the first row filed
+    /// at or after what was typed.
+    Name,
+    /// Each section starts the order again. With `names`, the order within
+    /// a section is by name, and a row that begins with what was typed is
+    /// looked for in each; failing that, or without it, a section whose
+    /// label begins with what was typed.
+    Sections {
+        /// Whether the order within a section is by name.
+        names: bool,
+    },
+    /// Neither: nothing is found.
+    Nothing,
 }
 
 impl View {
     /// Whether its rows show plays: a song's play count and when it was
-    /// last played, which a play taken in changes. No view is sorted or
-    /// filtered by plays.
+    /// last played, which a play taken in changes.
     pub fn shows_plays(&self) -> bool {
         matches!(self.kind, ListKind::Songs)
     }
@@ -178,12 +203,14 @@ impl LibraryStore {
         self.read(move |connection| open::key_of(connection, kind, id))
     }
 
-    /// The index in `resolved` of the first row whose sort text starts with
-    /// `prefix`, or of the first one after where it would be. `None` for an
-    /// order by when or by kind of record, or a view with no rows.
+    /// The index in `resolved` of the row a prefix typed finds, as the
+    /// view is found in ([`Find`]): in a view in order by name, the first
+    /// row whose sort text starts with `prefix` or the first one after
+    /// where it would be, and in one cut into sections that start the
+    /// order again, a row that starts with it or a section whose label
+    /// does. `None` when nothing is found, and for a view with no rows.
     pub fn list_locate_prefix(&self, resolved: &View, prefix: &str) -> Result<Option<u64>, Error> {
-        if matches!(resolved.sort, SortKey::Added | SortKey::Discography) || resolved.ids.is_empty()
-        {
+        if resolved.ids.is_empty() {
             return Ok(None);
         }
         self.read(|connection| open::locate_prefix(connection, resolved, prefix))

@@ -49,31 +49,71 @@ impl ListKind {
     /// takes when none is named.
     pub const fn sorts(self) -> &'static [SortKey] {
         match self {
-            Self::Artists => &[SortKey::Name],
+            Self::Artists => &[SortKey::Name, SortKey::Plays, SortKey::LastPlayed],
             Self::Albums => &[
                 SortKey::Artist,
                 SortKey::Title,
                 SortKey::Year,
                 SortKey::Added,
                 SortKey::Discography,
+                SortKey::Plays,
+                SortKey::LastPlayed,
             ],
-            Self::Songs => &[SortKey::Title, SortKey::Album],
+            Self::Songs => &[
+                SortKey::Title,
+                SortKey::Album,
+                SortKey::Plays,
+                SortKey::LastPlayed,
+                SortKey::Rating,
+            ],
         }
     }
 
     /// The predicates a filter on a list of this kind may use.
     pub const fn predicates(self) -> &'static [PredicateName] {
         match self {
-            Self::Artists => &[],
+            Self::Artists => &[PredicateName::PlayCount, PredicateName::All],
             Self::Albums => &[
                 PredicateName::ByArtist,
                 PredicateName::WithArtist,
+                PredicateName::MinTracks,
+                PredicateName::PlayCount,
+                PredicateName::Lossless,
+                PredicateName::YearRange,
                 PredicateName::All,
             ],
             Self::Songs => &[
                 PredicateName::ByArtist,
                 PredicateName::NoRecord,
+                PredicateName::PlayCount,
+                PredicateName::MinRating,
+                PredicateName::Lossless,
+                PredicateName::YearRange,
                 PredicateName::All,
+            ],
+        }
+    }
+
+    /// The groupings a list of this kind takes.
+    pub const fn groupings(self) -> &'static [GroupBy] {
+        match self {
+            Self::Artists => &[GroupBy::None, GroupBy::Letter],
+            Self::Albums => &[
+                GroupBy::None,
+                GroupBy::Letter,
+                GroupBy::Year,
+                GroupBy::Decade,
+                GroupBy::Added,
+                GroupBy::Quality,
+                GroupBy::Shelf,
+            ],
+            Self::Songs => &[
+                GroupBy::None,
+                GroupBy::Letter,
+                GroupBy::Year,
+                GroupBy::Decade,
+                GroupBy::Added,
+                GroupBy::Quality,
             ],
         }
     }
@@ -113,6 +153,52 @@ pub enum SortKey {
     /// [`Predicate::ByArtist`] or [`Predicate::WithArtist`]; without one it
     /// is refused as `invalid`.
     Discography,
+    /// Most played first, by counted plays: a song's are its recording's,
+    /// a record's those of the recordings on the release it shows, and an
+    /// artist's those of the songs whose credit names them. Then as the
+    /// kind's first order has them.
+    Plays,
+    /// Most recently played first, by the last dated play counted the same
+    /// way, and what has none last. Its sections are stretches of time, as
+    /// [`SortKey::Added`]'s are.
+    LastPlayed,
+    /// Songs: by the listener's stars, most first, and songs with none
+    /// last, then by title.
+    Rating,
+}
+
+/// How a list is cut into sections, when a query says so itself. Left out
+/// of a [`Query`], a list takes the sections its order has: letters for an
+/// order by name, years for an order by year, and so on.
+///
+/// A query that names one is ordered by group first, in the group order
+/// given here, and by its [`SortKey`] within each group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum GroupBy {
+    /// No sections: the list in its order, and nothing else.
+    None,
+    /// By letter, A to Z and then `#`: the letter of what the order files
+    /// a row under when it is an order by name, and otherwise of an
+    /// artist's name, a record's artist or a song's title.
+    Letter,
+    /// By the year a record first came out, or the year of a song's
+    /// release, newest first. Rows with none are under "No year", last.
+    Year,
+    /// By the decade of that year, such as "1990s", newest first. Rows
+    /// with no year are under "Unknown", last.
+    Decade,
+    /// By when a row came into the library, newest first, in the
+    /// stretches of time [`SortKey::Added`] uses.
+    Added,
+    /// By the best copy the library has of a song, or of any track of a
+    /// record: "Hi-Res Lossless" (lossless, and more than 16 bits or
+    /// 48 kHz), "Lossless", "Lossy", then "Unknown".
+    Quality,
+    /// Records, by the kind of record, as a discography files them: each
+    /// [`Shelf`] is a section.
+    Shelf,
 }
 
 /// One key of a query's order.
@@ -165,7 +251,51 @@ pub enum Predicate {
     },
     /// Songs on no record: files that name no album. Songs only.
     NoRecord,
-    /// Every one of these holds. At most one of them may name an artist.
+    /// Records whose shown release has at least this many tracks: 3 leaves
+    /// out singles and stubs. Records only.
+    MinTracks {
+        /// The fewest tracks.
+        count: u64,
+    },
+    /// Rows played at least `min` and at most `max` times, counted as
+    /// [`SortKey::Plays`] counts them. A `max` of 0 is what has never been
+    /// played, and a `min` of 1 what has.
+    PlayCount {
+        /// The fewest plays. Left out, there is no lower bound.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
+        min: Option<u64>,
+        /// The most plays. Left out, there is no upper bound.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
+        max: Option<u64>,
+    },
+    /// Songs the listener gave at least this rating, 0 to 100 as
+    /// [`SongRow::rating`] is: 80 is four stars or more. Songs only.
+    MinRating {
+        /// The lowest rating.
+        rating: u32,
+    },
+    /// Rows whose best copy is lossless, or is not. A row with no copy the
+    /// library has read is neither.
+    Lossless {
+        /// Whether the best copy is lossless.
+        lossless: bool,
+    },
+    /// Rows whose year, as [`GroupBy::Year`] reads it, is from `from` to
+    /// `to`, both included. A row with no year is in no range.
+    YearRange {
+        /// The first year. Left out, there is no first.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
+        from: Option<i64>,
+        /// The last year. Left out, there is no last.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
+        to: Option<i64>,
+    },
+    /// Every one of these holds. At most one of them may name an artist,
+    /// and two bounds of one kind are both kept.
     All {
         /// The conditions.
         of: Vec<Predicate>,
@@ -179,6 +309,11 @@ impl Predicate {
             Self::ByArtist { .. } => PredicateName::ByArtist,
             Self::WithArtist { .. } => PredicateName::WithArtist,
             Self::NoRecord => PredicateName::NoRecord,
+            Self::MinTracks { .. } => PredicateName::MinTracks,
+            Self::PlayCount { .. } => PredicateName::PlayCount,
+            Self::MinRating { .. } => PredicateName::MinRating,
+            Self::Lossless { .. } => PredicateName::Lossless,
+            Self::YearRange { .. } => PredicateName::YearRange,
             Self::All { .. } => PredicateName::All,
         }
     }
@@ -195,6 +330,16 @@ pub enum PredicateName {
     WithArtist,
     /// [`Predicate::NoRecord`].
     NoRecord,
+    /// [`Predicate::MinTracks`].
+    MinTracks,
+    /// [`Predicate::PlayCount`].
+    PlayCount,
+    /// [`Predicate::MinRating`].
+    MinRating,
+    /// [`Predicate::Lossless`].
+    Lossless,
+    /// [`Predicate::YearRange`].
+    YearRange,
     /// [`Predicate::All`].
     All,
 }
@@ -220,6 +365,13 @@ pub struct Query {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub sort: Option<Vec<Sort>>,
+    /// How the list is cut into sections. Left out, it takes the sections
+    /// its order has. Named, the list is ordered by group and then by
+    /// `sort`, and [`GroupBy::None`] gives the order alone, with no
+    /// sections.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub group_by: Option<GroupBy>,
 }
 
 /// A stretch of a view's rows: from `offset`, at most `limit` of them.
@@ -336,14 +488,15 @@ pub struct ViewParams {
 #[serde(rename_all = "camelCase")]
 pub struct Section {
     /// What the section is: a letter, `#` for names that begin with no
-    /// letter, a year, a stretch of time such as "This week" or
-    /// "October", or in a discography the kind of record, such as
-    /// "Singles".
+    /// letter, a year, a decade, a stretch of time such as "This week" or
+    /// "October", a quality such as "Lossless", or the kind of record,
+    /// such as "Singles".
     pub label: String,
     /// The index of its first row.
     pub index: u64,
-    /// In a discography, the kind of record the section holds. A client
-    /// chooses its own words and its layout by this, and not by `label`.
+    /// In a discography, or a list grouped by [`GroupBy::Shelf`], the kind
+    /// of record the section holds. A client chooses its own words and its
+    /// layout by this, and not by `label`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub shelf: Option<Shelf>,
@@ -396,9 +549,11 @@ impl Shelf {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct ListSections {
-    /// The sections, in the view's order. Letters for an order by name or
+    /// The sections, in the view's order: those of the query's
+    /// [`GroupBy`], or left to the order, letters for an order by name or
     /// title, years for an order by year, stretches of time for an order
-    /// by when. Empty for an order that has none.
+    /// by when. Empty for an order that has none, and for
+    /// [`GroupBy::None`].
     pub sections: Vec<Section>,
 }
 
@@ -416,8 +571,14 @@ pub struct ListLocateParams {
     #[cfg_attr(test, ts(optional))]
     pub id: Option<String>,
     /// The start of what the view is ordered by, as typed, for
-    /// type-to-find. It finds the first row whose sort text begins with it,
-    /// or else the first row after where it would be.
+    /// type-to-find. In a view that is in order by name from end to end,
+    /// it finds the first row whose sort text begins with it, or else the
+    /// first row after where it would be. In one cut into sections that
+    /// each start the order again, it finds the first row whose sort text
+    /// begins with it where the order within a section is by name, and
+    /// otherwise the first section whose label begins with it. A view in
+    /// neither kind of order, such as one by plays with no sections, finds
+    /// nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub prefix: Option<String>,
@@ -665,6 +826,8 @@ pub struct ListSupport {
     pub sorts: Vec<SortKey>,
     /// The predicates a filter on it may use.
     pub predicates: Vec<PredicateName>,
+    /// The groupings a query on it may name.
+    pub groupings: Vec<GroupBy>,
 }
 
 impl ListSupport {
@@ -676,6 +839,7 @@ impl ListSupport {
                 kind: *kind,
                 sorts: kind.sorts().to_vec(),
                 predicates: kind.predicates().to_vec(),
+                groupings: kind.groupings().to_vec(),
             })
             .collect()
     }
@@ -749,15 +913,92 @@ mod tests {
     fn every_kind_names_its_sorts_and_the_first_is_its_default() {
         let support = ListSupport::all();
         assert_eq!(support.len(), 3);
-        assert_eq!(support[0].sorts, [SortKey::Name]);
+        assert_eq!(support[0].sorts[0], SortKey::Name);
         assert_eq!(support[1].sorts[0], SortKey::Artist);
+        assert_eq!(support[2].sorts[0], SortKey::Title);
         assert_eq!(
             support[2].predicates,
             [
                 PredicateName::ByArtist,
                 PredicateName::NoRecord,
+                PredicateName::PlayCount,
+                PredicateName::MinRating,
+                PredicateName::Lossless,
+                PredicateName::YearRange,
                 PredicateName::All
             ]
+        );
+        // Only songs are rated, only records have a count of tracks or a
+        // shelf, and every kind can be read flat.
+        assert!(!support[1].sorts.contains(&SortKey::Rating));
+        assert!(!support[2].predicates.contains(&PredicateName::MinTracks));
+        assert!(!support[2].groupings.contains(&GroupBy::Shelf));
+        for kind in &support {
+            assert!(kind.groupings.contains(&GroupBy::None), "{kind:?}");
+            assert!(kind.sorts.contains(&SortKey::Plays), "{kind:?}");
+            assert!(kind.predicates.contains(&PredicateName::PlayCount));
+        }
+    }
+
+    #[test]
+    fn a_query_names_its_grouping_apart_from_its_order() {
+        let wire = json!({
+            "kind": "albums",
+            "query": { "sort": [{ "key": "plays" }], "groupBy": "decade" },
+        });
+        let params: ListOpenParams = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(params.query.group_by, Some(GroupBy::Decade));
+        assert_eq!(serde_json::to_value(&params).unwrap(), wire);
+        // Left out is not the same as none: one takes the order's own
+        // sections, the other has none.
+        let flat: Query = serde_json::from_value(json!({ "groupBy": "none" })).unwrap();
+        assert_eq!(flat.group_by, Some(GroupBy::None));
+        assert_eq!(Query::default().group_by, None);
+        assert_eq!(
+            serde_json::to_value(SortKey::LastPlayed).unwrap(),
+            json!("last_played")
+        );
+    }
+
+    #[test]
+    fn bounds_are_left_out_of_a_predicate_that_has_none() {
+        let wire = json!({
+            "is": "all",
+            "of": [
+                { "is": "min_tracks", "count": 3 },
+                { "is": "play_count", "max": 0 },
+                { "is": "min_rating", "rating": 80 },
+                { "is": "lossless", "lossless": true },
+                { "is": "year_range", "from": 1990 },
+            ],
+        });
+        let predicate: Predicate = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(
+            predicate,
+            Predicate::All {
+                of: vec![
+                    Predicate::MinTracks { count: 3 },
+                    Predicate::PlayCount {
+                        min: None,
+                        max: Some(0)
+                    },
+                    Predicate::MinRating { rating: 80 },
+                    Predicate::Lossless { lossless: true },
+                    Predicate::YearRange {
+                        from: Some(1990),
+                        to: None
+                    },
+                ]
+            }
+        );
+        assert_eq!(serde_json::to_value(&predicate).unwrap(), wire);
+        assert_eq!(
+            Predicate::YearRange {
+                from: None,
+                to: None
+            }
+            .name(),
+            PredicateName::YearRange
         );
     }
 

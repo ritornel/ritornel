@@ -107,6 +107,9 @@ mod tests {
             revision: 1,
             ids: (0..rows).collect(),
             sections: Vec::new(),
+            find: ritornel_engine::Find::Name,
+            by_plays: false,
+            by_ratings: false,
         })
     }
 

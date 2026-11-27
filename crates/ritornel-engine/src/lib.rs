@@ -133,7 +133,7 @@ pub use library_store::{
     WriteRequest, Written,
 };
 pub use link_store::{HubLink, LinkSession};
-pub use list::{ListError, View};
+pub use list::{Find, ListError, View};
 pub use lookup_store::{Asked, FACTS_METHOD, KeptReply, reads_as_disc_reply};
 pub use ratings::Said;
 pub use record_health::{Dismissal, Failing, LostScrobbles};

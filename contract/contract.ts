@@ -10,7 +10,7 @@
 // Every integer fits in 53 bits, so each is a `number`.
 
 /** The version of the contract these types are. */
-export const CONTRACT_VERSION = 7;
+export const CONTRACT_VERSION = 8;
 
 /** The HTTP routes. Each is a `GET` but `ticket` and `link`, which are `POST`s. */
 export const ROUTES = {
@@ -2157,6 +2157,16 @@ export type GoneRow = {
    */
   gone: boolean,
 };
+
+/**
+ * How a list is cut into sections, when a query says so itself. Left out
+ * of a [`Query`], a list takes the sections its order has: letters for an
+ * order by name, years for an order by year, and so on.
+ *
+ * A query that names one is ordered by group first, in the group order
+ * given here, and by its [`SortKey`] within each group.
+ */
+export type GroupBy = "none" | "letter" | "year" | "decade" | "added" | "quality" | "shelf";
 
 /**
  * An entry in queue order. Shuffle positions preserve the separate play order.
@@ -4921,8 +4931,14 @@ export type ListLocateParams = {
   id?: string,
   /**
    * The start of what the view is ordered by, as typed, for
-   * type-to-find. It finds the first row whose sort text begins with it,
-   * or else the first row after where it would be.
+   * type-to-find. In a view that is in order by name from end to end,
+   * it finds the first row whose sort text begins with it, or else the
+   * first row after where it would be. In one cut into sections that
+   * each start the order again, it finds the first row whose sort text
+   * begins with it where the order within a section is by name, and
+   * otherwise the first section whose label begins with it. A view in
+   * neither kind of order, such as one by plays with no sections, finds
+   * nothing.
    */
   prefix?: string,
 };
@@ -4998,9 +5014,11 @@ export type ListOpened = {
  */
 export type ListSections = {
   /**
-   * The sections, in the view's order. Letters for an order by name or
+   * The sections, in the view's order: those of the query's
+   * [`GroupBy`], or left to the order, letters for an order by name or
    * title, years for an order by year, stretches of time for an order
-   * by when. Empty for an order that has none.
+   * by when. Empty for an order that has none, and for
+   * [`GroupBy::None`].
    */
   sections: Array<Section>,
 };
@@ -5022,6 +5040,10 @@ export type ListSupport = {
    * The predicates a filter on it may use.
    */
   predicates: Array<PredicateName>,
+  /**
+   * The groupings a query on it may name.
+   */
+  groupings: Array<GroupBy>,
 };
 
 /**
@@ -6256,7 +6278,35 @@ export type Predicate = { "is": "by_artist",
   /**
    * The artist.
    */
-  artistId: string, } | { "is": "no_record" } | { "is": "all",
+  artistId: string, } | { "is": "no_record" } | { "is": "min_tracks",
+  /**
+   * The fewest tracks.
+   */
+  count: number, } | { "is": "play_count",
+  /**
+   * The fewest plays. Left out, there is no lower bound.
+   */
+  min?: number,
+  /**
+   * The most plays. Left out, there is no upper bound.
+   */
+  max?: number, } | { "is": "min_rating",
+  /**
+   * The lowest rating.
+   */
+  rating: number, } | { "is": "lossless",
+  /**
+   * Whether the best copy is lossless.
+   */
+  lossless: boolean, } | { "is": "year_range",
+  /**
+   * The first year. Left out, there is no first.
+   */
+  from?: number,
+  /**
+   * The last year. Left out, there is no last.
+   */
+  to?: number, } | { "is": "all",
   /**
    * The conditions.
    */
@@ -6266,7 +6316,7 @@ export type Predicate = { "is": "by_artist",
 /**
  * The name of a predicate, as the descriptor lists what a list supports.
  */
-export type PredicateName = "by_artist" | "with_artist" | "no_record" | "all";
+export type PredicateName = "by_artist" | "with_artist" | "no_record" | "min_tracks" | "play_count" | "min_rating" | "lossless" | "year_range" | "all";
 
 /**
  * What a satellite announces on its own connection.
@@ -6641,6 +6691,13 @@ export type Query = {
    * own tiebreak. Left out, a list takes its kind's first order.
    */
   sort?: Array<Sort>,
+  /**
+   * How the list is cut into sections. Left out, it takes the sections
+   * its order has. Named, the list is ordered by group and then by
+   * `sort`, and [`GroupBy::None`] gives the order alone, with no
+   * sections.
+   */
+  groupBy?: GroupBy,
 };
 
 /**
@@ -7406,9 +7463,9 @@ export type SearchResults = {
 export type Section = {
   /**
    * What the section is: a letter, `#` for names that begin with no
-   * letter, a year, a stretch of time such as "This week" or
-   * "October", or in a discography the kind of record, such as
-   * "Singles".
+   * letter, a year, a decade, a stretch of time such as "This week" or
+   * "October", a quality such as "Lossless", or the kind of record,
+   * such as "Singles".
    */
   label: string,
   /**
@@ -7416,8 +7473,9 @@ export type Section = {
    */
   index: number,
   /**
-   * In a discography, the kind of record the section holds. A client
-   * chooses its own words and its layout by this, and not by `label`.
+   * In a discography, or a list grouped by [`GroupBy::Shelf`], the kind
+   * of record the section holds. A client chooses its own words and its
+   * layout by this, and not by `label`.
    */
   shelf?: Shelf,
 };
@@ -7947,7 +8005,7 @@ export type Sort = {
  * so that it is total and a view of the same query twice has the same
  * order.
  */
-export type SortKey = "name" | "artist" | "title" | "year" | "added" | "album" | "discography";
+export type SortKey = "name" | "artist" | "title" | "year" | "added" | "album" | "discography" | "plays" | "last_played" | "rating";
 
 /**
  * One place the library's items come from.
