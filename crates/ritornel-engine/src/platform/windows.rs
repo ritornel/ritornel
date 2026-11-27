@@ -302,11 +302,19 @@ mod tests {
         std::fs::create_dir_all(root.join("a/b")).unwrap();
         std::fs::write(root.join("a/b/01.flac"), b"12345").unwrap();
         let opened = Folder::open_root(&root).unwrap();
-        let held = opened.open_folder(&["a"]).unwrap();
-        // The root and the folder are renamed and others made at their
-        // paths: what was opened is still what is reached.
-        std::fs::rename(&root, scratch.path().join("moved")).unwrap();
+        // Rename the root while only its own handle is open (Windows refuses
+        // renaming a parent while a handle to a descendant is open), then put
+        // a decoy at the old path: `opened` still reaches the moved tree.
+        let moved_root = scratch.path().join("moved-root");
+        std::fs::rename(&root, &moved_root).unwrap();
         std::fs::create_dir_all(root.join("a/b")).unwrap();
+
+        let held = opened.open_folder(&["a"]).unwrap();
+        // Now rename `a` itself while its handle is open and place a decoy at
+        // `moved-root/a/b`: `held` still reaches the moved `a`.
+        std::fs::rename(moved_root.join("a"), scratch.path().join("moved-a")).unwrap();
+        std::fs::create_dir_all(moved_root.join("a/b")).unwrap();
+
         let inner = held.open_folder(&["b"]).unwrap();
         let names: Vec<OsString> = inner
             .list()
@@ -316,8 +324,9 @@ mod tests {
             .collect();
         assert_eq!(names, ["01.flac"]);
         assert!(inner.open("01.flac", false).is_ok());
-        let again = opened.open_folder(&["a", "b"]).unwrap();
-        assert_eq!(again.id(), inner.id());
+        // The decoy created at `moved-root/a/b` is a different directory.
+        let decoy = opened.open_folder(&["a", "b"]).unwrap();
+        assert_ne!(decoy.id(), inner.id());
     }
 
     #[test]
