@@ -52,41 +52,98 @@ fn plausible(value: &serde_json::Value) -> bool {
 }
 
 /// Where a call is answered on a satellite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Route {
     /// On the satellite: what is its own, such as its player.
     Here,
     /// At the hub, forwarded unchanged: reading and changing the library.
     Hub,
-    /// Nowhere: it names folders on the hub's machine, which a satellite
-    /// cannot see. It is made on the hub.
+    /// Nowhere: it names folders, services or caches of the hub's machine,
+    /// which a satellite does not manage. It is made on the hub.
     Refused(&'static str),
 }
 
 /// Where `method` is answered on a satellite: library calls go to the
-/// hub; playback, output and pairing are local. See "Hub and satellites"
-/// in docs/internals/linking.md.
-pub(super) fn on_a_satellite(method: &str) -> Route {
+/// hub; playback, output and pairing are local. `None` for a method no one
+/// has placed, which is refused: each new call is placed here on purpose,
+/// and a test fails until it is. See "Hub and satellites" in
+/// docs/internals/linking.md.
+pub(super) fn classify_on_satellite(method: &str) -> Option<Route> {
     const FOLDERS: &str = "the library's folders are on its hub's machine: do this on the hub";
-    match method {
+    const TRANSCODES: &str = "manage the transcode cache on the library hub";
+    const LASTFM: &str = "connect or configure Last.fm on the library hub";
+    Some(match method {
+        // The satellite's own: its session, status, settings, backups,
+        // player, queue and link.
         "server.hello" | "server.status" | "servers.list" | "players.list" | "events.subscribe"
         | "events.unsubscribe" | "media.token" | "server.backup" | "server.settings"
-        | "server.setSettings" | "inspect.db" | "inspect.table" => Route::Here,
-        "playback.move" => Route::Hub,
-        _ if method.starts_with("playback.")
-            || method.starts_with("queue.")
-            || method.starts_with("link.") =>
-        {
-            Route::Here
-        }
-        "transcode.start" | "transcode.prune" => {
-            Route::Refused("manage the transcode cache on the library hub")
-        }
+        | "server.setSettings" | "inspect.db" | "inspect.table" | "playback.get"
+        | "playback.play" | "playback.pause" | "playback.resume" | "playback.stop"
+        | "playback.seek" | "playback.skip" | "playback.jump" | "playback.set" | "queue.window"
+        | "queue.add" | "queue.remove" | "queue.move" | "queue.clear" | "link.invite"
+        | "link.join" | "link.status" | "link.tracks" | "link.copies" | "link.listen"
+        | "link.event" | "link.handoff" | "link.ping" => Route::Here,
+        // The hub's library: read, changed and scanned there.
+        "sources.list"
+        | "scan.start"
+        | "jobs.list"
+        | "jobs.get"
+        | "jobs.cancel"
+        | "library.stats"
+        | "list.open"
+        | "list.window"
+        | "list.sections"
+        | "list.locate"
+        | "list.close"
+        | "library.search"
+        | "album.get"
+        | "artist.get"
+        | "playback.move"
+        | "history.recent"
+        | "history.onThisDay"
+        | "history.artist"
+        | "history.album"
+        | "history.artists"
+        | "history.albums"
+        | "history.track"
+        | "history.stream"
+        | "history.rebuild"
+        | "history.zones"
+        | "history.setZones"
+        | "tracks.get"
+        | "ratings.set"
+        | "lastfm.status"
+        | "lastfm.sync"
+        | "lastfm.report"
+        | "imports.stage"
+        | "imports.dryRun"
+        | "imports.apply"
+        | "imports.undo"
+        | "imports.get"
+        | "imports.list"
+        | "library.settings"
+        | "library.setSettings"
+        | "record.dismiss"
+        | "corrections.lookup"
+        | "corrections.summary"
+        | "corrections.list"
+        | "corrections.get"
+        | "corrections.preview"
+        | "corrections.confirm"
+        | "corrections.undo"
+        | "corrections.decline"
+        | "corrections.keepApart"
+        | "corrections.answers"
+        | "corrections.answer"
+        | "inspect.entity"
+        | "inspect.play"
+        | "inspect.conflicts"
+        | "library.revisions" => Route::Hub,
+        "transcode.start" | "transcode.prune" => Route::Refused(TRANSCODES),
         "lastfm.signInStart"
         | "lastfm.signInFinish"
         | "lastfm.signOut"
-        | "lastfm.setScrobbling" => {
-            Route::Refused("connect or configure Last.fm on the library hub")
-        }
+        | "lastfm.setScrobbling" => Route::Refused(LASTFM),
         "library.create"
         | "sources.add"
         | "library.setWatching"
@@ -97,7 +154,42 @@ pub(super) fn on_a_satellite(method: &str) -> Route {
         | "identity.dryRun"
         | "identity.review"
         | "corrections.discs" => Route::Refused(FOLDERS),
-        _ => Route::Hub,
+        _ => return None,
+    })
+}
+
+/// Where `method` is answered on a satellite, a method no one has placed
+/// being refused ([`classify_on_satellite`]).
+pub(super) fn on_a_satellite(method: &str) -> Route {
+    classify_on_satellite(method).unwrap_or(Route::Refused(
+        "this call is not available through a satellite",
+    ))
+}
+
+/// Whether a satellite's link session may make the call `method`, with
+/// `params`, at its hub: only what the link carries. That is its hello and
+/// its subscriptions to what it forwards; what the satellite asks for its
+/// player and its listens; what its clients' calls forward
+/// ([`Route::Hub`]); and a call for one player, named by its ID, as Play On
+/// sends. Everything else is refused, whatever the link's permissions.
+pub(super) fn from_a_link(method: &str, params: Option<&serde_json::Value>) -> bool {
+    use ritornel_contract::{Topic, TopicsParams};
+    match method {
+        "server.hello" | "players.list" => true,
+        "link.tracks" | "link.copies" | "link.listen" | "link.event" | "link.ping" => true,
+        "events.subscribe" | "events.unsubscribe" => params
+            .and_then(|params| serde_json::from_value::<TopicsParams>(params.clone()).ok())
+            .is_some_and(|asked| {
+                asked.topics.iter().all(|topic| {
+                    crate::uplink::HUB_TOPICS.contains(topic)
+                        || (asked.player.is_some()
+                            && matches!(topic, Topic::Playback | Topic::Progress | Topic::Queue))
+                })
+            }),
+        _ if super::players::is_player_method(method) => params
+            .and_then(|params| params.get("player"))
+            .is_some_and(|player| serde_json::from_value::<Id>(player.clone()).is_ok()),
+        _ => classify_on_satellite(method) == Some(Route::Hub),
     }
 }
 
@@ -804,6 +896,86 @@ impl Core {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn every_method_is_placed_on_a_satellite() {
+        for row in ritornel_contract::methods::METHODS {
+            assert!(
+                classify_on_satellite(row.name).is_some(),
+                "{} has no place on a satellite: say whether it is answered there, at the hub, \
+                 or not at all",
+                row.name
+            );
+        }
+        assert_eq!(classify_on_satellite("library.wipe"), None);
+        assert!(matches!(on_a_satellite("library.wipe"), Route::Refused(_)));
+    }
+
+    #[test]
+    fn a_link_carries_what_a_satellite_sends() {
+        let player = json!({ "player": Id::from_bytes([7; 16]) });
+        for (method, params) in [
+            ("server.hello", json!({})),
+            ("players.list", json!({})),
+            ("link.tracks", json!({})),
+            ("link.copies", json!({})),
+            ("link.listen", json!({})),
+            ("link.event", json!({})),
+            ("link.ping", json!({})),
+            ("list.open", json!({})),
+            ("ratings.set", json!({})),
+            ("imports.stage", json!({})),
+            ("jobs.cancel", json!({})),
+            ("playback.move", json!({})),
+            ("playback.pause", player.clone()),
+            ("queue.add", player.clone()),
+            (
+                "events.subscribe",
+                json!({ "topics": ["library", "jobs", "players", "list"] }),
+            ),
+            (
+                "events.subscribe",
+                json!({ "player": Id::from_bytes([7; 16]), "topics": ["playback", "progress", "queue"] }),
+            ),
+            ("events.unsubscribe", json!({ "topics": ["library"] })),
+        ] {
+            assert!(from_a_link(method, Some(&params)), "{method} {params}");
+        }
+    }
+
+    #[test]
+    fn a_link_carries_nothing_else() {
+        for (method, params) in [
+            ("link.invite", json!({})),
+            ("link.join", json!({})),
+            ("link.status", json!({})),
+            // The hub hands a queue off to a satellite, never the other way.
+            ("link.handoff", json!({})),
+            ("server.status", json!({})),
+            ("server.settings", json!({})),
+            ("server.setSettings", json!({})),
+            ("server.backup", json!({})),
+            ("servers.list", json!({})),
+            ("media.token", json!({})),
+            ("inspect.db", json!({})),
+            ("inspect.table", json!({})),
+            ("transcode.start", json!({})),
+            ("lastfm.signInStart", json!({})),
+            ("sources.add", json!({})),
+            ("library.wipe", json!({})),
+            // The hub's own player is reached only by naming it.
+            ("playback.pause", json!({})),
+            ("playback.pause", json!({ "player": null })),
+            ("queue.clear", json!({ "player": "not an ID" })),
+            ("events.subscribe", json!({ "topics": ["servers"] })),
+            ("events.subscribe", json!({ "topics": ["playback"] })),
+            ("events.subscribe", json!({})),
+        ] {
+            assert!(!from_a_link(method, Some(&params)), "{method} {params}");
+        }
+        assert!(!from_a_link("playback.pause", None));
+    }
 
     #[test]
     fn a_name_from_another_machine_is_kept_short_and_plain() {

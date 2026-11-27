@@ -542,7 +542,11 @@ async fn a_satellite_opens_a_socket_at_its_hub_with_its_link_session_and_no_tick
             })
             .await
             .unwrap();
-        assert_eq!(linked.status().await.unwrap().role, ServerRole::Hub);
+        // It reads the library it forwards for, and not the hub's own status,
+        // which a satellite answers for itself.
+        linked.call::<LibraryStats>(&NoParams {}).await.unwrap();
+        let refused = linked.status().await.unwrap_err();
+        assert_eq!(code(&refused), Some(ErrorCode::Forbidden), "{refused}");
         // Through its link it may not invite another server.
         let refused = linked
             .call::<LinkInvite>(&LinkInviteParams {
@@ -638,6 +642,49 @@ async fn a_satellite_reads_the_hubs_library_through_its_link() {
         let hub = status.hub.unwrap();
         assert_eq!(hub.answers, Some(true));
         assert!(hub.since_ms.is_some() && hub.problem.is_none());
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_satellites_clients_reach_what_its_link_forwards() {
+    use ritornel_client::contract::methods::PlayersListCall;
+    use serde_json::json;
+    bounded(async {
+        let scratch = Scratch::new();
+        let (hub, hub_client, _desk, desk_client) = two(&scratch).await;
+        join(&desk_client, &invite(&hub, &hub_client).await)
+            .await
+            .unwrap();
+        // One call of each kind a client of a satellite makes at the hub,
+        // all of which the hub takes from the satellite's link.
+        for (method, params) in [
+            ("library.stats", json!({})),
+            ("sources.list", json!({})),
+            ("jobs.list", json!({})),
+            ("history.recent", json!({})),
+            ("history.zones", json!({})),
+            ("imports.list", json!({})),
+            ("library.settings", json!({})),
+            ("corrections.summary", json!({})),
+            ("corrections.list", json!({})),
+            ("inspect.conflicts", json!({})),
+            ("library.revisions", json!({})),
+        ] {
+            desk_client
+                .call_raw(method, params)
+                .await
+                .unwrap_or_else(|error| panic!("{method}: {error}"));
+        }
+        let opened = desk_client.list_open(&songs()).await.unwrap();
+        desk_client
+            .call_raw("list.close", json!({ "view": opened.view }))
+            .await
+            .unwrap();
+        desk_client
+            .call::<PlayersListCall>(&NoParams {})
+            .await
+            .unwrap();
     })
     .await;
 }
@@ -3759,8 +3806,8 @@ async fn scoped_invites_enforce_delegation_http_permissions_and_report_role_in_l
         let cache_path = format!("{}/{}", route::CACHE_DERIVATIVE, "00".repeat(32));
         assert_eq!(get_linked(&hub, &cache_path, &monitor_cred).await, 403);
 
-        // Over WebSocket, a Monitor link can ping and list servers, but is refused
-        // link.tracks, link.copies, and link.listen.
+        // Over WebSocket, a Monitor link can ping, but is refused link.tracks,
+        // link.copies, and link.listen.
         let monitor_ws = linked_socket(&hub, &monitor_cred).await;
         monitor_ws
             .hello(&HelloParams {
@@ -3772,7 +3819,10 @@ async fn scoped_invites_enforce_delegation_http_permissions_and_report_role_in_l
             })
             .await
             .unwrap();
-        monitor_ws.servers().await.unwrap();
+        // Its link carries its ping, but not a list of the hub's servers,
+        // which a satellite answers for itself.
+        let refused = monitor_ws.servers().await.unwrap_err();
+        assert_eq!(code(&refused), Some(ErrorCode::Forbidden), "{refused}");
         monitor_ws
             .call::<LinkPing>(&LinkPingParams {
                 playing: false,

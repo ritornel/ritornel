@@ -909,6 +909,15 @@ impl Core {
                 format!("{} requires {}", row.name, missing.join(", ")),
             ));
         }
+        // A satellite's link carries only what a satellite sends, whatever
+        // its permissions. Checked before anything it asks is acted on, or
+        // keeps this hub awake.
+        if session.peer().is_some() && !link::from_a_link(row.name, params.as_ref()) {
+            return Err(RpcError::new(
+                ErrorCode::Forbidden,
+                format!("{} is not a call a satellite's link carries", row.name),
+            ));
+        }
         // What a linked server asks keeps this hub awake for a while.
         if let Some(peer) = session.peer()
             && crate::awake::is_activity(row.name)
