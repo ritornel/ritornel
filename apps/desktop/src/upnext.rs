@@ -528,7 +528,7 @@ impl UpNextCard {
                     .flex_none()
                     .flex()
                     .justify_center()
-                    .child(crate::marks::eq(eq_seconds, 13., theme::ink())),
+                    .child(crate::marks::eq(eq_seconds, 13., theme::acc())),
             )
     }
 

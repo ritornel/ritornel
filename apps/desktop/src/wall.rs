@@ -2739,7 +2739,9 @@ impl Wall {
                                 .absolute()
                                 .right(px(9.))
                                 .top(px(8.))
-                                .child(crate::icons::icon("chevron", 14., gpui::rgb(0x999999))),
+                                // In the accent, as the system's pop-ups
+                                // have theirs.
+                                .child(crate::icons::icon("chevron", 14., theme::acc())),
                         ),
                 )
         });

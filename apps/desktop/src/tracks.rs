@@ -233,7 +233,7 @@ impl Tracks {
                 .flex()
                 .items_center()
                 .justify_end()
-                .child(crate::marks::eq(eq_seconds, 13., theme::ink()))
+                .child(crate::marks::eq(eq_seconds, 13., theme::acc()))
         } else {
             div()
                 .relative()
