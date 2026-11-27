@@ -2,8 +2,12 @@
 //! across and 22 down; under letters, a lane of 96 points for the large
 //! letter and 40 between one letter's tiles and the next's; with the large
 //! letters off, a small heading over each letter's tiles; under a date, a
-//! heading of 52 points over each stretch's tiles. The room left over goes
-//! between the columns.
+//! heading of 52 points over each stretch's tiles; flat, nothing over them
+//! at all. The room left over goes between the columns.
+//!
+//! A wall need not be of tiles (`Metrics`): tiles may be smaller or larger
+//! than 150 points, and a list or a table is one row to a line, as wide as
+//! the wall, with nothing between the rows.
 
 /// How a wall is laid out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12,8 +16,26 @@ pub(crate) enum Shape {
     Lettered,
     /// Under small headings of letters, with the large letters turned off.
     Headed,
-    /// Under headings of time.
+    /// Under headings of time, or of anything else that is not a letter.
     Dated,
+    /// Under nothing: the rows in one run.
+    Flat,
+}
+
+/// What a wall's rows measure.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum Metrics {
+    /// Tiles `tile` points wide, as many as fit across, their words under
+    /// them.
+    Grid { tile: f32 },
+    /// One row to a line, `row` points high, with nothing between them.
+    Rows { row: f32 },
+}
+
+impl Metrics {
+    /// The wall of tiles the Library has always had.
+    #[cfg(test)]
+    pub(crate) const WALL: Self = Self::Grid { tile: TILE };
 }
 
 pub(crate) const LANE: f32 = 96.;
@@ -39,12 +61,13 @@ impl Shape {
             Self::Lettered => GROUP_GAP,
             Self::Headed => LETTER_GAP,
             Self::Dated => PERIOD_GAP,
+            Self::Flat => 0.,
         }
     }
 
     fn head(self) -> f32 {
         match self {
-            Self::Lettered => 0.,
+            Self::Lettered | Self::Flat => 0.,
             Self::Headed => LETTER_HEADING,
             Self::Dated => HEADING + HEADING_GAP,
         }
@@ -69,7 +92,10 @@ pub(crate) struct Group {
 #[derive(Debug, Clone)]
 pub(crate) struct Layout {
     pub shape: Shape,
+    pub metrics: Metrics,
     pub width: f32,
+    /// How wide a tile is, or a row.
+    pub tile: f32,
     pub columns: usize,
     pub row_height: f32,
     pub pitch: f32,
@@ -82,33 +108,61 @@ pub(crate) struct Layout {
     pub total: usize,
 }
 
-/// How many tiles fit across `width`.
+/// How many tiles of 150 points fit across `width`.
+#[cfg(test)]
 pub(crate) fn columns_for(width: f32, shape: Shape) -> usize {
+    columns_of(width, shape, TILE)
+}
+
+/// How many tiles `tile` points wide fit across `width`.
+fn columns_of(width: f32, shape: Shape, tile: f32) -> usize {
     let room = width - if shape == Shape::Lettered { LANE } else { 0. };
-    let fit = ((room + GAP_X) / (TILE + GAP_X)).floor().max(0.) as usize;
+    let fit = ((room + GAP_X) / (tile + GAP_X)).floor().max(0.) as usize;
     fit.clamp(MIN_COLUMNS, MAX_COLUMNS)
 }
 
-/// Lays out a wall `width` points wide holding `total` rows in sections
-/// that start at these indices. With no sections the rows are one group.
+/// Lays out a wall of 150-point tiles, as [`layout_of`] does.
+#[cfg(test)]
 pub(crate) fn layout(
     width: f32,
     total: usize,
     sections: &[(String, usize)],
     shape: Shape,
 ) -> Layout {
-    let columns = columns_for(width, shape);
+    layout_of(width, total, sections, shape, Metrics::WALL)
+}
+
+/// Lays out a wall `width` points wide holding `total` rows in sections
+/// that start at these indices. With no sections, or flat, the rows are
+/// one group.
+pub(crate) fn layout_of(
+    width: f32,
+    total: usize,
+    sections: &[(String, usize)],
+    shape: Shape,
+    metrics: Metrics,
+) -> Layout {
     let left = if shape == Shape::Lettered { LANE } else { 0. };
-    let row_height = TILE + TEXT_HEIGHT;
-    let pitch = row_height + GAP_Y;
     let room = width - left;
-    let gap = if columns > 1 {
-        ((room - columns as f32 * TILE) / (columns - 1) as f32).max(GAP_X)
-    } else {
-        GAP_X
+    let (columns, tile, row_height, gap_y) = match metrics {
+        Metrics::Grid { tile } => (
+            columns_of(width, shape, tile),
+            tile,
+            tile + TEXT_HEIGHT,
+            GAP_Y,
+        ),
+        Metrics::Rows { row } => (1, room.max(0.), row, 0.),
+    };
+    let pitch = row_height + gap_y;
+    let gap = match metrics {
+        Metrics::Grid { .. } if columns > 1 => {
+            ((room - columns as f32 * tile) / (columns - 1) as f32).max(GAP_X)
+        }
+        Metrics::Grid { .. } => GAP_X,
+        Metrics::Rows { .. } => 0.,
     };
     let fallback = [(String::new(), 0)];
-    let starts: &[(String, usize)] = if !sections.is_empty() {
+    let starts: &[(String, usize)] = if !sections.is_empty() && shape != Shape::Flat {
         sections
     } else if total > 0 {
         &fallback
@@ -124,7 +178,7 @@ pub(crate) fn layout(
             continue;
         }
         let lines = count.div_ceil(columns);
-        let tiles = lines as f32 * row_height + (lines - 1) as f32 * GAP_Y;
+        let tiles = lines as f32 * row_height + (lines - 1) as f32 * gap_y;
         if !groups.is_empty() {
             y += shape.gap_above();
         }
@@ -142,7 +196,9 @@ pub(crate) fn layout(
     }
     Layout {
         shape,
+        metrics,
         width,
+        tile,
         columns,
         row_height,
         pitch,
@@ -202,7 +258,7 @@ impl Layout {
     /// Where a tile is on the wall: its left, from the wall's left edge, and its top.
     pub(crate) fn tile_origin(&self, line: &Line, index: usize) -> (f32, f32) {
         let column = index - line.first;
-        (self.left + column as f32 * (TILE + self.gap), line.y)
+        (self.left + column as f32 * (self.tile + self.gap), line.y)
     }
 
     pub(crate) fn group_of(&self, index: usize) -> Option<&Group> {
@@ -226,7 +282,7 @@ impl Layout {
         let group = self.group_of(index)?;
         let column = (index - group.start) % self.columns;
         Some((
-            self.left + column as f32 * (TILE + self.gap),
+            self.left + column as f32 * (self.tile + self.gap),
             self.y_of(index),
         ))
     }
@@ -383,6 +439,117 @@ mod tests {
         assert_eq!(dated.groups[0].body_top, HEADING + HEADING_GAP);
         assert_eq!(dated.groups[1].top, dated.groups[0].height + PERIOD_GAP);
         assert!(layout(1020., 0, &[], Shape::Lettered).groups.is_empty());
+    }
+
+    #[test]
+    fn a_flat_wall_is_one_group_with_nothing_over_it() {
+        let flat = layout_of(1020., 25, &[], Shape::Flat, Metrics::WALL);
+        assert_eq!((flat.left, flat.columns, flat.groups.len()), (0., 6, 1));
+        let only = &flat.groups[0];
+        assert_eq!(
+            (only.start, only.count, only.body_top, only.top),
+            (0, 25, 0., 0.)
+        );
+        assert_eq!(only.lines, 5);
+        assert_eq!(flat.height, 5. * flat.row_height + 4. * GAP_Y);
+        assert_eq!(flat.y_of(6), flat.pitch);
+        // Sections it is given are not drawn: it is still one run.
+        let run = layout_of(1020., 25, &letters(), Shape::Flat, Metrics::WALL);
+        assert_eq!(run.groups.len(), 1);
+        assert_eq!(run.height, flat.height);
+        assert!(
+            layout_of(1020., 0, &[], Shape::Flat, Metrics::WALL)
+                .groups
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn smaller_tiles_fit_more_across_and_larger_fewer() {
+        let wide = |tile: f32| layout_of(1020., 60, &[], Shape::Flat, Metrics::Grid { tile });
+        let (compact, comfortable, roomy) = (wide(124.), wide(150.), wide(184.));
+        assert_eq!(
+            (compact.columns, comfortable.columns, roomy.columns),
+            (7, 6, 5)
+        );
+        for wall in [&compact, &comfortable, &roomy] {
+            // The tiles reach both edges, the room left over between them.
+            let last = wall.columns - 1;
+            let right = wall.origin_of(last).map(|(x, _)| x + wall.tile);
+            assert!(
+                right.is_some_and(|right| (right - 1020.).abs() < 0.01),
+                "{wall:?}"
+            );
+            assert_eq!(wall.row_height, wall.tile + TEXT_HEIGHT);
+            assert!(wall.gap >= GAP_X);
+        }
+        assert_eq!(compact.tile, 124.);
+        // Beside the letters' lane there is less room.
+        let lettered = layout_of(
+            1020.,
+            25,
+            &letters(),
+            Shape::Lettered,
+            Metrics::Grid { tile: 184. },
+        );
+        assert_eq!((lettered.left, lettered.columns), (LANE, 4));
+    }
+
+    #[test]
+    fn a_list_or_a_table_is_one_row_to_a_line_with_nothing_between() {
+        let rows = Metrics::Rows { row: 36. };
+        let table = layout_of(1020., 25, &[], Shape::Flat, rows);
+        assert_eq!((table.columns, table.tile, table.gap), (1, 1020., 0.));
+        assert_eq!((table.row_height, table.pitch), (36., 36.));
+        assert_eq!(table.height, 25. * 36.);
+        assert_eq!(table.y_of(10), 360.);
+        assert_eq!(table.origin_of(10), Some((0., 360.)));
+        assert_eq!(table.index_at(361.), 10);
+        let lines = table.lines_between(100., 200.);
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| (line.first, line.count))
+                .collect::<Vec<_>>(),
+            [(2, 1), (3, 1), (4, 1), (5, 1)]
+        );
+        // Every arrow but ↑ and ↓ would stay in its line: here they all
+        // move a row.
+        use Step::*;
+        assert_eq!(
+            [
+                table.step_from(3, Down),
+                table.step_from(3, Up),
+                table.step_from(3, Right),
+                table.step_from(0, Up),
+                table.step_from(24, Down)
+            ],
+            [4, 2, 4, 0, 24]
+        );
+        assert_eq!(table.first_in_view(1., 400.), Some(1));
+        assert_eq!(
+            table.scroll_to_show(20, 0., 360., 0., 0.),
+            Some(21. * 36. - 360.)
+        );
+
+        // Under headings each group has its own, the rows running on under
+        // it, and under letters the rows start after the lane.
+        let headed = layout_of(1020., 25, &letters(), Shape::Headed, rows);
+        let (a, b) = (&headed.groups[0], &headed.groups[1]);
+        assert_eq!(a.height, LETTER_HEADING + 7. * 36.);
+        assert_eq!(b.top, a.height + LETTER_GAP);
+        assert_eq!(headed.y_of(7), b.top + LETTER_HEADING);
+        assert_eq!(headed.step_from(6, Down), 7);
+        assert_eq!(headed.step_from(7, Up), 6);
+        let lettered = layout_of(1020., 25, &letters(), Shape::Lettered, rows);
+        assert_eq!((lettered.left, lettered.tile), (LANE, 1020. - LANE));
+        assert_eq!(
+            lettered.origin_of(8),
+            Some((LANE, lettered.groups[1].top + 36.))
+        );
+        // A denser list is the same list, closer.
+        let dense = layout_of(1020., 25, &[], Shape::Flat, Metrics::Rows { row: 30. });
+        assert_eq!(dense.height, 25. * 30.);
     }
 
     #[test]

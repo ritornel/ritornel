@@ -1,7 +1,8 @@
-//! What the app remembers on this computer between runs: which wall and
-//! which order the Library shows, whether the large letters stand beside the
-//! walls, the section Settings was last left on, the place the music was
-//! sent to, and how the bar shows volume. It is the app's own,
+//! What the app remembers on this computer between runs: whether the large
+//! letters stand beside the walls, the section Settings was last left on,
+//! the place the music was sent to, and how the bar shows volume. Which
+//! wall and which order the Library showed are kept from before it had
+//! views, which open on them the first time (`views.rs`). It is the app's own,
 //! not the server's, and lives in the system's place for an app's settings.
 //! Remembering is a convenience: a file that cannot be read or written is
 //! the defaults.

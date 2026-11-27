@@ -42,6 +42,34 @@ const ICONS: &[(&str, &str, bool)] = &[
         false,
     ),
     ("plus", "M7 2h2v5h5v2H9v5H7V9H2V7h5z", false),
+    // How a view's rows are drawn: tiles, a list, a table.
+    (
+        "viewWall",
+        "M2.5 2.5h4.5v4.5H2.5zM9 2.5h4.5v4.5H9zM2.5 9h4.5v4.5H2.5zM9 9h4.5v4.5H9z",
+        true,
+    ),
+    (
+        "viewList",
+        "M2.5 3h2.5v2.5H2.5zM7.5 4.25h6M2.5 10.5h2.5V13H2.5zM7.5 11.75h6",
+        true,
+    ),
+    (
+        "viewTable",
+        "M2.5 3h11v10h-11zM2.5 6.4h11M2.5 9.7h11M6.3 6.4V13",
+        true,
+    ),
+    // The card that changes a view: two sliders.
+    (
+        "sliders",
+        "M2.5 5h5M11 5h2.5M2.5 11h2.5M8.5 11h5M7.5 5a1.75 1.75 0 1 0 3.5 0 1.75 1.75 0 1 0-3.5 0zM5 11a1.75 1.75 0 1 0 3.5 0 1.75 1.75 0 1 0-3.5 0z",
+        true,
+    ),
+    // A song with no picture of its own: a note.
+    (
+        "note",
+        "M6 12.2V3.5l7-1.5v8.7M6 12.2a2 2 0 1 1-4 0 2 2 0 0 1 4 0zM13 10.7a2 2 0 1 1-4 0 2 2 0 0 1 4 0z",
+        true,
+    ),
     (
         "check",
         "M6.2 11.3 2.9 8l-1.4 1.4 4.7 4.7L14.5 5.8l-1.4-1.4z",

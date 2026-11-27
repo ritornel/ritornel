@@ -62,6 +62,8 @@ pub(crate) fn act(wall: &mut Wall, row: &TileRow, item: &str, cx: &mut Context<W
             id,
             name: row.title.to_string(),
         },
+        // A song's menu is its own (`song_menu`).
+        Subject::Song => return,
     };
     wall.player
         .update(cx, |player, cx| player.many(many, doing, cx));

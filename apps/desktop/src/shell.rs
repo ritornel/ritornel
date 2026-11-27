@@ -324,6 +324,8 @@ impl Shell {
         );
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
+        // The wall's card gives the keys back to the shell too.
+        wall.update(cx, |wall, _| wall.home = Some(focus.clone()));
         // Search gives the keys back to the shell, whose keys are the
         // window's shortcuts.
         let search = cx.new(|cx| SearchBox::new(link.clone(), focus.clone(), window, cx));
@@ -623,6 +625,8 @@ impl Shell {
                 self.open_artist_from(artist, row.title.clone(), small, flight, window, cx);
                 return;
             }
+            // A song has no page: it is played where it is listed.
+            crate::wall::Subject::Song => return,
         };
         self.finish_carry(cx);
         let still = crate::platform::reduce_motion();
@@ -1140,7 +1144,7 @@ impl Shell {
 
     fn traced(&self, how: &str, cx: &gpui::App) {
         let page = match self.pages.current() {
-            Page::Library => format!("the {} wall", self.wall.read(cx).kind.name()),
+            Page::Library => format!("the {} view", self.wall.read(cx).config().id),
             Page::Album { album, .. } => format!("album “{}”", album.read(cx).row.title),
             Page::Artist { artist, .. } => format!("artist {}", artist.read(cx).artist_id),
             Page::History(_) => "History".to_owned(),
@@ -1995,8 +1999,11 @@ impl Render for Shell {
             // the arrows, Return and Esc.
             .on_key_down(
                 cx.listener(|shell, event: &gpui::KeyDownEvent, window, cx| {
-                    // Typing in the search field is the field's.
-                    if shell.search.read(cx).focused(window, cx) {
+                    // Typing in the search field is the field's, and so
+                    // is typing in a field of the card that changes a view.
+                    if shell.search.read(cx).focused(window, cx)
+                        || shell.wall.read(cx).typing(window, cx)
+                    {
                         return;
                     }
                     // The picker's keys while it is open, and ⌥↑ and ⌥↓

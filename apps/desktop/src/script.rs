@@ -8,7 +8,14 @@
 //! - `pull <points>`: pull the wall with a touchpad, held; `lift`: let go
 //! - `open <index>`: click the tile of that row (it must be drawn)
 //! - `type <text>`: each character a key; `key <name>`: one key, as `down` or `cmd-down`
-//! - `wall artists` or `wall albums <artist|title|year|added>`: as the controls choose
+//! - `wall artists` or `wall albums <artist|title|year|added>`: the Artists or the
+//!   Albums view, in that order
+//! - `view <id or name>`: show that view of the Library, as its pill does;
+//!   `preset <id>`: add a view ready made, as the + does, such as
+//!   `albums-by-decade`; `style wall|list|table`, `density
+//!   compact|comfortable|roomy`, `grouping <name>` and `sort <name>`: change
+//!   the view on show, as the card that customizes it does; `customize
+//!   open|close`: that card
 //! - `tab <name>`: go to a tab, as clicking it does
 //! - `back`; `up`: the banner's way back, on an album's page or an artist's;
 //!   `record <n>`: a click on the nth record of the page open
@@ -233,6 +240,16 @@ pub(crate) fn run(script: String, window: AnyWindowHandle, cx: &mut AsyncApp) ->
                             let wall = shell.read(cx).wall.clone();
                             wall.update(cx, |wall, cx| wall.choose(kind, order, cx));
                         }
+                    });
+                }
+                "view" | "preset" | "style" | "density" | "grouping" | "sort" | "customize" => {
+                    let said = rest.trim().to_owned();
+                    let _ = window.update(cx, |root, window, cx| {
+                        let Ok(shell) = root.downcast::<Shell>() else {
+                            return;
+                        };
+                        let wall = shell.read(cx).wall.clone();
+                        wall.update(cx, |wall, cx| view_step(wall, verb, &said, window, cx));
                     });
                 }
                 "tab" => {
@@ -637,6 +654,48 @@ pub(crate) fn run(script: String, window: AnyWindowHandle, cx: &mut AsyncApp) ->
 }
 
 /// A step of the Settings window's.
+/// A step that shows or changes one of the Library's views.
+fn view_step(
+    wall: &mut crate::wall::Wall,
+    step: &str,
+    said: &str,
+    window: &mut gpui::Window,
+    cx: &mut gpui::Context<crate::wall::Wall>,
+) {
+    use crate::views::{Density, Grouping, Presentation, ViewSort};
+    let done = match step {
+        "view" => wall
+            .views
+            .find(said)
+            .map(|index| wall.select(index, cx))
+            .is_some(),
+        "preset" => wall.add_template(said, cx),
+        "style" => Presentation::named(said)
+            .map(|presentation| wall.edit(|view| view.presentation = presentation, cx))
+            .is_some(),
+        "density" => Density::named(said)
+            .map(|density| wall.edit(|view| view.density = density, cx))
+            .is_some(),
+        "grouping" => Grouping::named(said)
+            .map(|grouping| wall.edit(|view| view.grouping = grouping, cx))
+            .is_some(),
+        "sort" => ViewSort::named(said)
+            .map(|sort| wall.edit(|view| view.sort = sort, cx))
+            .is_some(),
+        _ => {
+            if said == "close" {
+                wall.close_customize(window, cx);
+            } else {
+                wall.open_customize(cx);
+            }
+            true
+        }
+    };
+    if !done {
+        eprintln!("script: nothing for `{step} {said}`");
+    }
+}
+
 fn settings(rest: &str, cx: &mut AsyncApp) {
     use crate::settings::{self, Section};
     let words: Vec<&str> = rest.split_whitespace().collect();

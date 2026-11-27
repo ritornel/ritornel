@@ -185,6 +185,21 @@ impl Field {
         cx.notify();
     }
 
+    /// What is in it.
+    pub(crate) fn text(&self) -> &str {
+        &self.content
+    }
+
+    /// Puts `text` in it, the cursor after it, and says nothing of it:
+    /// what it holds is what it was told, not what was typed.
+    pub(crate) fn set(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.content = text.to_owned().into();
+        self.selected = text.len()..text.len();
+        self.reversed = false;
+        self.marked = None;
+        cx.notify();
+    }
+
     fn changed(&mut self, cx: &mut Context<Self>) {
         cx.emit(FieldEvent::Changed(self.content.clone()));
         cx.notify();

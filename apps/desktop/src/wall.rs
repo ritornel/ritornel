@@ -1,10 +1,20 @@
-//! The Library walls ("Library walls and cover loading" in
-//! docs/internals/desktop.md).
+//! The Library's wall ("Library views" and "Library walls and cover
+//! loading" in docs/internals/desktop.md).
 //!
-//! The wall keeps its own scroll position and draws only the lines of
-//! tiles in view, from scratch each frame (`layout.rs`). Rows are read a
-//! page of 100 at a time through a server view; covers come through
-//! `covers.rs`.
+//! The wall shows one of the Library's views (`views.rs`) at a time: the
+//! view says what is listed, in what order and under what headings, and
+//! whether the rows are drawn as tiles, as a list or as a table. The wall
+//! keeps its own scroll position and draws only the lines in view, from
+//! scratch each frame (`layout.rs`). Rows are read a page of 100 at a time
+//! through a server view; covers come through `covers.rs`.
+//!
+//! The controls over the wall are in `wall/bar.rs`, the card that changes
+//! the view on show in `wall/customize.rs`, and the rows of a list and a
+//! table in `wall/listing.rs`.
+
+mod bar;
+mod customize;
+mod listing;
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -21,19 +31,20 @@ use gpui::{
 };
 use ritornel_contract::methods::LibraryStats;
 use ritornel_contract::{
-    AlbumRef, Id, ListKind, ListOpenParams, NoParams, Query, Row, ServerRole, Sort, SortKey,
+    AlbumRef, Id, ListKind, ListOpenParams, NoParams, Query, Row, ServerRole, SongRow,
 };
 use tokio::sync::watch;
 
 use crate::blank::Blank;
 use crate::covers::{self, Cache, LoaderCounts, Wants};
 use crate::find::{Cut, cut};
-use crate::layout::{self, Layout, Shape, TILE};
+use crate::layout::{self, Layout, Metrics, Shape};
 use crate::link::{Link, LinkEvent, State};
 use crate::measure::{Fling, Stats};
 use crate::motion::Motion;
 use crate::net::Net;
 use crate::theme;
+use crate::views::{Entity, LibraryView, Presentation, ViewSort, Views};
 
 /// The page's top margin, heading, and controls row, scrolling away with
 /// the wall. The 30-point heading is set on a 1.4 line height (42 pt).
@@ -83,10 +94,50 @@ const TYPING: Duration = Duration::from_millis(1000);
 pub(crate) enum Subject {
     Album(AlbumRef),
     Artist(Id),
+    /// A song: its row's ID is its track appearance.
+    Song,
 }
 
-/// Which wall the Library shows ("Library walls and cover loading" in
-/// docs/internals/desktop.md).
+/// What a row says beside its name, for a list or a table to show.
+#[derive(Debug, Clone)]
+pub(crate) enum Detail {
+    Artist {
+        albums: u64,
+        songs: u64,
+    },
+    Album {
+        year: Option<i64>,
+        tracks: u64,
+        duration_ms: u64,
+        /// Its best copy, in a few words: "FLAC 24/96".
+        format: Option<SharedString>,
+    },
+    Song {
+        song: Box<SongRow>,
+        format: Option<SharedString>,
+    },
+}
+
+/// A format in a few words: "FLAC 24/96", "FLAC 16/44.1", "MP3 320".
+fn format_words(format: &ritornel_contract::Format) -> SharedString {
+    let codec = format.codec.to_uppercase();
+    let khz = f64::from(format.sample_rate_hz) / 1000.;
+    let khz = if khz.fract() == 0. {
+        format!("{khz:.0}")
+    } else {
+        format!("{khz:.1}")
+    };
+    match (format.lossless, format.bit_depth, format.bitrate_kbps) {
+        (true, Some(bits), _) => format!("{codec} {bits}/{khz}"),
+        (false, _, Some(kbps)) => format!("{codec} {kbps}"),
+        _ => codec,
+    }
+    .into()
+}
+
+/// The two walls the Library had before it had views: how a script, and
+/// the way up from an artist's page, still name the Artists and Albums
+/// views.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WallKind {
     Artists,
@@ -94,107 +145,21 @@ pub(crate) enum WallKind {
 }
 
 impl WallKind {
-    pub(crate) fn name(self) -> &'static str {
+    /// What it lists, and the ID of the view that opens with it.
+    const fn entity(self) -> Entity {
         match self {
-            Self::Artists => "artists",
-            Self::Albums => "albums",
+            Self::Artists => Entity::Artists,
+            Self::Albums => Entity::Albums,
         }
     }
-
-    /// A count of it: "1 album", "8,653 albums".
-    fn count(self, total: usize) -> String {
-        let (one, many) = match self {
-            Self::Artists => ("artist", "artists"),
-            Self::Albums => ("album", "albums"),
-        };
-        format!(
-            "{} {}",
-            thousands(total),
-            if total == 1 { one } else { many }
-        )
-    }
 }
 
-/// An order of a wall: its key, its name in the menu, and whether it is
-/// laid out under headings of time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Order {
-    pub key: SortKey,
-    pub label: &'static str,
-    pub dated: bool,
-    /// What the remembered choice calls it.
-    pub id: &'static str,
-}
+/// An order of a view, as a script names one.
+pub(crate) type Order = ViewSort;
 
-/// Each wall's sort orders, the first being the default it opens in.
-/// The Artists wall's one order, and the order a wall opens in when none was chosen.
-const BY_NAME: Order = Order {
-    key: SortKey::Name,
-    label: "Name",
-    dated: false,
-    id: "name",
-};
-const BY_ARTIST: Order = Order {
-    key: SortKey::Artist,
-    label: "Artist",
-    dated: false,
-    id: "artist",
-};
-const ARTIST_ORDERS: &[Order] = &[Order {
-    key: SortKey::Name,
-    label: "Name",
-    dated: false,
-    id: "name",
-}];
-const ALBUM_ORDERS: &[Order] = &[
-    Order {
-        key: SortKey::Artist,
-        label: "Artist",
-        dated: false,
-        id: "artist",
-    },
-    Order {
-        key: SortKey::Title,
-        label: "Title",
-        dated: false,
-        id: "title",
-    },
-    Order {
-        key: SortKey::Year,
-        label: "Year",
-        dated: true,
-        id: "year",
-    },
-    Order {
-        key: SortKey::Added,
-        label: "Recently added",
-        dated: true,
-        id: "added",
-    },
-];
-
-/// An order by the name the remembered choice gives it.
+/// An order by the name a script gives it.
 pub(crate) fn order_named(id: &str) -> Option<Order> {
-    ALBUM_ORDERS
-        .iter()
-        .chain(ARTIST_ORDERS)
-        .find(|order| order.id == id)
-        .copied()
-}
-
-/// The order a wall opens in.
-fn first_order(kind: WallKind) -> Order {
-    match kind {
-        WallKind::Artists => BY_NAME,
-        WallKind::Albums => BY_ARTIST,
-    }
-}
-
-fn orders(kind: WallKind) -> &'static [Order] {
-    match kind {
-        WallKind::Artists => ARTIST_ORDERS,
-        WallKind::Albums => ALBUM_ORDERS,
-    }
+    ViewSort::named(id)
 }
 
 pub(crate) struct TileRow {
@@ -216,6 +181,8 @@ pub(crate) struct TileRow {
     pub no_cover: Option<String>,
     /// A record's artist, the first its credit names: where Go to Artist goes.
     pub artist_id: Option<Id>,
+    /// What a list or a table says of it besides.
+    pub detail: Detail,
 }
 
 impl TileRow {
@@ -232,7 +199,17 @@ impl TileRow {
         let name = format!("{title}{artist}");
         let soft = theme::soft(&name);
         let no_cover = tile.art_id.is_none().then(|| name.clone());
+        let detail = Detail::Album {
+            year: tile.year,
+            tracks: tile.track_count,
+            duration_ms: tile.duration_ms,
+            format: tile
+                .quality
+                .as_ref()
+                .map(|quality| format_words(&quality.best)),
+        };
         Self {
+            detail,
             subject: Subject::Album(tile.album),
             id: tile.album.id(),
             names: (Some(artist.clone()), Some(title.clone())),
@@ -244,6 +221,64 @@ impl TileRow {
             soft,
             no_cover,
             artist_id,
+        }
+    }
+
+    /// A song as a wall's row has it. It has no picture of its own: its
+    /// soft colour is made from its record's name, so the songs of one
+    /// record wear one colour.
+    fn of_song(song: SongRow) -> Self {
+        let title = song.title.clone().unwrap_or_else(|| "Untitled".to_owned());
+        let artist_id = song
+            .artist_credit
+            .as_ref()
+            .and_then(|credit| credit.artist_ids.first().copied());
+        let artist = song
+            .artist_credit
+            .as_ref()
+            .map_or_else(|| "Unknown artist".to_owned(), |credit| credit.text.clone());
+        let name = format!(
+            "{}{artist}",
+            song.album_title.as_deref().unwrap_or(title.as_str())
+        );
+        // The best copy: lossless before lossy, then more bits, a higher rate.
+        let format = song
+            .copies
+            .iter()
+            .map(|copy| &copy.format)
+            .max_by_key(|format| {
+                (
+                    format.lossless,
+                    format.bit_depth.unwrap_or(0),
+                    format.sample_rate_hz,
+                    format.bitrate_kbps.unwrap_or(0),
+                )
+            })
+            .map(format_words);
+        Self {
+            subject: Subject::Song,
+            id: song.appearance_id,
+            names: (Some(artist.clone()), Some(title.clone())),
+            initial: SharedString::default(),
+            round: false,
+            title: title.into(),
+            artist: artist.into(),
+            art: None,
+            soft: theme::soft(&name),
+            no_cover: Some(name),
+            artist_id,
+            detail: Detail::Song {
+                song: Box::new(song),
+                format,
+            },
+        }
+    }
+
+    /// The song a row is of.
+    pub(crate) fn song(&self) -> Option<&SongRow> {
+        match &self.detail {
+            Detail::Song { song, .. } => Some(song),
+            _ => None,
         }
     }
 }
@@ -402,10 +437,26 @@ pub(crate) struct Wall {
     /// The server has let the view go: nothing is read through it until
     /// another takes its place.
     lost: bool,
-    /// Which wall, in which order, and whether the large letters stand beside it.
-    pub kind: WallKind,
-    pub order: Order,
+    /// The Library's views, the one on show among them, and whether the
+    /// large letters stand beside a view left to itself.
+    pub views: Views,
     letters: bool,
+    /// Where the strip of views is scrolled to, when they do not all fit,
+    /// and how many frames more it is asked to show the view on show.
+    strip: gpui::ScrollHandle,
+    strip_settles: u8,
+    /// The card that changes the view on show, and the fields on it.
+    customize: customize::Customize,
+    /// The shell's focus handle, which takes the keys back from a field.
+    pub home: Option<gpui::FocusHandle>,
+    /// The star the pointer is on, in a table of songs, and its row.
+    star: Option<(usize, u32)>,
+    /// The songs just queued with their +, for a moment.
+    added: HashMap<Id, gpui::Task<()>>,
+    /// The song whose menu is open, or closing, and how strongly it shows.
+    menued: Option<(String, f32)>,
+    /// The player, followed while songs are on show.
+    _player: gpui::Subscription,
     /// The stretch past either end.
     elastic: crate::elastic::Elastic,
     /// Coming up from an artist's page, the one you came from, to scroll
@@ -460,10 +511,27 @@ impl Wall {
                 cx.notify();
             }
         });
+        // The song playing, and stars set anywhere, show in a view of
+        // songs at once.
+        let heard = cx.observe(&player, |wall: &mut Self, _, cx| {
+            if wall.config().entity == Entity::Songs {
+                cx.notify();
+            }
+        });
+        let customize = customize::Customize::new(cx);
         let now = link.read(cx).net();
         let mut wall = Self {
             link,
             player,
+            views: Views::load(),
+            strip: gpui::ScrollHandle::new(),
+            strip_settles: 0,
+            customize,
+            home: None,
+            star: None,
+            added: HashMap::new(),
+            menued: None,
+            _player: heard,
             elastic: crate::elastic::Elastic::default(),
             reveal: None,
             locating: None,
@@ -517,22 +585,9 @@ impl Wall {
             opening: 0,
             heard_revision: 0,
             lost: false,
-            kind: WallKind::Artists,
-            order: BY_NAME,
             letters: true,
         };
-        let remembered = crate::remember::load();
         wall.letters = crate::remember::looks(cx).letters;
-        wall.kind = if remembered.wall == "albums" {
-            WallKind::Albums
-        } else {
-            WallKind::Artists
-        };
-        wall.order = orders(wall.kind)
-            .iter()
-            .find(|order| wall.kind == WallKind::Albums && order.id == remembered.albums_sort)
-            .copied()
-            .unwrap_or(first_order(wall.kind));
         if let Some(net) = now {
             wall.start(net, cx);
         }
@@ -717,42 +772,47 @@ impl Wall {
         self.failures = 0;
     }
 
-    /// How the wall is laid out: under headings of time for a date, else
-    /// under letters in their lane, or under small headings with the large
-    /// letters turned off.
+    /// The view on show.
+    pub(crate) fn config(&self) -> &LibraryView {
+        self.views.active()
+    }
+
+    /// How the wall is laid out: as the view on show says, given the
+    /// sections the server answered with.
     fn shape(&self) -> Shape {
-        if self.order.dated {
-            Shape::Dated
-        } else if self.letters {
-            Shape::Lettered
+        self.config().shape(&self.sections, self.letters)
+    }
+
+    /// Whether the rows are a table's, under its bar of columns.
+    fn table(&self) -> bool {
+        self.config().presentation == Presentation::Table
+    }
+
+    /// What is over the wall's first row: the page's header, and a table's
+    /// bar of columns.
+    fn head(&self) -> f32 {
+        HEADER + self.pinned()
+    }
+
+    /// What stays over the wall's rows however far it is scrolled: a
+    /// table's bar of columns.
+    fn pinned(&self) -> f32 {
+        if self.table() {
+            listing::COLUMN_BAR
         } else {
-            Shape::Headed
+            0.
         }
     }
 
-    /// Shows another wall or sort order from its top; the choice is
-    /// remembered.
-    pub(crate) fn choose(&mut self, kind: WallKind, order: Option<Order>, cx: &mut Context<Self>) {
-        let order = order.unwrap_or(if kind == self.kind {
-            self.order
-        } else {
-            first_order(kind)
-        });
-        let order = if kind == WallKind::Albums && order == BY_NAME {
-            BY_ARTIST
-        } else {
-            order
-        };
-        if (kind, order) == (self.kind, self.order) {
-            return;
-        }
+    /// Shows the view on show from its top: what was read for another
+    /// view, or for this one as it was, is let go.
+    fn show(&mut self, cx: &mut Context<Self>) {
         self.view = None;
-        if kind != WallKind::Artists {
+        if self.config().entity != Entity::Artists {
             self.reveal = None;
         }
         self.forget_asks();
-        self.kind = kind;
-        self.order = order;
+        self.clear_typed();
         self.pages.clear();
         self.pages_in_flight = 0;
         self.total = 0;
@@ -761,14 +821,96 @@ impl Wall {
         self.top = 0.;
         self.elastic.reset();
         self.failed = false;
-        let mut remembered = crate::remember::load();
-        remembered.wall = kind.name().to_owned();
-        if kind == WallKind::Albums {
-            remembered.albums_sort = order.id.to_owned();
-        }
-        crate::remember::save(&remembered);
+        self.star = None;
+        // The view's pill is brought into sight among the others.
+        self.strip.scroll_to_item(self.views.active_index());
         self.open(cx);
         cx.notify();
+    }
+
+    /// Shows the view at `index` among the views; the choice is kept.
+    pub(crate) fn select(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(view) = self.views.views.get(index) else {
+            return;
+        };
+        if view.id == self.views.active {
+            return;
+        }
+        self.views.active = view.id.clone();
+        self.views.save();
+        self.customize.fill(self.views.active(), cx);
+        self.show(cx);
+    }
+
+    /// Changes the view on show, and keeps the change. What the change
+    /// asks of the server opens the view again from its top; how the rows
+    /// are drawn only lays them out again, the row at the top staying
+    /// where it is.
+    pub(crate) fn edit(&mut self, change: impl FnOnce(&mut LibraryView), cx: &mut Context<Self>) {
+        let before = self.config().clone();
+        let mut after = before.clone();
+        change(&mut after);
+        let after = after.sanitized();
+        if after == before {
+            return;
+        }
+        let asks = (after.entity, after.query()) != (before.entity, before.query());
+        self.views.change(|view| *view = after);
+        self.views.save();
+        self.customize.fill(self.views.active(), cx);
+        if asks {
+            self.show(cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    /// Shows the Artists or the Albums view, as a script and the way up
+    /// from an artist's page ask for one: the first view of that entity,
+    /// in `order` if one is named.
+    pub(crate) fn choose(&mut self, kind: WallKind, order: Option<Order>, cx: &mut Context<Self>) {
+        let entity = kind.entity();
+        let before = (self.views.active.clone(), self.config().clone());
+        // The view that opens with the Library for it, or else its first.
+        let of_entity = |view: &&LibraryView| view.entity == entity;
+        let held = self
+            .views
+            .views
+            .iter()
+            .filter(of_entity)
+            .find(|view| view.id == entity.name())
+            .or_else(|| self.views.views.iter().find(of_entity))
+            .map(|view| view.id.clone());
+        match held {
+            Some(id) => self.views.active = id,
+            // Every view of it was taken away: it is given back as it comes.
+            None => {
+                let made = Views::default()
+                    .views
+                    .into_iter()
+                    .find(|view| view.entity == entity);
+                if let Some(view) = made {
+                    self.views.add(view);
+                }
+            }
+        }
+        if let Some(order) = order {
+            self.views.change(|view| view.sort = order);
+        }
+        if (self.views.active.clone(), self.config().clone()) == before {
+            return;
+        }
+        self.views.save();
+        self.customize.fill(self.views.active(), cx);
+        self.show(cx);
+    }
+
+    /// Adds a view to the Library, and shows it.
+    pub(crate) fn add(&mut self, view: LibraryView, cx: &mut Context<Self>) {
+        self.views.add(view);
+        self.views.save();
+        self.customize.fill(self.views.active(), cx);
+        self.show(cx);
     }
 
     /// Jumps to the first row at `index`, its line at the top: under a
@@ -778,16 +920,18 @@ impl Wall {
         let under = match layout.shape {
             Shape::Dated => 56.,
             Shape::Headed => 36.,
-            Shape::Lettered => 0.,
+            Shape::Lettered | Shape::Flat => 0.,
         };
-        self.top = (HEADER + layout.y_of(index) - under).max(0.);
+        // Clear of a table's bar of columns, which stays over the rows.
+        let top = HEADER + layout.y_of(index) - under;
+        self.top = top.max(0.);
         self.elastic.reset();
     }
 
     /// Up from an artist's page: returns to the Artists wall at that artist,
     /// highlighting their tile briefly.
     pub(crate) fn reveal(&mut self, artist: Id, cx: &mut Context<Self>) {
-        if self.kind != WallKind::Artists {
+        if self.config().entity != Entity::Artists {
             self.reveal = Some(artist);
             self.choose(WallKind::Artists, None, cx);
         } else {
@@ -958,6 +1102,10 @@ impl Wall {
             cx.notify();
             return true;
         }
+        if self.customize.open && keys.key == "escape" {
+            self.close_customize(window, cx);
+            return true;
+        }
         match keys.key.as_str() {
             "left" | "right" | "up" | "down" if plain => {
                 let step = match keys.key.as_str() {
@@ -1013,10 +1161,6 @@ impl Wall {
         let continues = !self.typed.is_empty() && character == " ";
         if !(starts || continues) || character.chars().count() != 1 {
             return false;
-        }
-        // Sorted by when added there is no name to find.
-        if self.order.key == SortKey::Added {
-            return true;
         }
         self.typed.push_str(character);
         self.ask(window, cx);
@@ -1157,23 +1301,20 @@ impl Wall {
                 let Some(row) = rows_of(rows).into_iter().flatten().next() else {
                     return;
                 };
-                let names: Vec<String> = if wall.order.key == SortKey::Year {
-                    wall.sections
-                        .iter()
-                        .find(|(_, start)| *start == index)
-                        .map(|(label, _)| label.clone())
-                        .into_iter()
-                        .collect()
-                } else if row.round {
-                    [row.names.0.clone(), row.names.1.clone()]
-                        .into_iter()
-                        .flatten()
-                        .collect()
-                } else if wall.order.key == SortKey::Title {
-                    row.names.1.clone().into_iter().collect()
+                // What was found begins with what was typed: the name the
+                // order files the row under first, then its other names,
+                // then the heading of a section found by its label.
+                let (first, second) = if wall.config().sort == ViewSort::Title {
+                    (row.names.1.clone(), row.names.0.clone())
                 } else {
-                    row.names.0.clone().into_iter().collect()
+                    (row.names.0.clone(), row.names.1.clone())
                 };
+                let heading = wall
+                    .sections
+                    .iter()
+                    .find(|(_, start)| *start == index)
+                    .map(|(label, _)| label.clone());
+                let names: Vec<String> = [first, second, heading].into_iter().flatten().collect();
                 let Some(found) = names.iter().find_map(|name| cut(name, &typed)) else {
                     wall.shown = Some((typed, None));
                     cx.notify();
@@ -1200,7 +1341,8 @@ impl Wall {
             return;
         };
         let viewport = viewport_of(window).1;
-        let wall_top = self.top - HEADER;
+        let head = self.head();
+        let wall_top = self.top - head;
         let index = match &self.selected {
             // Read in a view since replaced: it is found again in this one.
             Some(selected) if selected.view != view => return,
@@ -1227,14 +1369,20 @@ impl Wall {
     /// gap clear of the edges; up to the wall's first line brings the page's
     /// top with it.
     fn keep_in_view(&mut self, index: usize, viewport: f32) {
+        let (head, pinned) = (self.head(), self.pinned());
         let Some(layout) = &self.layout else { return };
-        let wall_top = self.top - HEADER;
-        if let Some(next) = layout.scroll_to_show(index, wall_top, viewport, 0., layout::GAP_Y) {
+        let wall_top = self.top - head;
+        // Tiles keep a gap clear of the edges; rows meet them.
+        let margin = match layout.metrics {
+            Metrics::Grid { .. } => layout::GAP_Y,
+            Metrics::Rows { .. } => 0.,
+        };
+        if let Some(next) = layout.scroll_to_show(index, wall_top, viewport, pinned, margin) {
             self.elastic.reset();
             self.top = if next < wall_top && layout.y_of(index) == layout.y_of(0) {
                 0.
             } else {
-                (HEADER + next).max(0.)
+                (head + next).max(0.)
             };
         }
     }
@@ -1257,7 +1405,12 @@ impl Wall {
     fn open_selected(&mut self, cx: &mut Context<Self>) {
         let viewport = self.viewport;
         if let Some((row, index, art)) = self.reach(viewport) {
-            cx.emit(OpenAlbum { row, index, art });
+            // A song is played, the list following; anything else opens.
+            if row.song().is_some() {
+                self.play_from(index, cx);
+            } else {
+                cx.emit(OpenAlbum { row, index, art });
+            }
         }
     }
 
@@ -1268,7 +1421,12 @@ impl Wall {
             self.menu_open = Some(index);
             cx.notify();
             let at = gpui::point(art.origin.x + px(20.), art.origin.y + art.size.height);
-            crate::menu::record_menu(row, at, window, cx);
+            if row.song().is_some() {
+                self.menu_open = None;
+                self.song_menu(index, at, window, cx);
+            } else {
+                crate::menu::record_menu(row, at, window, cx);
+            }
         }
     }
 
@@ -1291,11 +1449,12 @@ impl Wall {
             return;
         }
         self.revision = event.library_revision;
+        let head = self.head();
         let pages: Vec<usize> = self
             .layout
             .as_ref()
             .and_then(|layout| {
-                let wall_top = self.top - HEADER;
+                let wall_top = self.top - head;
                 let lines =
                     layout.lines_between(wall_top - self.viewport, wall_top + 2. * self.viewport);
                 let (first, last) = (lines.first()?, lines.last()?);
@@ -1388,16 +1547,12 @@ impl Wall {
             self.open(cx);
             return;
         };
-        let wall_top = (self.top - HEADER).max(0.);
+        let wall_top = (self.top - self.head()).max(0.);
         let index = layout.index_at(wall_top);
         let anchor = self.row(index);
         let screen = layout.y_of(index) - wall_top;
         let client = Arc::clone(&net.client);
-        let kind = match self.kind {
-            WallKind::Artists => ListKind::Artists,
-            WallKind::Albums => ListKind::Albums,
-        };
-        let key = self.order.key;
+        let (kind, query) = self.asked_for();
         self.opening += 1;
         let asked = self.opening;
         let selected = self.selected.clone();
@@ -1408,10 +1563,7 @@ impl Wall {
                 &client,
                 &ListOpenParams {
                     kind,
-                    query: Query {
-                        sort: Some(vec![Sort { key }]),
-                        ..Query::default()
-                    },
+                    query,
                     window: Some(ritornel_contract::Window {
                         offset,
                         limit: PAGE as u64,
@@ -1566,6 +1718,13 @@ impl Wall {
         self.view.as_ref().map(|held| held.id.as_str())
     }
 
+    /// What the server is asked for: the view on show, as a list and a
+    /// query.
+    fn asked_for(&self) -> (ListKind, Query) {
+        let view = self.config();
+        (view.entity.kind(), view.query())
+    }
+
     /// Opens the view again in a moment, if it has still not been read.
     fn try_again_soon(&mut self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
@@ -1600,11 +1759,7 @@ impl Wall {
             return;
         }
         let client = Arc::clone(&net.client);
-        let kind = match self.kind {
-            WallKind::Artists => ListKind::Artists,
-            WallKind::Albums => ListKind::Albums,
-        };
-        let key = self.order.key;
+        let (kind, query) = self.asked_for();
         self.opening += 1;
         let asked = self.opening;
         let opened = net.rt().spawn(async move {
@@ -1612,10 +1767,7 @@ impl Wall {
                 &client,
                 &ListOpenParams {
                     kind,
-                    query: Query {
-                        sort: Some(vec![Sort { key }]),
-                        ..Query::default()
-                    },
+                    query,
                     window: Some(ritornel_contract::Window {
                         offset: 0,
                         limit: PAGE as u64,
@@ -1789,7 +1941,7 @@ impl Wall {
 
     /// The height of the page: header, wall and foot.
     fn content_height(&self) -> f32 {
-        HEADER + self.layout.as_ref().map_or(0., |layout| layout.height) + FOOT
+        self.head() + self.layout.as_ref().map_or(0., |layout| layout.height) + FOOT
     }
 
     /// Moves the page `dy` points down, as a scroll event or the measure's fling does.
@@ -1868,6 +2020,7 @@ impl Wall {
         let Some(layout) = self.layout.clone() else {
             return;
         };
+        let head = self.head();
         let regions = self.regions(viewport, now);
         let moving = self.motion.moving(now, Duration::from_secs(3)) || self.fling.is_some();
         let capacity = (self.covers_capacity(px) * 4 / 5).max(32);
@@ -1875,7 +2028,7 @@ impl Wall {
         let mut wanted = HashSet::new();
         let mut pages = Vec::new();
         for (from, to, visible) in regions {
-            let lines = layout.lines_between(from - HEADER, to - HEADER);
+            let lines = layout.lines_between(from - head, to - head);
             // Nearest the start of the region first, in the direction it is read.
             for line in &lines {
                 for page in [line.first / PAGE, (line.first + line.count - 1) / PAGE] {
@@ -1996,10 +2149,15 @@ fn rows_of(rows: Vec<Row>) -> Vec<Option<Arc<TileRow>>> {
                     soft: theme::soft(&soft_name),
                     no_cover: artist.art_id.is_none().then_some(soft_name),
                     artist_id: Some(artist.artist_id),
+                    detail: Detail::Artist {
+                        albums: artist.album_count,
+                        songs: artist.track_count,
+                    },
                 }))
             }
             Row::Album(tile) => Some(Arc::new(TileRow::of_album(tile))),
-            _ => None,
+            Row::Song(song) => Some(Arc::new(TileRow::of_song(song))),
+            Row::Gone(_) => None,
         })
         .collect()
 }
@@ -2039,20 +2197,32 @@ impl Wall {
         let width = window_width - rail;
         self.viewport = viewport;
         let scale = window.scale_factor();
-        let px_size = (TILE * scale).ceil() as u32;
+        // How the view on show is drawn: as tiles, a list or a table, and
+        // how large its pictures are.
+        let config = self.config().clone();
+        let presentation = config.presentation;
+        let side = config.art_side();
+        let px_size = (side * scale).ceil() as u32;
+        let head = self.head();
+        self.menued = crate::menu::marked(window, cx).filter(|(key, _)| key.starts_with("song:"));
 
         // Nothing to show yet, or nothing to show: the page says why. An
-        // empty wall keeps its controls, so that the other can be chosen.
+        // empty view keeps its controls, so that another can be chosen and
+        // this one changed.
         if let Some(blank) = self.blank(cx) {
             let controls = self.view.is_some() && self.total == 0 && !self.failed;
+            let gutter = gutter(width);
             let (top, header) = if controls {
-                (
-                    HEADER,
-                    self.header(gutter(width), gutter(width) + rail, 20., cx),
-                )
+                let wide = width - 2. * gutter;
+                (HEADER, self.header(gutter, gutter + rail, 20., wide, cx))
             } else {
-                let name = name_row(gutter(width), gutter(width) + rail, 20., None);
+                let name = name_row(gutter, gutter + rail, 20., None);
                 (HEADER - 66., name.into_any_element())
+            };
+            let card = if controls {
+                self.customize_card(gutter + rail, 0., viewport, window, cx)
+            } else {
+                Vec::new()
             };
             return div()
                 .id("wall")
@@ -2068,6 +2238,7 @@ impl Wall {
                         .right_0()
                         .child(blank.render(viewport)),
                 )
+                .children(card)
                 .into_any_element();
         }
 
@@ -2088,26 +2259,32 @@ impl Wall {
         let gutter = gutter(width);
         self.gutter = gutter;
         let wall_width = width - 2. * gutter;
+        let (shape, metrics) = (self.shape(), config.metrics());
         let relayout = match &self.layout {
             None => true,
-            Some(layout) => layout.width != wall_width || layout.shape != self.shape(),
+            Some(layout) => {
+                layout.width != wall_width || layout.shape != shape || layout.metrics != metrics
+            }
         };
         if relayout && self.total > 0 {
-            let next = layout::layout(wall_width, self.total, &self.sections, self.shape());
-            // A resize keeps the row at the top where it was on screen.
+            // With another width the strip of views may hide the one on show.
+            self.strip_settles = 2;
+            let next = layout::layout_of(wall_width, self.total, &self.sections, shape, metrics);
+            // A resize, or rows drawn another way, keeps the row at the top
+            // where it was on screen.
             if let Some(before) = &self.layout
-                && self.top > HEADER
+                && self.top > head
             {
-                let keep = before.index_at(self.top - HEADER);
-                let offset = before.y_of(keep) - (self.top - HEADER);
-                self.top = HEADER + next.y_of(keep) - offset;
+                let keep = before.index_at(self.top - head);
+                let offset = before.y_of(keep) - (self.top - head);
+                self.top = head + next.y_of(keep) - offset.min(next.row_height);
             }
             self.layout = Some(next);
             // After a replacement, the anchor row back where it was on screen.
             if let (Some((index, screen)), Some(layout)) =
                 (self.pending_anchor.take(), &self.layout)
             {
-                self.top = (HEADER + layout.y_of(index) - screen).max(0.);
+                self.top = (head + layout.y_of(index) - screen).max(0.);
             }
         }
         // Up from an artist's page, centre their tile on screen.
@@ -2115,7 +2292,7 @@ impl Wall {
             self.reveal_at = None;
             crate::debug(format_args!("wall: revealing row {index}"));
             let under = ((viewport - layout.pitch) / 2.).max(0.);
-            self.top = HEADER + layout.y_of(index) - under;
+            self.top = head + layout.y_of(index) - under;
             self.elastic.reset();
         }
         let max = (self.content_height() - viewport).max(0.);
@@ -2125,7 +2302,9 @@ impl Wall {
         theme::flush_soft(window, cx);
         // Three seconds at rest, the covers held come down to about two screens.
         if !self.motion.moving(started, Duration::from_secs(3)) && self.fling.is_none() {
-            let screen = (viewport / 219. + 1.) * (width / 168.);
+            let screen = self.layout.as_ref().map_or(0., |layout| {
+                (viewport / layout.pitch + 1.) * layout.columns as f32
+            });
             let keep = (screen * 2.) as usize * (px_size as usize).pow(2) * 4;
             let frame = self.frame;
             self.covers.trim(frame, keep, window, cx);
@@ -2143,6 +2322,14 @@ impl Wall {
             }));
         }
 
+        // The strip scrolls to a pill by where the frame before drew it, so
+        // after a change of width it is asked again once the width holds.
+        if self.strip_settles > 0 {
+            self.strip_settles -= 1;
+            self.strip.scroll_to_item(self.views.active_index());
+            window.request_animation_frame();
+        }
+
         let mut children: Vec<AnyElement> = Vec::new();
         // Where the wall is drawn: past either end while it is stretched.
         if self.elastic.step(started) {
@@ -2152,7 +2339,7 @@ impl Wall {
 
         // The name and the row of controls, scrolling away with the wall.
         if top < HEADER {
-            children.push(self.header(gutter, gutter + rail, 20. - top, cx));
+            children.push(self.header(gutter, gutter + rail, 20. - top, wall_width, cx));
         }
 
         let mut tiles_in_view = 0usize;
@@ -2161,7 +2348,7 @@ impl Wall {
         let mut in_view = HashSet::new();
         let mut seen = HashSet::new();
         if let Some(layout) = self.layout.clone() {
-            let wall_top = top - HEADER;
+            let wall_top = top - head;
             let lines = layout.lines_between(wall_top - layout.pitch * 0.5, wall_top + viewport);
             let moving = self.motion.moving(started, Duration::from_millis(450));
             let ink = letter_ink(&self.motion, started);
@@ -2170,8 +2357,9 @@ impl Wall {
             }
             // What stands over each group: in the lettered shape the large
             // letter in its lane, held 30 points under the top while its
-            // tiles pass; otherwise a heading over its tiles, a small
-            // letter's or a stretch of time's, that scrolls away with them.
+            // rows pass; under headings one over its rows, a small
+            // letter's or a larger one for a stretch of time, that scrolls
+            // away with them; flat, nothing.
             let shown_from = layout
                 .groups
                 .partition_point(|group| group.top + group.height < wall_top);
@@ -2181,9 +2369,10 @@ impl Wall {
                 .skip(shown_from)
                 .take_while(|group| group.top <= wall_top + viewport)
             {
-                let group_top = HEADER + group.top - top;
+                let group_top = head + group.top - top;
                 let label = group.label.clone();
                 match layout.shape {
+                    Shape::Flat => {}
                     Shape::Lettered => {
                         let y = (group_top - 6.)
                             .max(30.)
@@ -2267,9 +2456,8 @@ impl Wall {
                     }
                 }
             }
-            let _ = moving;
             for line in &lines {
-                let y = HEADER + line.y - top;
+                let y = head + line.y - top;
                 let visible = y + layout.row_height > 0. && y < viewport;
                 for index in line.first..line.first + line.count {
                     let (x, _) = layout.tile_origin(line, index);
@@ -2281,7 +2469,15 @@ impl Wall {
                     let entered = visible && !self.seen.contains(&index);
                     let mut shown = false;
                     let element = match &row {
-                        None => placeholder(index).into_any_element(),
+                        None => match presentation {
+                            Presentation::Wall => placeholder(index, side).into_any_element(),
+                            Presentation::List | Presentation::Table => listing::placeholder(
+                                index,
+                                layout.row_height,
+                                presentation == Presentation::Table,
+                            )
+                            .into_any_element(),
+                        },
                         Some(row) => {
                             let cover = row.art.and_then(|art| {
                                 if visible {
@@ -2343,10 +2539,42 @@ impl Wall {
                             if here > 0. || grow > 1. {
                                 window.request_animation_frame();
                             }
-                            tile(
-                                index, row, ground, cover, selected, here, grow, away, px_size, cx,
-                            )
-                            .into_any_element()
+                            let art = listing::Art {
+                                ground,
+                                cover,
+                                side,
+                                px: px_size,
+                                away,
+                            };
+                            match presentation {
+                                Presentation::Wall => {
+                                    let playing = row.song().is_some_and(|song| {
+                                        self.player.read(cx).appearance()
+                                            == Some(song.appearance_id)
+                                    });
+                                    let mark = playing.then(|| self.player.read(cx).equalizer(cx));
+                                    tile(index, row, art, selected, here, grow, mark, cx)
+                                        .into_any_element()
+                                }
+                                Presentation::List => self.list_row(
+                                    index,
+                                    row,
+                                    art,
+                                    here,
+                                    layout.tile,
+                                    layout.row_height,
+                                    cx,
+                                ),
+                                Presentation::Table => self.table_row(
+                                    index,
+                                    row,
+                                    art,
+                                    here,
+                                    layout.tile,
+                                    layout.row_height,
+                                    cx,
+                                ),
+                            }
                         }
                     };
                     if visible && shown {
@@ -2363,11 +2591,17 @@ impl Wall {
                             .absolute()
                             .left(px(gutter + x))
                             .top(px(y))
-                            .w(px(TILE))
+                            .w(px(layout.tile))
                             .child(element)
                             .into_any_element(),
                     );
                 }
+            }
+            // A table's bar of columns: over the first row at rest, and
+            // held at the top of the page once the rows pass under it.
+            if presentation == Presentation::Table {
+                let y = (HEADER - top).max(0.);
+                children.push(self.column_bar(gutter, y, layout.tile, side, cx));
             }
             // A thin bar while the wall moves, as the system's overlay scroller has it.
             if moving || self.fling.is_some() {
@@ -2394,6 +2628,7 @@ impl Wall {
         if let Some(at) = self.index_at {
             children.extend(self.index(at, cx));
         }
+        children.extend(self.customize_card(gutter + rail, top, viewport, window, cx));
         if fading {
             window.request_animation_frame();
         }
@@ -2642,6 +2877,18 @@ impl Wall {
             return Some(blank);
         }
         if self.view.is_some() && self.total == 0 {
+            // A view narrowed to nothing is not an empty library.
+            let view = self.config();
+            if !view.filter.is_empty() {
+                return Some(Blank::new(
+                    "Nothing in this view.",
+                    format!(
+                        "No {} match what “{}” is narrowed to. Customize changes that.",
+                        view.entity.name(),
+                        view.title()
+                    ),
+                ));
+            }
             let (title, then) = empty_words(self.songs);
             let mut blank = Blank::new(
                 title,
@@ -2654,141 +2901,6 @@ impl Wall {
             return Some(blank);
         }
         None
-    }
-}
-
-impl Wall {
-    /// The page's name and how many there are, and one row of controls
-    /// under it, which wall at the left and the order at the right, scrolling
-    /// away with the wall.
-    fn header(&self, gutter: f32, right: f32, y: f32, cx: &mut Context<Self>) -> AnyElement {
-        let segment = |kind: WallKind, label: &'static str, on: bool, cx: &mut Context<Self>| {
-            let base = div()
-                .id(label)
-                .flex()
-                .items_center()
-                .h(px(28.))
-                .px(px(13.))
-                .rounded(px(8.))
-                .whitespace_nowrap()
-                .on_click(cx.listener(move |wall, _, _, cx| wall.choose(kind, None, cx)));
-            if on {
-                base.bg(theme::raised())
-                    .text_color(theme::ink())
-                    .font_weight(FontWeight(600.))
-                    .shadow(vec![theme::css_shadow(1., 3., gpui::rgba(0x00000024))])
-                    .child(label)
-            } else {
-                base.text_color(theme::dim())
-                    .font_weight(FontWeight(500.))
-                    .hover(theme::hovered_ink)
-                    .active(theme::pressed)
-                    .child(label)
-            }
-        };
-        let count = (self.view.is_some() && self.total > 0).then(|| self.kind.count(self.total));
-        let choices = orders(self.kind);
-        let order = self.order;
-        let empty = self.view.is_some() && self.total == 0;
-        let sort = (choices.len() > 1 && !empty).then(|| {
-            div()
-                .flex()
-                .items_center()
-                .gap(px(8.))
-                .text_size(px(13.))
-                .text_color(theme::dim())
-                .child("Sort by")
-                .child(
-                    // A native pop-up menu as wide as its longest order,
-                    // "Recently added".
-                    div()
-                        .id("sort")
-                        .relative()
-                        .flex()
-                        .items_center()
-                        .w(px(141.))
-                        .h(px(30.))
-                        .pl(px(12.))
-                        .rounded(px(8.))
-                        .bg(theme::fill())
-                        .hover(theme::hovered_on_fill)
-                        .active(theme::pressed)
-                        .text_color(theme::ink())
-                        .font_weight(FontWeight(600.))
-                        .on_click(cx.listener(move |_, event: &gpui::ClickEvent, window, cx| {
-                            let window = window.window_handle();
-                            let at = event.position();
-                            let checked = choices.iter().position(|each| *each == order);
-                            let labels = choices.iter().map(|each| each.label.to_owned()).collect();
-                            cx.spawn(async move |wall, cx| {
-                                let chosen =
-                                    crate::menu::choose(window, labels, checked, at, cx).await;
-                                if let Some(order) =
-                                    chosen.and_then(|index| choices.get(index)).copied()
-                                {
-                                    let _ = wall.update(cx, |wall, cx| {
-                                        wall.choose(WallKind::Albums, Some(order), cx)
-                                    });
-                                }
-                            })
-                            .detach();
-                        }))
-                        .child(order.label)
-                        .child(
-                            div()
-                                .absolute()
-                                .right(px(9.))
-                                .top(px(8.))
-                                // In the accent, as the system's pop-ups
-                                // have theirs.
-                                .child(crate::icons::icon("chevron", 14., theme::acc())),
-                        ),
-                )
-        });
-        div()
-            .absolute()
-            .left(px(gutter))
-            .right(px(right))
-            .top(px(y))
-            .flex()
-            .flex_col()
-            .child(
-                div()
-                    .relative()
-                    .h(px(42.))
-                    .mb(px(6.))
-                    .child(name_row(0., 0., 0., count)),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(22.))
-                    .h(px(52.))
-                    .child(
-                        div()
-                            .flex()
-                            .p(px(2.))
-                            .rounded(px(10.))
-                            .bg(theme::fill())
-                            .text_size(px(13.))
-                            .child(segment(
-                                WallKind::Artists,
-                                "Artists",
-                                self.kind == WallKind::Artists,
-                                cx,
-                            ))
-                            .child(segment(
-                                WallKind::Albums,
-                                "Albums",
-                                self.kind == WallKind::Albums,
-                                cx,
-                            )),
-                    )
-                    .child(div().flex_1())
-                    .children(sort),
-            )
-            .into_any_element()
     }
 }
 
@@ -2805,17 +2917,17 @@ pub(crate) fn thousands(value: usize) -> String {
 }
 
 /// A tile whose row has not been read: the same size, quiet bars for its words.
-fn placeholder(index: usize) -> impl IntoElement {
+fn placeholder(index: usize, side: f32) -> impl IntoElement {
     let first = 52. + ((index * 37) % 34) as f32;
     let second = 34. + ((index * 53) % 28) as f32;
     div()
         .flex()
         .flex_col()
-        .child(div().size(px(TILE)).rounded(px(10.)).bg(theme::fill()))
+        .child(div().size(px(side)).rounded(px(10.)).bg(theme::fill()))
         .child(
             div().mt(px(9.)).h(px(20.)).flex().items_center().child(
                 div()
-                    .w(px(TILE * first / 100.))
+                    .w(px(side * first / 100.))
                     .h(px(10.))
                     .rounded(px(5.))
                     .bg(theme::fill()),
@@ -2824,7 +2936,7 @@ fn placeholder(index: usize) -> impl IntoElement {
         .child(
             div().h(px(18.)).flex().items_center().child(
                 div()
-                    .w(px(TILE * second / 100.))
+                    .w(px(side * second / 100.))
                     .h(px(9.))
                     .rounded(px(5.))
                     .bg(theme::fill()),
@@ -2832,23 +2944,31 @@ fn placeholder(index: usize) -> impl IntoElement {
         )
 }
 
+/// One tile of a wall: its picture `art.side` square, and its two lines
+/// under it. `playing` is the moving bars of the song playing, when the
+/// tile is that song's.
 #[allow(clippy::too_many_arguments)]
 fn tile(
     index: usize,
     row: &Arc<TileRow>,
-    ground: (Hsla, Hsla),
-    cover: Option<(Arc<gpui::RenderImage>, f32)>,
+    art: listing::Art,
     selected: bool,
     here: f32,
     grow: f32,
-    away: bool,
-    px_size: u32,
+    playing: Option<crate::marks::Equalizer>,
     cx: &mut Context<Wall>,
 ) -> impl IntoElement {
+    let listing::Art {
+        ground,
+        cover,
+        side: tile_side,
+        px: px_size,
+        away,
+    } = art;
     // An artist is drawn round, a record with corners of 10.
     // Settling, the art is drawn larger about its centre, its place the same.
-    let side = TILE * grow;
-    let spill = (side - TILE) / 2.;
+    let side = tile_side * grow;
+    let spill = (side - tile_side) / 2.;
     let radius = if row.round { side / 2. } else { 10. };
     let group: SharedString = format!("tile-{index}").into();
     let mut art = div()
@@ -2906,6 +3026,39 @@ fn tile(
                 .child(row.initial.clone()),
         );
     }
+    // A song has no picture of its own: over its record's soft colours, a
+    // round Play under the pointer, which plays from it, and the moving
+    // bars while it plays.
+    if row.song().is_some() && !away {
+        let button = div()
+            .absolute()
+            .right(px(10.))
+            .bottom(px(10.))
+            .size(px(34.))
+            .rounded_full()
+            .bg(gpui::rgba(0x000000a6))
+            .flex()
+            .items_center()
+            .justify_center();
+        art = art.child(match playing {
+            Some(bars) => button
+                .child(bars.draw(gpui::rgb(0xffffff)))
+                .into_any_element(),
+            None => button
+                .id(("play", index))
+                .invisible()
+                .group_hover(group.clone(), |style| style.visible())
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |wall, _, _, cx| {
+                        cx.stop_propagation();
+                        wall.play_from(index, cx);
+                    }),
+                )
+                .child(crate::icons::icon("play", 13., gpui::rgb(0xffffff)))
+                .into_any_element(),
+        });
+    }
     // A hairline inside the edge, so a dark cover meets a dark page cleanly.
     art = art.when(!away, |art| {
         art.child(
@@ -2949,8 +3102,14 @@ fn tile(
                 }),
         );
     }
+    // Under a song, who it is by and how long it is.
+    let under: SharedString = match row.song().and_then(|song| song.duration_ms) {
+        Some(ms) => format!("{} · {}", row.artist, crate::words::clock(ms.max(0) as u64)).into(),
+        None => row.artist.clone(),
+    };
     let open_row = Arc::clone(row);
     let menu_row = Arc::clone(row);
+    let song = row.song().is_some();
     div()
         .id(("tile", index))
         .group(group)
@@ -2979,30 +3138,46 @@ fn tile(
                 .text_color(theme::dim())
                 .w_full()
                 .truncate()
-                .child(row.artist.clone()),
+                .child(under),
         )
-        .on_click(
-            cx.listener(move |wall, event: &gpui::ClickEvent, _window, cx| {
-                if event.standard_click() {
-                    let at = event.position();
-                    let _ = at;
-                    let art = wall.art_bounds(index);
-                    if let Some(art) = art {
+        .when(selected, |tile| {
+            tile.on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        })
+        // A record or an artist opens on a click; a song plays on a
+        // double-click, the view following it.
+        .when(!song, |tile| {
+            tile.on_click(
+                cx.listener(move |wall, event: &gpui::ClickEvent, _window, cx| {
+                    if event.standard_click()
+                        && let Some(art) = wall.art_bounds(index)
+                    {
                         cx.emit(OpenAlbum {
                             row: Arc::clone(&open_row),
                             index,
                             art,
                         });
                     }
-                }
-            }),
-        )
-        .when(selected, |tile| {
-            tile.on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                }),
+            )
+        })
+        .when(song, |tile| {
+            tile.on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |wall, event: &gpui::MouseDownEvent, _, cx| {
+                    if event.click_count == 2 {
+                        wall.play_from(index, cx);
+                    }
+                }),
+            )
         })
         .on_mouse_down(
             MouseButton::Right,
             cx.listener(move |wall, event: &gpui::MouseDownEvent, window, cx| {
+                if menu_row.song().is_some() {
+                    cx.stop_propagation();
+                    wall.song_menu(index, event.position, window, cx);
+                    return;
+                }
                 wall.menu_open = Some(index);
                 cx.notify();
                 crate::menu::record_menu(Arc::clone(&menu_row), event.position, window, cx);
@@ -3011,15 +3186,23 @@ fn tile(
 }
 
 impl Wall {
-    /// Where row `index`'s art is in the window now.
+    /// Where row `index`'s art is in the window now: a tile's picture, or
+    /// the small one at the start of a row of a list or a table.
     pub(crate) fn art_bounds(&self, index: usize) -> Option<Bounds<Pixels>> {
-        let (x, y) = self.layout.as_ref()?.origin_of(index)?;
+        let layout = self.layout.as_ref()?;
+        let (x, y) = layout.origin_of(index)?;
+        let side = self.config().art_side();
+        // A row's picture is inset from its edge and centred in its height.
+        let (dx, dy) = match layout.metrics {
+            Metrics::Grid { .. } => (0., 0.),
+            Metrics::Rows { row } => (10., (row - side) / 2.),
+        };
         Some(Bounds::new(
             point(
-                px(self.gutter + x),
-                px(self.origin_y + HEADER + y - self.top - self.elastic.shown()),
+                px(self.gutter + x + dx),
+                px(self.origin_y + self.head() + y + dy - self.top - self.elastic.shown()),
             ),
-            size(px(TILE), px(TILE)),
+            size(px(side), px(side)),
         ))
     }
 }
@@ -3124,6 +3307,8 @@ mod tests {
         /// Calls received and not yet answered.
         unanswered: Arc<std::sync::atomic::AtomicUsize>,
         failing: Arc<std::sync::atomic::AtomicBool>,
+        /// What each view was opened with, in order.
+        opened: Arc<Mutex<Vec<Value>>>,
     }
 
     const ROWS: u64 = 1_000;
@@ -3201,6 +3386,10 @@ mod tests {
             let answer = match request.method.as_str() {
                 "list.open" => {
                     *views += 1;
+                    self.opened
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(request.params.clone().unwrap_or_default());
                     let offset = number("/window/offset");
                     serde_json::to_value(ritornel_contract::ListOpened {
                         view: format!("view {views}"),
@@ -3246,6 +3435,22 @@ mod tests {
 
         fn asked(&self, method: &str) -> usize {
             self.lock().get(method).copied().unwrap_or(0)
+        }
+
+        /// What the last view opened was asked for: its kind and its query.
+        fn last_open(&self) -> (Value, Value) {
+            let opened = self
+                .opened
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let said = |key: &str| {
+                opened
+                    .last()
+                    .and_then(|last| last.get(key))
+                    .cloned()
+                    .unwrap_or_default()
+            };
+            (said("kind"), said("query"))
         }
     }
 
@@ -3418,5 +3623,212 @@ mod tests {
         wall.update(cx, |wall, cx| wall.restated(back, cx));
         until(&wall, &fake, cx, |wall| read(wall) == PAGES);
         assert_eq!(fake.asked("list.open"), 1);
+    }
+
+    /// Runs the window until the wall has opened `opens` views and read
+    /// what it asked of them.
+    fn opened(
+        wall: &gpui::Entity<Wall>,
+        fake: &Fake,
+        opens: usize,
+        cx: &mut gpui::VisualTestContext,
+    ) {
+        let asked = fake.clone();
+        until(wall, fake, cx, move |wall| {
+            asked.asked("list.open") == opens && wall.view.is_some() && wall.layout.is_some()
+        });
+    }
+
+    #[gpui::test]
+    fn a_view_is_asked_of_the_server_as_it_says_and_again_only_when_that_changes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fake = Fake::default();
+        let (wall, cx) = wall(Net::satellite(fake.client(), true), cx);
+        draw(&wall, &fake, 1, cx);
+        opened(&wall, &fake, 1, cx);
+        // The Library opens on its first view, the artists by name, with
+        // the sections left to the order.
+        assert_eq!(
+            fake.last_open(),
+            (json!("artists"), json!({ "sort": [{ "key": "name" }] }))
+        );
+
+        // The way a script and the way up from an artist's page name the
+        // Albums view still works, and an order named with it is taken.
+        wall.update(cx, |wall, cx| {
+            wall.choose(WallKind::Albums, order_named("year"), cx);
+        });
+        draw(&wall, &fake, 1, cx);
+        opened(&wall, &fake, 2, cx);
+        assert_eq!(
+            fake.last_open(),
+            (json!("albums"), json!({ "sort": [{ "key": "year" }] }))
+        );
+        assert_eq!(
+            wall.read_with(cx, |wall, _| wall.config().id.clone()),
+            "albums"
+        );
+
+        // How the rows are drawn asks nothing: the same view, laid out as
+        // rows, and then as smaller tiles.
+        let metrics = |cx: &mut gpui::VisualTestContext| {
+            wall.read_with(cx, |wall, _| {
+                wall.layout.as_ref().map(|layout| layout.metrics)
+            })
+        };
+        assert_eq!(metrics(cx), Some(Metrics::Grid { tile: 150. }));
+        wall.update(cx, |wall, cx| {
+            wall.edit(|view| view.presentation = Presentation::Table, cx);
+        });
+        draw(&wall, &fake, 2, cx);
+        assert_eq!(metrics(cx), Some(Metrics::Rows { row: 36. }));
+        wall.update(cx, |wall, cx| {
+            wall.edit(
+                |view| {
+                    view.presentation = Presentation::Wall;
+                    view.density = crate::views::Density::Compact;
+                },
+                cx,
+            );
+        });
+        draw(&wall, &fake, 2, cx);
+        assert_eq!(metrics(cx), Some(Metrics::Grid { tile: 124. }));
+        assert_eq!(fake.asked("list.open"), 2);
+
+        // Its headings and what it is narrowed to are the server's to
+        // work out: each opens the view again.
+        wall.update(cx, |wall, cx| {
+            wall.edit(|view| view.grouping = crate::views::Grouping::Decade, cx);
+        });
+        draw(&wall, &fake, 1, cx);
+        opened(&wall, &fake, 3, cx);
+        assert_eq!(
+            fake.last_open().1,
+            json!({ "sort": [{ "key": "year" }], "groupBy": "decade" })
+        );
+        assert!(wall.update(cx, |wall, cx| wall.add_template("unplayed-albums", cx)));
+        draw(&wall, &fake, 1, cx);
+        opened(&wall, &fake, 4, cx);
+        assert_eq!(
+            fake.last_open(),
+            (
+                json!("albums"),
+                json!({
+                    "filter": { "version": 1, "where": { "is": "play_count", "max": 0 } },
+                    "sort": [{ "key": "added" }],
+                    "groupBy": "added",
+                })
+            )
+        );
+        let shown = wall.read_with(cx, |wall, _| {
+            let names: Vec<String> = wall
+                .views
+                .views
+                .iter()
+                .map(|view| view.name.clone())
+                .collect();
+            (names, wall.views.active.clone())
+        });
+        assert_eq!(
+            shown,
+            (
+                ["Artists", "Albums", "Songs", "Unplayed Albums"]
+                    .map(str::to_owned)
+                    .to_vec(),
+                "unplayed-albums".to_owned()
+            )
+        );
+        assert!(!wall.update(cx, |wall, cx| wall.add_template("no-such-view", cx)));
+    }
+
+    #[gpui::test]
+    fn the_card_takes_the_keys_while_a_field_has_them_and_gives_them_back(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use customize::Which;
+        let fake = Fake::default();
+        let (wall, cx) = wall(Net::satellite(fake.client(), true), cx);
+        // The shell's handle, which has the keys while no field does.
+        let home = cx.update(|window, cx| {
+            let home = cx.focus_handle();
+            window.focus(&home, cx);
+            home
+        });
+        wall.update(cx, |wall, cx| {
+            wall.home = Some(home.clone());
+            wall.open_customize(cx);
+        });
+        draw(&wall, &fake, 1, cx);
+        opened(&wall, &fake, 1, cx);
+        let typing = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, cx| wall.read(cx).typing(window, cx))
+        };
+        assert!(!typing(cx));
+        assert_eq!(
+            wall.read_with(cx, |wall, cx| wall.field_text(Which::Name, cx)),
+            "Artists"
+        );
+
+        // With a field focused the keys are the field's.
+        wall.update_in(cx, |wall, window, cx| {
+            wall.focus_field(Which::Name, window, cx)
+        });
+        assert!(typing(cx));
+        // A name is kept as it is typed, and asks the server nothing.
+        wall.update(cx, |wall, cx| wall.type_into(Which::Name, "Everyone", cx));
+        assert_eq!(
+            wall.read_with(cx, |wall, _| wall.config().name.clone()),
+            "Everyone"
+        );
+        draw(&wall, &fake, 1, cx);
+        assert_eq!(fake.asked("list.open"), 1);
+
+        // Esc puts the card away, and the shell has the keys again.
+        let escape = gpui::KeyDownEvent {
+            keystroke: gpui::Keystroke {
+                modifiers: gpui::Modifiers::default(),
+                key: "escape".to_owned(),
+                key_char: None,
+            },
+            is_held: false,
+            prefer_character_input: false,
+        };
+        let taken = wall.update_in(cx, |wall, window, cx| wall.key(&escape, window, cx));
+        assert!(taken);
+        assert!(!wall.read_with(cx, |wall, _| wall.customize.open));
+        assert!(!typing(cx));
+        assert!(cx.update(|window, _| home.is_focused(window)));
+
+        // What a view contains is asked for once the typing rests, not at
+        // each key.
+        wall.update(cx, |wall, cx| {
+            wall.choose(WallKind::Albums, None, cx);
+            wall.open_customize(cx);
+        });
+        draw(&wall, &fake, 1, cx);
+        opened(&wall, &fake, 2, cx);
+        for typed in ["n", "ni", "night "] {
+            wall.update(cx, |wall, cx| wall.type_into(Which::Text, typed, cx));
+        }
+        wall.update(cx, |wall, cx| wall.type_into(Which::From, "1990", cx));
+        draw(&wall, &fake, 1, cx);
+        assert_eq!(fake.asked("list.open"), 2);
+        cx.executor().advance_clock(Duration::from_secs(1));
+        draw(&wall, &fake, 1, cx);
+        opened(&wall, &fake, 3, cx);
+        assert_eq!(
+            fake.last_open().1,
+            json!({
+                "text": "night",
+                "filter": { "version": 1, "where": { "is": "year_range", "from": 1990 } },
+                "sort": [{ "key": "artist" }],
+            })
+        );
+        // The field keeps the space typed after the word.
+        assert_eq!(
+            wall.read_with(cx, |wall, cx| wall.field_text(Which::Text, cx)),
+            "night "
+        );
     }
 }
