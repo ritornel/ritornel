@@ -327,8 +327,8 @@ impl Server {
         }
         if listen.is_private() {
             warn!(
-                "listening on the private network: what is sent is plain HTTP, which anyone on \
-                 the same network can read"
+                "listening on the private network: satellites reach this server over TLS, and \
+                 any other client over plain HTTP, which anyone on the same network can read"
             );
         }
         let worker = Worker::start(Arc::clone(&core), boot_id, run.scan).map_err(Error::Runtime)?;

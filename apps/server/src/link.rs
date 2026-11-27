@@ -173,9 +173,10 @@ pub(crate) fn found_routes(port: u16) -> Vec<String> {
 }
 
 /// Whether `ip` is an address a satellite may dial: this machine, or one
-/// on a private or link-local network or a tailnet, never a public
-/// address. What travels on a route is plain HTTP, so it must not leave
-/// home, or must travel inside a tailnet's own encryption.
+/// on a private or link-local network or in the shared address space
+/// tailnets use, never a public address. That bounds who can reach the
+/// hub's listener. What travels is TLS pinned to the hub's key, which is
+/// what keeps it private and proves the hub ([`crate::tls`]).
 pub(crate) fn is_private_route(ip: IpAddr) -> bool {
     !ip.is_unspecified() && Listen::private_on_port(0).admits(ip)
 }
@@ -210,8 +211,8 @@ pub(crate) fn check_routes(routes: &[String]) -> Result<(), String> {
             }
             if !is_private_route(address.ip()) {
                 return Err(format!(
-                    "{route} is not on a private network or a tailnet, and a link travels as \
-                     plain HTTP"
+                    "{route} is not on a private network or a tailnet, and a hub listens on \
+                     no other"
                 ));
             }
         } else if !is_name_and_port(route) {
@@ -253,14 +254,12 @@ pub(crate) async fn within<T>(
 /// The addresses `route` dials now: an address as it is, a name as the
 /// system resolves it at this moment, by DNS or multicast DNS. Only IPv4
 /// addresses on a private network or a tailnet are kept: the hub listens
-/// on IPv4, and what travels is plain HTTP.
+/// on IPv4, and on no other network.
 ///
 /// A name that answers with another machine, by mistake or by spoofing,
-/// gets nothing from the satellite but a nonce: [`reach`] asks whatever
-/// answers to prove it holds the hub's key first. What the proof cannot
-/// stop is what plain HTTP cannot: someone able to relay traffic on the
-/// network reads what travels, by a name as by an address. That is why a
-/// route must be private, or inside a tailnet's own encryption.
+/// gets nothing from the satellite: every connection is TLS pinned to the
+/// hub's key, and one that answers with another key is closed in the
+/// handshake, before anything is sent ([`crate::tls::dial`]).
 pub(crate) async fn resolve(route: &str) -> Result<Vec<SocketAddr>, String> {
     let found: Vec<SocketAddr> = within(RESOLVE_WAIT, async {
         tokio::net::lookup_host(route)
@@ -449,10 +448,11 @@ async fn resolve_recently(route: &str) -> Resolved {
     resolved
 }
 
-/// Asks the server at `route` for its descriptor with a fresh nonce, and
-/// returns it if that server is the hub `hub`: it has that ID, proves it
-/// holds `key`, is a hub, and speaks this server's contract. Nothing but
-/// the nonce is sent.
+/// Asks the server at `route` for its descriptor with a fresh nonce, over
+/// TLS pinned to `key`, and returns it if that server is the hub `hub`: it
+/// has that ID, proves it holds `key`, is a hub, and speaks this server's
+/// contract. A satellite joining asks it before it sends the invite's
+/// secret. Nothing but the nonce is sent.
 pub(crate) async fn reach(
     route: SocketAddr,
     hub: Id,
