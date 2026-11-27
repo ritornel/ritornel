@@ -640,7 +640,8 @@ impl SearchBox {
                 cx.stop_propagation();
             });
         if self.view.failed {
-            card = card.child(empty("The library could not be searched."));
+            card = card
+                .child(empty("The library could not be searched.").text_color(theme::fail_text()));
         } else if self.view.hits.is_empty() {
             card = card.child(empty("Nothing in your library matches."));
         }
@@ -812,7 +813,7 @@ impl SearchBox {
     }
 }
 
-fn empty(text: &'static str) -> impl IntoElement {
+fn empty(text: &'static str) -> gpui::Div {
     div()
         .px(px(12.))
         .py(px(14.))

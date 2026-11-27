@@ -9,7 +9,8 @@ use gpui::{
 };
 use ritornel_client::record;
 use ritornel_contract::{
-    RecordProblem, RecordProblemKind, RecordStatus, WatchState, WatchedFolder, WatchedKind,
+    JobState, RecordProblem, RecordProblemKind, RecordStatus, WatchState, WatchedFolder,
+    WatchedKind,
 };
 
 use super::act;
@@ -22,7 +23,7 @@ use super::words::{
     Clock, is_ended, last_auto, pictures_found, scan_ended, scan_progress, unbroken_paths,
     watch_state, when,
 };
-use crate::theme;
+use crate::theme::{self, Status};
 use crate::words::thousands;
 
 /// How the server watches a folder, at the right of its row, while it watches.
@@ -36,12 +37,35 @@ fn watching(folder: Option<&WatchedFolder>, on: bool, clock: &Clock) -> Option<i
             .child(
                 div()
                     .when(folder.state == WatchState::Offline, |state| {
-                        state.text_color(theme::warn())
+                        state.text_color(theme::need_text())
                     })
                     .child(watch_state(folder)),
             )
-            .children(last_auto(folder, clock).map(sub)),
+            .children(last_auto(folder, clock).map(|said| {
+                let failed = folder
+                    .last_auto
+                    .as_ref()
+                    .is_some_and(|run| run.state == JobState::Failed);
+                sub(said).when(failed, |said| said.text_color(theme::fail_text()))
+            })),
     )
+}
+
+/// The colour of a thing that stops the record advancing ("Status" in
+/// docs/internals/desktop.md): amber while it waits on someone and nothing
+/// is lost yet, red while listens or scrobbles are lost or what would say
+/// so cannot be read. The notes are said quietly.
+fn record_status(kind: RecordProblemKind) -> Status {
+    match kind {
+        RecordProblemKind::SignInNeeded | RecordProblemKind::ListensUndelivered => Status::Need,
+        RecordProblemKind::ListenUnsaved
+        | RecordProblemKind::ScrobblesRefused
+        | RecordProblemKind::ImportFailed
+        | RecordProblemKind::Unreadable => Status::Fail,
+        RecordProblemKind::ScrobblesUnknown | RecordProblemKind::ScrobblesWithdrawn => {
+            Status::Quiet
+        }
+    }
 }
 
 /// Whether the listening record advances: a quiet line while it does, and
@@ -106,7 +130,9 @@ fn record(
                     grow()
                         .child(
                             div()
-                                .when(*warning, |what| what.text_color(theme::warn()))
+                                .when(*warning, |what| {
+                                    what.text_color(record_status(problem.kind).text())
+                                })
                                 .child(record::what(problem)),
                         )
                         .child(sub_wraps(said))
@@ -234,9 +260,14 @@ pub(super) fn render(
         )
     } else if let Some(last) = last {
         // A scan's failure can be long: two lines of it.
+        let failed = last.state == JobState::Failed;
         Some(
             div()
-                .text_color(theme::dim())
+                .text_color(if failed {
+                    theme::fail_text()
+                } else {
+                    theme::dim()
+                })
                 .line_clamp(2)
                 .text_ellipsis()
                 .child(unbroken_paths(&scan_ended(last, clock)))
@@ -402,4 +433,32 @@ pub(super) fn render(
         .children(record)
         .child(music)
         .child(artists)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn what_stops_the_record_is_amber_while_nothing_is_lost_and_red_once_it_is() {
+        assert_eq!(record_status(RecordProblemKind::SignInNeeded), Status::Need);
+        assert_eq!(
+            record_status(RecordProblemKind::ListensUndelivered),
+            Status::Need
+        );
+        for lost in [
+            RecordProblemKind::ListenUnsaved,
+            RecordProblemKind::ScrobblesRefused,
+            RecordProblemKind::ImportFailed,
+            RecordProblemKind::Unreadable,
+        ] {
+            assert_eq!(record_status(lost), Status::Fail, "{lost:?}");
+        }
+        for note in [
+            RecordProblemKind::ScrobblesUnknown,
+            RecordProblemKind::ScrobblesWithdrawn,
+        ] {
+            assert_eq!(record_status(note), Status::Quiet, "{note:?}");
+        }
+    }
 }

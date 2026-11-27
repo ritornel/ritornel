@@ -110,6 +110,12 @@ const PICTURES: &[(&str, &str)] = &[
         "settings/ring",
         r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 14 14"><path fill-rule="evenodd" d="M7 0a7 7 0 1 1 0 14A7 7 0 1 1 7 0zm0 2a5 5 0 1 0 0 10A5 5 0 1 0 7 2z" fill="black"/></svg>"#,
     ),
+    // What is being done: three quarters of a ring, from the top round
+    // to the left, that turns (`marks::Mark`).
+    (
+        "marks/working",
+        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M8 1.5A6.5 6.5 0 1 1 1.5 8" fill="none" stroke="black" stroke-width="3" stroke-linecap="round"/></svg>"#,
+    ),
     (
         "settings/arc",
         r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 14 14"><path d="M2.05 2.05a7 7 0 0 1 9.9 0l-1.41 1.41a5 5 0 0 0-7.08 0z" fill="black"/></svg>"#,

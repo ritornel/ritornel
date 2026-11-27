@@ -13,9 +13,10 @@ use gpui::{
 };
 
 use crate::icons::icon;
+use crate::marks::Mark;
 use crate::platform;
 use crate::stage::Tab;
-use crate::theme;
+use crate::theme::{self, Status};
 use crate::wall::TITLE_BAR;
 
 actions!(
@@ -160,8 +161,8 @@ pub(crate) type OnTab = std::rc::Rc<dyn Fn(Tab, &mut gpui::Window, &mut App)>;
 pub(crate) struct Server {
     /// The name it is shown by.
     pub name: SharedString,
-    /// Whether the computer the library is on has gone: the dot is then an
-    /// amber ring.
+    /// Whether the computer the library is on has gone: the green dot is
+    /// then an amber ring.
     pub away: bool,
     /// What it says while the pointer is on it: a first line and a second,
     /// which may be empty.
@@ -184,8 +185,9 @@ pub(crate) fn title_bar(
     over_picture: bool,
     // The connection, or `None` when there is none.
     server: Option<Server>,
-    // What is said while there is none.
-    unconnected: &'static str,
+    // What is said while there is none, and its status: working while the
+    // server is looked for or prepares, failed when there is none to reach.
+    unconnected: (&'static str, Status),
     search: gpui::AnyElement,
     on_back: impl Fn(&gpui::ClickEvent, &mut gpui::Window, &mut App) + 'static,
     on_tab: OnTab,
@@ -308,14 +310,24 @@ pub(crate) fn title_bar(
         })
 }
 
-/// The connection's dot and name, and what hovering them says.
-fn connection(server: Option<Server>, unconnected: &'static str) -> impl IntoElement {
-    let dot = div().size(px(7.)).flex_none().rounded_full();
-    let dot = match &server {
-        Some(server) if server.away => dot.border(px(1.5)).border_color(theme::warn()),
-        Some(_) => dot.bg(gpui::rgb(0x3fae6a)),
-        None => dot.bg(theme::fill2()),
-    };
+/// How big the connection's mark is, in points.
+const CONNECTION_MARK: f32 = 8.;
+
+/// The connection's mark: green while connected, an amber ring while the
+/// hub does not answer, and otherwise what is said while there is none.
+fn connection_mark(away: Option<bool>, unconnected: Status) -> Mark {
+    match away {
+        Some(true) => Mark::away(Status::Need),
+        Some(false) => Mark::here(Status::Ok),
+        None => Mark::here(unconnected),
+    }
+}
+
+/// The connection's mark and name, and what hovering them says.
+fn connection(server: Option<Server>, unconnected: (&'static str, Status)) -> impl IntoElement {
+    let (unconnected, status) = unconnected;
+    let dot =
+        connection_mark(server.as_ref().map(|server| server.away), status).draw(CONNECTION_MARK);
     let Some(Server {
         name,
         card,
@@ -463,4 +475,29 @@ fn caption_button(
         })
         .active(theme::pressed)
         .child(glyph)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_connection_s_mark_follows_the_server_and_what_is_said_without_one() {
+        assert_eq!(
+            connection_mark(Some(false), Status::Fail),
+            Mark::here(Status::Ok)
+        );
+        assert_eq!(
+            connection_mark(Some(true), Status::Ok),
+            Mark::away(Status::Need)
+        );
+        assert_eq!(
+            connection_mark(None, Status::Working),
+            Mark::here(Status::Working)
+        );
+        assert_eq!(
+            connection_mark(None, Status::Fail),
+            Mark::here(Status::Fail)
+        );
+    }
 }

@@ -945,7 +945,7 @@ fn trouble_lines((wrong, then): (String, String)) -> [gpui::Div; 2] {
             .truncate()
             .text_size(px(13.))
             .line_height(px(16.))
-            .text_color(theme::warn())
+            .text_color(theme::fail_text())
             .child(wrong),
         div()
             .truncate()

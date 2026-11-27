@@ -6,8 +6,9 @@
 //! On this computer it is the icon alone, or under `always` a slider led
 //! by a volume icon. Playing elsewhere it lights up: an accent tint from
 //! end to end, the place's name, faded at its end rather than cut short,
-//! and that place's volume under it. A place in trouble wears the warning
-//! colour, and its slider dims and stops answering.
+//! and that place's volume under it. A place in trouble wears its
+//! trouble's colour, amber out of reach and red when its output failed, and
+//! its slider dims and stops answering.
 //!
 //! The slider sends about ten times a second while it is dragged and once
 //! more when let go, and holds its own level against the place's reports
@@ -31,6 +32,7 @@ use crate::icons::icon;
 use crate::places::{Look, Places, line, plays, waves};
 use crate::player::Player;
 use crate::theme;
+use crate::theme::Status;
 
 /// The widget's width, in every state.
 pub(crate) const WIDTH: f32 = 164.;
@@ -259,10 +261,10 @@ fn name_width(name: &str, window: &Window) -> f32 {
 }
 
 /// What hovering the widget shows: the whole name, and in trouble the
-/// whole sentence.
+/// whole sentence, in the trouble's colour.
 struct HoverCard {
     name: SharedString,
-    more: Option<SharedString>,
+    more: Option<(SharedString, Status)>,
 }
 
 impl Render for HoverCard {
@@ -285,7 +287,7 @@ impl Render for HoverCard {
             .children(
                 self.more
                     .clone()
-                    .map(|more| div().text_color(theme::warn()).child(more)),
+                    .map(|(more, status)| div().text_color(status.text()).child(more)),
             )
     }
 }
@@ -310,6 +312,8 @@ pub(crate) struct Speaker {
     scroll_ends: Option<Task<()>>,
     gate: ScrollGate,
     light: Light,
+    /// The status of the trouble last shown, kept while its colour fades.
+    trouble: Status,
     /// The name last lit, kept while it goes out.
     lit_name: Option<SharedString>,
     slider: Rc<Cell<Option<Bounds<Pixels>>>>,
@@ -345,6 +349,7 @@ impl Speaker {
             scroll_ends: None,
             gate: ScrollGate::default(),
             light: Light::default(),
+            trouble: Status::Need,
             lit_name: None,
             slider: Rc::default(),
             icon_bounds: Rc::default(),
@@ -775,6 +780,9 @@ impl Render for Speaker {
         let (lit, warn) = match &look {
             Look::There { name, trouble, .. } => {
                 self.lit_name = Some(name.clone().into());
+                if let Some(trouble) = trouble {
+                    self.trouble = trouble.status();
+                }
                 (true, trouble.is_some())
             }
             _ => (false, false),
@@ -787,7 +795,8 @@ impl Render for Speaker {
         if !lit && shown.tint <= 0. {
             self.lit_name = None;
         }
-        let color = theme::mix(theme::acc(), theme::warn(), shown.warn);
+        // The trouble's text form, since the speaker icon is drawn in it.
+        let color = theme::mix(theme::acc(), self.trouble.text(), shown.warn);
         // The tint's colour over the bar, for the name's fade to end in.
         let ground = theme::mix(theme::bar_bg(), color, theme::LIT_TINT);
         let (icon_shown, slider, answers, trouble, name) = match &look {
@@ -917,9 +926,12 @@ impl Render for Speaker {
             .map(|name| {
                 (
                     name.clone(),
-                    trouble
-                        .as_ref()
-                        .map(|trouble| SharedString::from(trouble.sentence(&clock))),
+                    trouble.as_ref().map(|trouble| {
+                        (
+                            SharedString::from(trouble.sentence(&clock)),
+                            trouble.status(),
+                        )
+                    }),
                 )
             });
         let body = match (&name, slider) {

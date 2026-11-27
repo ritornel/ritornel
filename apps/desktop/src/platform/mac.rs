@@ -175,6 +175,10 @@ pub(crate) const FITTING_SHOWS: bool = true;
 /// What a button that shows a folder in Finder says.
 pub(crate) const SHOW_FOLDER: &str = "Show in Finder";
 
+/// The accent AppKit's controls wear on Multicolor, where the system names
+/// none (`accents`): its blue, as a switch that is on draws it.
+pub(crate) const CONTROL_ACCENT: u32 = 0x027affff;
+
 /// What the picker calls the computer the app runs on.
 pub(crate) const THIS_COMPUTER: &str = "This Mac";
 

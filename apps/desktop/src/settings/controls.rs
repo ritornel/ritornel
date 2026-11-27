@@ -143,9 +143,18 @@ pub(crate) fn sub_wraps(text: impl Into<SharedString>) -> Div {
 
 /// A label and its value at the right.
 pub(crate) fn label_value(label: impl Into<SharedString>, value: impl Into<SharedString>) -> Div {
+    label_status(label, value, theme::Status::Quiet)
+}
+
+/// A label and its value at the right, in the value's status's colour.
+pub(crate) fn label_status(
+    label: impl Into<SharedString>,
+    value: impl Into<SharedString>,
+    status: theme::Status,
+) -> Div {
     row().child(div().flex_1().child(label.into())).child(
         div()
-            .text_color(theme::dim())
+            .text_color(status.text())
             .text_right()
             .child(value.into()),
     )
@@ -174,7 +183,7 @@ pub(crate) fn problem(text: impl Into<SharedString>) -> Div {
         .mx(px(2.))
         .text_size(px(11.))
         .line_height(px(SMALL_LINE))
-        .text_color(theme::warn())
+        .text_color(theme::fail_text())
         .child(text.into())
 }
 

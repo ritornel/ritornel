@@ -14,6 +14,7 @@ mod banner;
 mod bar;
 mod blank;
 mod blur;
+mod button;
 mod carry;
 mod covers;
 mod drawn;

@@ -29,6 +29,7 @@ use ritornel_contract::Event;
 use ritornel_contract::local::Preparing;
 
 use crate::net::{Net, rt};
+use crate::theme::Status;
 
 /// Why there is no server to talk to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +108,25 @@ pub(crate) fn preparing_words(step: Preparing) -> (&'static str, &'static str) {
         }
     };
     ("Updating your library…", text)
+}
+
+/// What the title bar says while there is no session, and its status:
+/// working while the server prepares the library, is looked for, starts or
+/// is looked for again after the connection was lost, and failed when there
+/// is no server, or none that answers or that the app can talk to.
+fn unconnected(preparing: Option<Preparing>, state: &State) -> (&'static str, Status) {
+    match (preparing, state) {
+        (Some(_), _) => ("Updating your library…", Status::Working),
+        (
+            None,
+            State::Looking
+            | State::Away {
+                why: Why::Starting | Why::Lost,
+                ..
+            },
+        ) => ("Connecting…", Status::Working),
+        _ => ("Not connected", Status::Fail),
+    }
 }
 
 #[derive(Clone)]
@@ -268,19 +288,9 @@ impl Link {
         crate::platform::started_here(holder).then_some(holder)
     }
 
-    /// What the title bar says while there is no session.
-    pub(crate) fn unconnected(&self) -> &'static str {
-        match (self.preparing, &self.state) {
-            (Some(_), _) => "Updating your library…",
-            (
-                None,
-                State::Looking
-                | State::Away {
-                    why: Why::Starting, ..
-                },
-            ) => "Connecting…",
-            _ => "Not connected",
-        }
+    /// What the title bar says while there is no session, and its status.
+    pub(crate) fn unconnected(&self) -> (&'static str, Status) {
+        unconnected(self.preparing, &self.state)
     }
 
     /// Reads what the server holding the directory says it is preparing,
@@ -683,5 +693,40 @@ mod launch_tests {
         );
         assert!(!spawned);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_title_bar_is_working_while_it_connects_and_failed_with_no_server() {
+        let away = |why| State::Away {
+            why,
+            message: None,
+            data_dir: None,
+        };
+        let working = ("Connecting…", Status::Working);
+        let failed = ("Not connected", Status::Fail);
+        assert_eq!(unconnected(None, &State::Looking), working);
+        assert_eq!(unconnected(None, &away(Why::Starting)), working);
+        assert_eq!(unconnected(None, &away(Why::Lost)), working);
+        for why in [
+            Why::NotRunning,
+            Why::Unreachable,
+            Why::Incompatible,
+            Why::Failed,
+        ] {
+            assert_eq!(unconnected(None, &away(why)), failed, "{why:?}");
+        }
+        // Preparing the library, or saving a copy of it first, is working
+        // whatever else is so.
+        for step in [Preparing::Backup, Preparing::Migration, Preparing::History] {
+            assert_eq!(
+                unconnected(Some(step), &away(Why::Failed)),
+                ("Updating your library…", Status::Working)
+            );
+        }
     }
 }

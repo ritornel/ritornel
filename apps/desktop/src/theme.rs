@@ -67,8 +67,11 @@ pub(crate) fn surf() -> Rgba {
 pub(crate) fn raised() -> Rgba {
     pick(RAISED)
 }
+/// A neutral control's ground, as a secondary button's.
+const FILL: Token = (0xffffff12, 0x1c22300f);
+
 pub(crate) fn fill() -> Rgba {
-    pick((0xffffff12, 0x1c22300f))
+    pick(FILL)
 }
 pub(crate) fn fill2() -> Rgba {
     pick((0xffffff26, 0x1c223024))
@@ -89,9 +92,105 @@ pub(crate) fn dim() -> Rgba {
 pub(crate) fn faint() -> Rgba {
     pick(FAINT)
 }
-/// What went wrong: `--warn`.
-pub(crate) fn warn() -> Rgba {
-    pick((0xe59a6cff, 0xb4572aff))
+
+// ---- Status ("Status" in docs/internals/desktop.md). A status's colour
+// says whether it is fine, being worked on, waiting on you, or wrong; its
+// shape says whether it is here (`marks::Mark`), and its words always say
+// it too. A mark (a dot, a ring, a badge) is held to 3:1 on the palette's
+// grounds and text to 4.5:1 on them and on a neutral button's fill, so each
+// colour has a mark and a text form. None of them follows the accent.
+
+/// Fine: here, and nothing to do.
+const OK: Token = (0x3aae86ff, 0x1f8f64ff);
+const OK_TEXT: Token = (0x3aae86ff, 0x17704eff);
+/// Waiting on you, with nothing lost yet.
+const NEED: Token = (0xe0ad48ff, 0xc2820aff);
+const NEED_TEXT: Token = (0xe0ad48ff, 0x8f6207ff);
+const NEED_TINT: Token = (0xd9a44121, 0xc2820a1f);
+/// Failed, or losing something until something changes.
+const FAIL: Token = (0xee6a5fff, 0xd23f32ff);
+const FAIL_TEXT: Token = (0xf47c72ff, 0xb52b20ff);
+const FAIL_TINT: Token = (0xee6a5f1f, 0xd23f3217);
+/// Being done now: the app's own accent, kept when `acc` follows the
+/// system's, so that a red or green accent never reads as a status.
+const WORKING: Token = ACC;
+
+/// A fine status's mark.
+pub(crate) fn ok() -> Rgba {
+    pick(OK)
+}
+/// A fine status in words.
+pub(crate) fn ok_text() -> Rgba {
+    pick(OK_TEXT)
+}
+/// The mark of what waits on you.
+pub(crate) fn need() -> Rgba {
+    pick(NEED)
+}
+/// What waits on you, in words.
+pub(crate) fn need_text() -> Rgba {
+    pick(NEED_TEXT)
+}
+/// The ground of a box that says what waits on you.
+#[allow(dead_code, reason = "no box says what waits on you yet")]
+pub(crate) fn need_tint() -> Rgba {
+    pick(NEED_TINT)
+}
+/// The mark of what went wrong.
+pub(crate) fn fail() -> Rgba {
+    pick(FAIL)
+}
+/// What went wrong, in words.
+pub(crate) fn fail_text() -> Rgba {
+    pick(FAIL_TEXT)
+}
+/// The ground of a box, or a button under the pointer, that says what went
+/// wrong or takes something away.
+pub(crate) fn fail_tint() -> Rgba {
+    pick(FAIL_TINT)
+}
+/// What is being done now: the open arc that turns (`marks::Mark`).
+pub(crate) fn working() -> Rgba {
+    pick(WORKING)
+}
+
+/// What a status says, by its colour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Status {
+    /// Nothing to do: here and not the app's, or away as expected.
+    Quiet,
+    /// Here, and nothing to do.
+    Ok,
+    /// Being done now.
+    Working,
+    /// Waiting on you, and nothing is lost yet.
+    Need,
+    /// It failed, or is losing something until something changes.
+    Fail,
+}
+
+impl Status {
+    /// Its mark's colour.
+    pub(crate) fn mark(self) -> Rgba {
+        match self {
+            Self::Quiet => faint(),
+            Self::Ok => ok(),
+            Self::Working => working(),
+            Self::Need => need(),
+            Self::Fail => fail(),
+        }
+    }
+
+    /// Its words' colour.
+    pub(crate) fn text(self) -> Rgba {
+        match self {
+            Self::Quiet => dim(),
+            Self::Ok => ok_text(),
+            Self::Working => working(),
+            Self::Need => need_text(),
+            Self::Fail => fail_text(),
+        }
+    }
 }
 /// What is lit: the system's accent as the palette wears it (`accent.rs`),
 /// or the app's own.
@@ -101,13 +200,10 @@ pub(crate) fn acc() -> Rgba {
 }
 /// The system's accent as its own controls wear it, for the controls drawn
 /// to look like them (`settings/controls.rs`), darkened where their white
-/// knob would not show on it (`accent::control`): a Mac's blue where the
-/// system names none.
+/// knob would not show on it (`accent::control`): the system's default
+/// where it names none (`platform::CONTROL_ACCENT`).
 pub(crate) fn system_accent() -> Rgba {
-    match SYSTEM_ACCENT.load(Ordering::Relaxed) {
-        NO_ACCENT => rgba(0x027affff),
-        accent => rgba(accent),
-    }
+    rgba(SYSTEM_ACCENT.load(Ordering::Relaxed))
 }
 /// Under a large cover: `--cover-shadow`.
 pub(crate) fn cover_shadow() -> Rgba {
@@ -160,10 +256,16 @@ pub(crate) const LIGHT_LOOK: Look = Look {
 
 /// `acc`, worked out for each appearance as the accent changes.
 static ACCENT: [AtomicU32; 2] = [AtomicU32::new(ACC.0), AtomicU32::new(ACC.1)];
-/// `system_accent`, or `NO_ACCENT`.
-static SYSTEM_ACCENT: AtomicU32 = AtomicU32::new(NO_ACCENT);
-/// No colour is clear: the system's accents are opaque.
-const NO_ACCENT: u32 = 0;
+/// `system_accent`, worked out as the accent changes.
+static SYSTEM_ACCENT: AtomicU32 = AtomicU32::new(crate::platform::CONTROL_ACCENT);
+
+/// The system's accent as its own controls wear it: `system`'s, or the
+/// system's default where it names none.
+fn control_accent(system: Option<Rgba>) -> u32 {
+    system.map_or(crate::platform::CONTROL_ACCENT, |system| {
+        accent::hex(accent::control(system))
+    })
+}
 
 /// The accent for each appearance, dark first: `system`'s, or the app's own
 /// where the system names none.
@@ -190,7 +292,7 @@ pub(crate) fn follow_accent(system: Option<Rgba>) -> bool {
     });
     let system = (*held).unwrap_or(system);
     let (dark, light) = accents(system);
-    let control = system.map_or(NO_ACCENT, |system| accent::hex(accent::control(system)));
+    let control = control_accent(system);
     let [dark_acc, light_acc] = &ACCENT;
     let changed = [
         dark_acc.swap(dark, Ordering::Relaxed) != dark,
@@ -555,7 +657,6 @@ mod tests {
 
     #[test]
     fn a_pressed_control_s_words_still_show_on_the_palette_s_grounds() {
-        let side = |token: Token, dark: bool| rgba(if dark { token.0 } else { token.1 });
         for dark in [true, false] {
             for words in [INK, DIM, FAINT] {
                 for ground in [BG, BAR_BG, SURF, RAISED] {
@@ -565,6 +666,81 @@ mod tests {
                     assert!(ratio >= 3., "dark {dark}: {words:08x?} pressed: {ratio:.2}");
                 }
             }
+        }
+    }
+
+    /// A token's colour in one appearance.
+    fn side(token: Token, dark: bool) -> Rgba {
+        rgba(if dark { token.0 } else { token.1 })
+    }
+
+    #[test]
+    fn a_status_s_mark_shows_on_the_page_and_its_words_read_on_every_ground() {
+        for dark in [true, false] {
+            for mark in [OK, NEED, FAIL] {
+                for ground in [BG, RAISED] {
+                    let ratio = accent::contrast(side(mark, dark), side(ground, dark));
+                    assert!(ratio >= 3., "dark {dark}: {mark:08x?}: {ratio:.2}");
+                }
+            }
+            for words in [OK_TEXT, NEED_TEXT, FAIL_TEXT] {
+                for ground in [BG, BAR_BG, SURF, RAISED] {
+                    let ratio = accent::contrast(side(words, dark), side(ground, dark));
+                    assert!(ratio >= 4.5, "dark {dark}: {words:08x?}: {ratio:.2}");
+                }
+                // And on a neutral button on the page, as a destructive
+                // button's words are.
+                let page = side(BG, dark);
+                let button = mix(
+                    page,
+                    Rgba {
+                        a: 1.,
+                        ..side(FILL, dark)
+                    },
+                    side(FILL, dark).a,
+                );
+                let ratio = accent::contrast(side(words, dark), button);
+                assert!(
+                    ratio >= 4.5,
+                    "dark {dark}: {words:08x?} on fill: {ratio:.2}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn amber_and_red_differ_in_lightness_where_a_badge_has_no_words() {
+        for dark in [true, false] {
+            let ratio = accent::contrast(side(NEED, dark), side(FAIL, dark));
+            assert!(ratio >= 1.4, "dark {dark}: {ratio:.2}");
+        }
+    }
+
+    #[test]
+    fn working_keeps_the_app_s_own_colour_whatever_the_system_s_accent() {
+        for system in [0xff3b30ff, 0x28cd41ff] {
+            let (dark, light) = accents(Some(rgba(system)));
+            assert_ne!((dark, light), WORKING, "{system:08x}");
+        }
+        assert_eq!(WORKING, ACC);
+    }
+
+    #[test]
+    fn the_settings_controls_wear_the_system_s_accent_or_its_default() {
+        assert_eq!(control_accent(None), crate::platform::CONTROL_ACCENT);
+        // The default keeps a white knob at 3:1 on it, as a named accent is
+        // darkened to.
+        let knob = rgba(0xffffffff);
+        let ratio = accent::contrast(rgba(crate::platform::CONTROL_ACCENT), knob);
+        assert!(ratio >= accent::CONTROL_CONTRAST, "{ratio:.2}");
+        for system in [0xffc600ff, 0x8c8c8cff, 0x007affff] {
+            let control = control_accent(Some(rgba(system)));
+            assert_eq!(control, accent::hex(accent::control(rgba(system))));
+            let ratio = accent::contrast(rgba(control), knob);
+            assert!(
+                ratio >= accent::CONTROL_CONTRAST,
+                "{system:08x}: {ratio:.2}"
+            );
         }
     }
 

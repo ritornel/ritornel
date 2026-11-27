@@ -10,13 +10,14 @@ use gpui::{
 
 use super::act;
 use super::controls::{
-    MONO, actions, boxed, chosen, clickable, date_field, edit, group, grow, heading, label_value,
-    note, pop_up, problem, push, row, spinner, sub, sub_wraps, switch_row,
+    MONO, actions, boxed, chosen, clickable, date_field, edit, group, grow, heading, label_status,
+    label_value, note, pop_up, problem, push, row, spinner, sub, sub_wraps, switch_row,
 };
 use super::model::{Busy, Group, Model, NO_LIBRARY_YET, SigningIn, Zones};
 use super::words::{Clock, all_zones, last_import, next_import, when, zone_name, zone_span};
-use crate::theme;
+use crate::theme::{self, Status};
 use crate::words::thousands;
+use ritornel_contract::JobState;
 
 /// Text that wraps at its spaces, with the words in `mono` set in the
 /// monospaced face at 11 points (such as `lastfm.env` inside a sentence).
@@ -63,7 +64,7 @@ pub(super) fn render(
                             grow()
                                 .child(
                                     div()
-                                        .text_color(theme::warn())
+                                        .text_color(theme::fail_text())
                                         .child("Last.fm settings could not be read"),
                                 )
                                 .when(!reason.is_empty(), |body| {
@@ -252,7 +253,20 @@ pub(super) fn render(
     let history = group(false)
         .child(heading("History"))
         .child(boxed(vec![
-            label_value("Last import", last_import(&status.import, clock)),
+            label_status(
+                "Last import",
+                last_import(&status.import, clock),
+                if status
+                    .import
+                    .last
+                    .as_ref()
+                    .is_some_and(|last| last.state == JobState::Failed)
+                {
+                    Status::Fail
+                } else {
+                    Status::Quiet
+                },
+            ),
             label_value("Next import", next_import(&status.import, clock)),
             row()
                 .child(grow().child(div().text_color(theme::dim()).child(format!(
@@ -292,7 +306,7 @@ pub(super) fn render(
                         grow()
                             .child(
                                 div()
-                                    .text_color(theme::warn())
+                                    .text_color(theme::fail_text())
                                     .child("Listening time zones could not be read"),
                             )
                             .when(!reason.is_empty(), |body| {

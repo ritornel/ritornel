@@ -129,6 +129,15 @@ impl Trouble {
         }
     }
 
+    /// Its colour: a place out of reach waits on it coming back, and one
+    /// whose output failed has gone wrong.
+    pub(crate) fn status(&self) -> crate::theme::Status {
+        match self {
+            Self::Away { .. } => crate::theme::Status::Need,
+            Self::Output { .. } => crate::theme::Status::Fail,
+        }
+    }
+
     /// The whole sentence, as hovering the widget shows it, with the
     /// system's own words for it.
     pub(crate) fn sentence(&self, clock: &Clock) -> String {

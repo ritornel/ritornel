@@ -122,6 +122,10 @@ pub(crate) const SERVER_APART: bool = true;
 /// What a button that shows a folder in File Explorer says.
 pub(crate) const SHOW_FOLDER: &str = "Show in File Explorer";
 
+/// The accent Windows' controls wear where it can name none (`accents`):
+/// its default blue.
+pub(crate) const CONTROL_ACCENT: u32 = 0x0078d4ff;
+
 /// The mark in a server's environment that says the app started it, as on
 /// Linux. Windows offers no way to read another process's environment, so
 /// the mark that is read is a named event the server holds (`mark_name`),

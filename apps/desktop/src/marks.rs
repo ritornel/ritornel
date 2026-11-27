@@ -1,5 +1,5 @@
-//! Small marks drawn wherever a song appears: its five stars and the three
-//! bars of the song playing.
+//! Small marks: a status's dot, ring or turning arc, and, wherever a song
+//! appears, its five stars and the three bars of the song playing.
 
 use std::time::{Duration, Instant};
 
@@ -9,7 +9,72 @@ use gpui::{
     px, size,
 };
 
-use crate::theme;
+use crate::theme::{self, Status};
+
+/// A status's mark ("Status" in docs/internals/desktop.md). What is being
+/// done is an open arc that turns, whether or not it is here; anything else
+/// is a dot in its colour if it is here, or a ring if it is not, as a hub
+/// that does not answer is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Mark {
+    pub status: Status,
+    pub here: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shape {
+    Dot,
+    Ring,
+    Arc,
+}
+
+/// How long the working arc takes to turn once.
+const TURN: Duration = Duration::from_millis(1000);
+
+impl Mark {
+    pub(crate) fn here(status: Status) -> Self {
+        Self { status, here: true }
+    }
+
+    pub(crate) fn away(status: Status) -> Self {
+        Self {
+            status,
+            here: false,
+        }
+    }
+
+    fn shape(self) -> Shape {
+        match (self.status, self.here) {
+            (Status::Working, _) => Shape::Arc,
+            (_, true) => Shape::Dot,
+            (_, false) => Shape::Ring,
+        }
+    }
+
+    /// The mark, `side` points square. The arc is turned by the renderer,
+    /// so nothing is laid out again while it turns, and holds still where
+    /// motion is reduced.
+    pub(crate) fn draw(self, side: f32) -> gpui::AnyElement {
+        let color = self.status.mark();
+        let round = div().size(px(side)).flex_none().rounded_full();
+        match self.shape() {
+            Shape::Dot => round.bg(color).into_any_element(),
+            Shape::Ring => round.border(px(1.5)).border_color(color).into_any_element(),
+            Shape::Arc => gpui::svg()
+                .path("icons/marks/working.svg")
+                .size(px(side))
+                .flex_none()
+                .text_color(color)
+                .when(!crate::platform::reduce_motion(), |arc| {
+                    arc.with_timed_transformation(
+                        gpui::TimedTransformation::rotation(TURN, gpui::Transformation::default())
+                            .with_max_fps(30.),
+                    )
+                })
+                .into_any_element(),
+        }
+    }
+}
 
 /// Five stars: in the accent when set, and while the pointer is on them,
 /// filled up to the one it is on. `hovered` is the star the pointer is on,
@@ -178,6 +243,16 @@ impl Equalizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn working_is_an_arc_and_anything_else_a_dot_here_or_a_ring_away() {
+        assert_eq!(Mark::here(Status::Working).shape(), Shape::Arc);
+        assert_eq!(Mark::away(Status::Working).shape(), Shape::Arc);
+        for status in [Status::Quiet, Status::Ok, Status::Need, Status::Fail] {
+            assert_eq!(Mark::here(status).shape(), Shape::Dot);
+            assert_eq!(Mark::away(status).shape(), Shape::Ring);
+        }
+    }
 
     #[gpui::test]
     fn bar_clips_keep_the_original_widths_and_gaps_at_both_scales(cx: &mut gpui::TestAppContext) {
