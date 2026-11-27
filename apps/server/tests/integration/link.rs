@@ -402,6 +402,21 @@ async fn an_invite_works_once_and_only_for_the_hub_it_names() {
         unproved.proof = request(&parsed, other.server_id(), 2).proof;
         assert_eq!(post(&hub, &unproved).await.0, 400);
 
+        // It is never taken over plain HTTP, where anyone between could read
+        // it, and is not spent by being sent so.
+        let plain = ritornel_client::post(
+            hub.endpoint(),
+            route::LINK,
+            None,
+            &request(&parsed, other.server_id(), 1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(plain.status, 403);
+        assert!(
+            String::from_utf8_lossy(&plain.body).contains("join over TLS"),
+            "{plain:?}"
+        );
         // The secret is spent by the satellite that uses it first.
         assert_eq!(
             post(&hub, &request(&parsed, other.server_id(), 1)).await.0,
@@ -3875,6 +3890,26 @@ async fn a_conflicting_peer_key_does_not_consume_the_invite() {
                 .await
                 .unwrap();
         assert_eq!(answer.status, 409);
+
+        // Nothing of desk's changed: not its name in the library's registry,
+        // nor the label of its link session.
+        let registered: String =
+            rusqlite::Connection::open(scratch.data_dir("hub").join("library.db"))
+                .unwrap()
+                .query_row(
+                    "SELECT name FROM server WHERE public_id = ?1",
+                    [desk.server_id().as_bytes()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+        assert_ne!(registered, "imposter");
+        let satellites = hub_client
+            .call::<LinkStatusCall>(&NoParams {})
+            .await
+            .unwrap()
+            .satellites;
+        assert_eq!(satellites.len(), 1);
+        assert_eq!(satellites[0].name, registered);
 
         // The invite was NOT consumed: another server can still join with it.
         let legit = start(&scratch, "legit").await;

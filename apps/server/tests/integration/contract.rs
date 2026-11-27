@@ -1316,10 +1316,73 @@ async fn a_connection_that_sends_no_whole_request_is_closed_when_its_time_is_up(
             );
         }
 
+        // The same over TLS, which a satellite opens with: a handshake
+        // begun and never finished, one finished with no request after it,
+        // and one with a whole request. The handshake takes from the same
+        // time as the request.
+        let key = hex::decode_array::<32>(&running.server.public_key()).unwrap();
+        let mut stalled = TcpStream::connect(running.endpoint()).await.unwrap();
+        let opened = Instant::now();
+        stalled.write_all(&[0x16]).await.unwrap();
+        assert_eq!(read_until_closed(&mut stalled).await, "");
+        assert!(
+            opened.elapsed() >= header_wait / 2,
+            "{:?}",
+            opened.elapsed()
+        );
+        for (sent, answered) in [
+            ("", false),
+            ("GET /v1/descriptor HTTP/1.1\r\nHost: test\r\n\r\n", true),
+        ] {
+            let opened = Instant::now();
+            let mut connection = ritornel_server::dial_hub(running.endpoint(), key)
+                .await
+                .unwrap();
+            connection.write_all(sent.as_bytes()).await.unwrap();
+            let mut received = Vec::new();
+            let _ = connection.read_to_end(&mut received).await;
+            let received = String::from_utf8_lossy(&received);
+            assert!(
+                opened.elapsed() >= header_wait / 2,
+                "{sent:?} over TLS was closed after {:?}",
+                opened.elapsed()
+            );
+            assert_eq!(
+                received.starts_with("HTTP/1.1 200 OK"),
+                answered,
+                "{sent:?} over TLS: {received:?}"
+            );
+        }
+
         // The server is as it was.
         ritornel_client::descriptor(running.endpoint())
             .await
             .unwrap();
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_stop_does_not_wait_on_a_handshake_that_never_ends() {
+    bounded(async {
+        // Long waits, so that only the stop can end the connection.
+        let running = start_with(Bounds {
+            header_wait: Duration::from_secs(60),
+            stop_grace: Duration::from_secs(60),
+            ..Bounds::default()
+        })
+        .await;
+        let mut stalled = TcpStream::connect(running.endpoint()).await.unwrap();
+        stalled.write_all(&[0x16]).await.unwrap();
+        // The handshake has begun when the descriptor is answered after it.
+        ritornel_client::descriptor(running.endpoint())
+            .await
+            .unwrap();
+        let stopping = Instant::now();
+        running.server.stop().await.unwrap();
+        let took = stopping.elapsed();
+        assert!(took < Duration::from_secs(30), "the stop took {took:?}");
+        assert_eq!(read_until_closed(&mut stalled).await, "");
     })
     .await;
 }
