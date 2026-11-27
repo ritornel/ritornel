@@ -186,7 +186,7 @@ fn request(invite: &InviteLink, server_id: ritornel_client::contract::Id, seed: 
 /// one before it sends anything of its link.
 async fn tls(hub: &Server) -> impl ritornel_client::Stream {
     let key = hex::decode_array::<32>(&hub.public_key()).unwrap();
-    ritornel_server::dial_hub(hub.endpoint(), key)
+    ritornel_server::test_support::dial_hub(hub.endpoint(), key)
         .await
         .unwrap()
 }
@@ -1792,7 +1792,7 @@ impl Relay {
                 row.get(0)
             })
             .unwrap();
-        let acceptor = ritornel_server::hub_tls(seed).unwrap();
+        let acceptor = ritornel_server::test_support::hub_tls(seed).unwrap();
         let endpoint = hub.endpoint();
         let key = hex::decode_array::<32>(&hub.public_key()).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1810,7 +1810,8 @@ impl Relay {
                     let Ok(satellite) = acceptor.accept(satellite).await else {
                         return;
                     };
-                    let Ok(hub) = ritornel_server::dial_hub(endpoint, key).await else {
+                    let Ok(hub) = ritornel_server::test_support::dial_hub(endpoint, key).await
+                    else {
                         return;
                     };
                     let (mut from_satellite, mut to_satellite) = tokio::io::split(satellite);

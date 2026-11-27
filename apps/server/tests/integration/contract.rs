@@ -1355,7 +1355,9 @@ async fn a_handshake_and_the_first_request_share_one_deadline() {
             // purpose, and no event marks the time going by.
             tokio::time::sleep(before).await;
             // Within its own time, the handshake always succeeds.
-            let mut tls = ritornel_server::handshake_with_hub(tcp, key).await.unwrap();
+            let mut tls = ritornel_server::test_support::handshake_with_hub(tcp, key)
+                .await
+                .unwrap();
             // sleep: as above, after the handshake.
             tokio::time::sleep(after).await;
             descriptor_answered(&mut tls).await
@@ -1373,7 +1375,9 @@ async fn a_handshake_and_the_first_request_share_one_deadline() {
             // Each within its own deadline, but not both within one.
             late(header_wait * 3 / 4, header_wait / 2),
             async {
-                let mut tls = ritornel_server::dial_hub(endpoint, key).await.unwrap();
+                let mut tls = ritornel_server::test_support::dial_hub(endpoint, key)
+                    .await
+                    .unwrap();
                 descriptor_answered(&mut tls).await
             },
         );

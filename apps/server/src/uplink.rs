@@ -230,9 +230,9 @@ impl Uplink {
         Credential::new(self.link.token.expose())
     }
 
-    /// The route the hub last proved it holds its key on, while it
-    /// answers there: where the link session may be sent outside a
-    /// connection, for media. `None` until a connection has been made, and
+    /// The route where the hub last answered a handshake signed with its
+    /// key, while it answers there: where media is fetched outside a
+    /// socket, over a TLS connection of its own. `None` until a connection has been made, and
     /// while the hub does not answer.
     pub(crate) fn route(&self) -> Option<SocketAddr> {
         let reach = lock(&self.reach);

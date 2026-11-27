@@ -813,9 +813,9 @@ async fn art(
     if let Ok(Ok(bytes)) = tokio::task::spawn_blocking(move || std::fs::read(read)).await {
         return jpeg(bytes);
     }
-    // A satellite has no pictures: it asks its hub, on the route the hub
-    // last proved itself on, and keeps what it is given beside the covers
-    // it would have made.
+    // A satellite has no pictures: it asks its hub, over TLS pinned to the
+    // hub's key on the route where the hub last answered, and keeps what it
+    // is given beside the covers it would have made.
     if let Some(uplink) = core.uplink() {
         let Some(route) = uplink.route() else {
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
