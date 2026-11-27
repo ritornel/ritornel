@@ -597,11 +597,21 @@ async fn a_satellite_opens_a_socket_at_its_hub_with_its_link_session_and_no_tick
         .await
         .unwrap();
         assert_eq!(ticket.status, 403);
-        // Over plain HTTP its link session is not taken at all.
+        // Over plain HTTP its link session is not taken at all: not for a
+        // ticket, a socket or a route.
         assert!(matches!(
             ritornel_client::ticket(hub.endpoint(), &credential).await,
             Err(ritornel_client::Error::Refused { status: 401 })
         ));
+        assert!(matches!(
+            Client::connect(hub.endpoint(), &credential).await,
+            Err(ritornel_client::Error::Refused { status: 401 })
+        ));
+        let health = ritornel_client::get(hub.endpoint(), route::HEALTH, Some(&credential))
+            .await
+            .unwrap();
+        assert_eq!(health.status, 401);
+        assert_eq!(get_linked(&hub, route::HEALTH, &credential).await, 200);
     })
     .await;
 }

@@ -286,9 +286,6 @@ async fn serve(
     (deadline, header_wait): (tokio::time::Instant, Duration),
     _admitted: OwnedSemaphorePermit,
 ) {
-    // Whether the first request has reached the routes, after which the
-    // deadline no longer applies.
-    let asked = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let opened = async {
         let mut first = [0; 1];
         match stream.peek(&mut first).await {
@@ -315,7 +312,6 @@ async fn serve(
                 *session,
                 Secure(true),
                 router,
-                asked,
                 deadline,
                 stopping,
                 header_wait,
@@ -327,7 +323,6 @@ async fn serve(
                 stream,
                 Secure(false),
                 router,
-                asked,
                 deadline,
                 stopping,
                 header_wait,
@@ -349,15 +344,17 @@ async fn serve_http<S>(
     stream: S,
     secure: Secure,
     router: Router,
-    asked: Arc<std::sync::atomic::AtomicBool>,
     deadline: tokio::time::Instant,
     mut stopping: watch::Receiver<bool>,
     header_wait: Duration,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
+    // Whether the first request has reached the routes, after which the
+    // deadline no longer applies.
+    let asked = Arc::new(AtomicBool::new(false));
     let seen = Arc::clone(&asked);
     let router = router
         .layer(middleware::from_fn(move |request: Request, next: Next| {
@@ -474,12 +471,12 @@ async fn require_credential(
         // A link session's token is taken over TLS alone, which is all a
         // satellite speaks. Over plain HTTP it is refused like any unknown
         // token, and the satellite that sent it runs an older release.
-        .filter(|(_, peer)| {
-            let taken = secure || peer.is_none();
-            if !taken {
-                info!(satellite = ?peer.as_ref().map(|peer| peer.server), "a satellite's link session came without TLS: it runs an older release");
+        .filter(|(_, peer)| match peer {
+            Some(peer) if !secure => {
+                info!(satellite = %peer.server, "a satellite's link session came without TLS: it runs an older release");
+                false
             }
-            taken
+            _ => true,
         })
         .map(|(grant, peer)| (grant, peer, Presented::Header));
     let admitted = by_header

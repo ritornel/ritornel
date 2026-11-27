@@ -372,7 +372,7 @@ mod enabled {
                 last: last.as_ref().and_then(|ended| {
                     Some(LastImport {
                         ended: ended.finished_at_ms?,
-                        state: job_for(ended, false).state,
+                        state: crate::dispatch::calls::job_state(ended.state),
                         failure: ended.error.clone(),
                     })
                 }),

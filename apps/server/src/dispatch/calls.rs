@@ -48,8 +48,8 @@ pub(crate) fn job_state(state: ritornel_engine::JobState) -> JobState {
     }
 }
 
-/// A job as the contract carries it. Error messages that may hold host
-/// filesystem paths are omitted when `show_paths` is false.
+/// A job as the contract carries it. Its error and its label, which may
+/// hold host filesystem paths, are omitted when `show_paths` is false.
 pub(crate) fn job_for(job: &ritornel_engine::Job, show_paths: bool) -> Job {
     Job {
         job_id: job.public_id,
