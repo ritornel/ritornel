@@ -637,6 +637,15 @@ impl Speaker {
                 let playing = plays(row);
                 let at = picker.at == Some(id);
                 let choosable = row.reachable;
+                let trouble = crate::places::trouble(row, None);
+                // A place whose output failed is lit in red, on which its
+                // red line still reads; one out of reach is never lit.
+                let lit = match trouble.as_ref().map(|trouble| trouble.status()) {
+                    Some(Status::Fail) => theme::fail_hover(),
+                    _ => theme::fill(),
+                };
+                // What cannot be chosen fades, but its trouble is said whole.
+                let faded = |part: gpui::Div| part.when(!choosable, |part| part.opacity(0.45));
                 div()
                     .id(SharedString::from(format!("place-{id}")))
                     .h(px(46.))
@@ -645,10 +654,9 @@ impl Speaker {
                     .flex()
                     .items_center()
                     .gap(px(10.))
-                    .when(at, |row| row.bg(theme::fill()))
-                    .when(!choosable, |row| row.opacity(0.45))
+                    .when(at, |row| row.bg(lit))
                     .when(choosable, |row| {
-                        row.hover(theme::hovered)
+                        row.hover(move |style| style.bg(lit))
                             .active(theme::pressed)
                             .on_hover(cx.listener(move |speaker, over: &bool, _, cx| {
                                 if *over {
@@ -666,14 +674,18 @@ impl Speaker {
                                     .update(cx, |places, cx| places.choose(id, cx));
                             }))
                     })
-                    .child(icon("speaker", 16., theme::dim()))
+                    .child(faded(div().flex_none().child(icon(
+                        "speaker",
+                        16.,
+                        theme::dim(),
+                    ))))
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .flex()
                             .flex_col()
-                            .child(
+                            .child(faded(
                                 div()
                                     .truncate()
                                     .text_size(px(13.5))
@@ -681,11 +693,10 @@ impl Speaker {
                                     .font_weight(FontWeight(500.))
                                     .text_color(theme::ink())
                                     .child(name),
-                            )
+                            ))
                             .child({
                                 // A place in trouble says so in its colour,
                                 // after its mark.
-                                let trouble = crate::places::trouble(row, None);
                                 div()
                                     .flex()
                                     .items_center()
@@ -713,7 +724,11 @@ impl Speaker {
                         )
                     })
                     .when(chosen == Some(id), |row| {
-                        row.child(icon("check", 14., theme::acc()))
+                        row.child(faded(div().flex_none().child(icon(
+                            "check",
+                            14.,
+                            theme::acc(),
+                        ))))
                     })
             })
             .collect();

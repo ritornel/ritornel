@@ -164,9 +164,11 @@ const ON_ACCENT: Token = (BG.0, RAISED.1);
 /// How far a primary button's accent moves toward the ink under the
 /// pointer: away from its words, which are the ink's opposite.
 const PRIMARY_HOVER: f32 = 0.12;
-/// How much red a destructive button takes as its ground under the pointer:
-/// as much as keeps its words at 4.5:1 on every ground.
-const DESTRUCTIVE_HOVER: f32 = 0.08;
+/// How much red a red thing takes as its ground under the pointer or the
+/// keys, a destructive button or a place whose output failed: as much as
+/// keeps its words at 4.5:1, and its mark at 3:1, on every ground. The
+/// neutral `fill` would not, on a raised surface in the dark.
+const FAIL_HOVER: f32 = 0.08;
 
 pub(crate) fn on_accent() -> Rgba {
     pick(ON_ACCENT)
@@ -175,10 +177,10 @@ pub(crate) fn on_accent() -> Rgba {
 pub(crate) fn primary_hover() -> Rgba {
     mix(acc(), ink(), PRIMARY_HOVER)
 }
-/// A destructive button's ground under the pointer.
-pub(crate) fn destructive_hover() -> Rgba {
+/// The ground of a red thing under the pointer or the keys (`FAIL_HOVER`).
+pub(crate) fn fail_hover() -> Rgba {
     Rgba {
-        a: DESTRUCTIVE_HOVER,
+        a: FAIL_HOVER,
         ..fail()
     }
 }
@@ -737,17 +739,33 @@ mod tests {
     }
 
     #[test]
-    fn a_destructive_button_s_words_read_on_every_ground_at_rest_and_under_the_pointer() {
+    fn red_words_and_marks_read_on_every_ground_at_rest_and_under_the_pointer() {
+        // A destructive button, and a place whose output failed in the Play
+        // on picker, which lies on `raised`.
         for dark in [true, false] {
-            let words = side(FAIL_TEXT, dark);
             for ground in [BG, BAR_BG, SURF, RAISED] {
                 let ground = side(ground, dark);
-                let hovered = mix(ground, side(FAIL, dark), DESTRUCTIVE_HOVER);
+                let hovered = mix(ground, side(FAIL, dark), FAIL_HOVER);
                 for (state, under) in [("rest", ground), ("hover", hovered)] {
-                    let ratio = accent::contrast(words, under);
-                    assert!(ratio >= 4.5, "dark {dark}, {state}: {ratio:.2}");
+                    let words = accent::contrast(side(FAIL_TEXT, dark), under);
+                    assert!(words >= 4.5, "dark {dark}, {state}: words {words:.2}");
+                    let mark = accent::contrast(side(FAIL, dark), under);
+                    assert!(mark >= 3., "dark {dark}, {state}: mark {mark:.2}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn a_place_out_of_reach_reads_in_the_picker() {
+        // It cannot be chosen, so neither the pointer nor the keys light
+        // it: its ring and line lie on the picker's `raised` alone.
+        for dark in [true, false] {
+            let ground = side(RAISED, dark);
+            let mark = accent::contrast(side(NEED, dark), ground);
+            assert!(mark >= 3., "dark {dark}: mark {mark:.2}");
+            let words = accent::contrast(side(NEED_TEXT, dark), ground);
+            assert!(words >= 4.5, "dark {dark}: words {words:.2}");
         }
     }
 

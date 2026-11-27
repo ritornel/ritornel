@@ -104,7 +104,7 @@ pub(crate) fn button(
             Role::Primary => style.bg(theme::primary_hover()),
             Role::Secondary => theme::hovered_on_fill(style),
             Role::Quiet => theme::hovered(style),
-            Role::Destructive => style.bg(theme::destructive_hover()),
+            Role::Destructive => style.bg(theme::fail_hover()),
         })
         .active(theme::pressed)
         .child(label.into())
