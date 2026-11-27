@@ -254,6 +254,17 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_working_arc_s_picture_is_there() -> gpui::Result<()> {
+        use gpui::AssetSource;
+        assert!(
+            crate::icons::Icons
+                .load("icons/marks/working.svg")?
+                .is_some()
+        );
+        Ok(())
+    }
+
     #[gpui::test]
     fn bar_clips_keep_the_original_widths_and_gaps_at_both_scales(cx: &mut gpui::TestAppContext) {
         struct Marks;

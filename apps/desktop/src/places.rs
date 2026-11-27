@@ -138,6 +138,15 @@ impl Trouble {
         }
     }
 
+    /// Its mark: a ring while the place is out of reach, since it comes and
+    /// goes, and a dot while it is there with its output failed.
+    pub(crate) fn mark(&self) -> crate::marks::Mark {
+        match self {
+            Self::Away { .. } => crate::marks::Mark::away(self.status()),
+            Self::Output { .. } => crate::marks::Mark::here(self.status()),
+        }
+    }
+
     /// The whole sentence, as hovering the widget shows it, with the
     /// system's own words for it.
     pub(crate) fn sentence(&self, clock: &Clock) -> String {
@@ -1098,6 +1107,21 @@ pub(crate) mod tests {
                 trouble: None
             }
         );
+    }
+
+    #[test]
+    fn a_place_out_of_reach_is_an_amber_ring_and_a_failed_output_a_red_dot() {
+        use crate::marks::Mark;
+        use crate::theme::Status;
+        let away = Trouble::Away { since_ms: 0 };
+        let output = Trouble::Output {
+            since_ms: 0,
+            detail: String::new(),
+        };
+        assert_eq!(away.status(), Status::Need);
+        assert_eq!(away.mark(), Mark::away(Status::Need));
+        assert_eq!(output.status(), Status::Fail);
+        assert_eq!(output.mark(), Mark::here(Status::Fail));
     }
 
     #[test]

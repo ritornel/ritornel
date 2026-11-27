@@ -34,6 +34,9 @@ use crate::player::Player;
 use crate::theme;
 use crate::theme::Status;
 
+/// How big a place's mark is beside its line in the picker.
+const PICKER_MARK: f32 = 8.;
+
 /// The widget's width, in every state.
 pub(crate) const WIDTH: f32 = 164.;
 /// Its height: two lines, the name and the slider.
@@ -679,14 +682,29 @@ impl Speaker {
                                     .text_color(theme::ink())
                                     .child(name),
                             )
-                            .child(
+                            .child({
+                                // A place in trouble says so in its colour,
+                                // after its mark.
+                                let trouble = crate::places::trouble(row, None);
                                 div()
-                                    .truncate()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(5.))
+                                    .min_w_0()
                                     .text_size(px(12.))
                                     .line_height(px(15.))
-                                    .text_color(theme::dim())
-                                    .child(line(row, &clock)),
-                            ),
+                                    .text_color(
+                                        trouble.as_ref().map_or(theme::dim(), |trouble| {
+                                            trouble.status().text()
+                                        }),
+                                    )
+                                    .children(
+                                        trouble
+                                            .as_ref()
+                                            .map(|trouble| trouble.mark().draw(PICKER_MARK)),
+                                    )
+                                    .child(div().min_w_0().truncate().child(line(row, &clock)))
+                            }),
                     )
                     .when(playing, |row| {
                         row.child(

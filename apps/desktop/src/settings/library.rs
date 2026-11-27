@@ -15,16 +15,20 @@ use ritornel_contract::{
 
 use super::act;
 use super::controls::{
-    actions, boxed, folder_icon, group, grow, heading, note, problem, progress, push, row, spinner,
-    sub, sub_wraps, switch_row,
+    actions, boxed, folder_icon, group, grow, heading, note, problem, progress, push, row, sub,
+    sub_wraps, switch_row, working,
 };
 use super::model::{Busy, Group, Model};
 use super::words::{
     Clock, is_ended, last_auto, pictures_found, scan_ended, scan_progress, unbroken_paths,
     watch_state, when,
 };
+use crate::marks::Mark;
 use crate::theme::{self, Status};
 use crate::words::thousands;
+
+/// How big the ring beside a folder that is offline is.
+const OFFLINE_RING: f32 = 8.;
 
 /// How the server watches a folder, at the right of its row, while it watches.
 fn watching(folder: Option<&WatchedFolder>, on: bool, clock: &Clock) -> Option<impl IntoElement> {
@@ -36,8 +40,15 @@ fn watching(folder: Option<&WatchedFolder>, on: bool, clock: &Clock) -> Option<i
             .text_right()
             .child(
                 div()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap(px(6.))
                     .when(folder.state == WatchState::Offline, |state| {
-                        state.text_color(theme::need_text())
+                        // A disk that comes and goes: a ring while it is gone.
+                        state
+                            .text_color(theme::need_text())
+                            .child(Mark::away(Status::Need).draw(OFFLINE_RING))
                     })
                     .child(watch_state(folder)),
             )
@@ -384,7 +395,7 @@ pub(super) fn render(
                 .items_center()
                 .gap(px(8.))
                 .text_color(theme::dim())
-                .child(spinner("importing"))
+                .child(working())
                 .child("Importing pictures…")
         } else {
             // An import started on its own keeps no counts: what the folder

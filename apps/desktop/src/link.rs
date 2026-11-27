@@ -111,12 +111,20 @@ pub(crate) fn preparing_words(step: Preparing) -> (&'static str, &'static str) {
 }
 
 /// What the title bar says while there is no session, and its status:
-/// working while the server prepares the library, is looked for, starts or
-/// is looked for again after the connection was lost, and failed when there
-/// is no server, or none that answers or that the app can talk to.
-fn unconnected(preparing: Option<Preparing>, state: &State) -> (&'static str, Status) {
+/// working while the server prepares the library, while it is looked for
+/// (at first, after the connection was lost, or when asked to look again),
+/// and while it starts; failed when there is no server, or none that
+/// answers or that the app can talk to. `looking` is the look the app
+/// makes at first and when asked, not the quiet retries between, so a
+/// failure stays said until someone asks again.
+fn unconnected(
+    preparing: Option<Preparing>,
+    state: &State,
+    looking: bool,
+) -> (&'static str, Status) {
     match (preparing, state) {
         (Some(_), _) => ("Updating your library…", Status::Working),
+        (None, _) if looking => ("Connecting…", Status::Working),
         (
             None,
             State::Looking
@@ -290,7 +298,7 @@ impl Link {
 
     /// What the title bar says while there is no session, and its status.
     pub(crate) fn unconnected(&self) -> (&'static str, Status) {
-        unconnected(self.preparing, &self.state)
+        unconnected(self.preparing, &self.state, self.looking)
     }
 
     /// Reads what the server holding the directory says it is preparing,
@@ -709,22 +717,25 @@ mod tests {
         };
         let working = ("Connecting…", Status::Working);
         let failed = ("Not connected", Status::Fail);
-        assert_eq!(unconnected(None, &State::Looking), working);
-        assert_eq!(unconnected(None, &away(Why::Starting)), working);
-        assert_eq!(unconnected(None, &away(Why::Lost)), working);
+        assert_eq!(unconnected(None, &State::Looking, true), working);
+        assert_eq!(unconnected(None, &away(Why::Starting), false), working);
+        assert_eq!(unconnected(None, &away(Why::Lost), true), working);
         for why in [
             Why::NotRunning,
             Why::Unreachable,
             Why::Incompatible,
             Why::Failed,
         ] {
-            assert_eq!(unconnected(None, &away(why)), failed, "{why:?}");
+            // Failed, then asked to look again: working while it looks,
+            // and failed again if it finds none.
+            assert_eq!(unconnected(None, &away(why), false), failed, "{why:?}");
+            assert_eq!(unconnected(None, &away(why), true), working, "{why:?}");
         }
         // Preparing the library, or saving a copy of it first, is working
         // whatever else is so.
         for step in [Preparing::Backup, Preparing::Migration, Preparing::History] {
             assert_eq!(
-                unconnected(Some(step), &away(Why::Failed)),
+                unconnected(Some(step), &away(Why::Failed), false),
                 ("Updating your library…", Status::Working)
             );
         }

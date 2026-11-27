@@ -26,7 +26,7 @@ use crate::places::Places;
 use crate::player::{Player, stars_of};
 use crate::settings::words::{Clock, Style, when};
 use crate::speaker::Speaker;
-use crate::theme;
+use crate::theme::{self, Status};
 use crate::wall::PLAYER_BAR;
 
 /// Minutes and seconds, with seconds rounded.
@@ -337,7 +337,7 @@ impl Render for PlayerBar {
         let current = state.as_ref().filter(|_| !player.stale());
         let trouble = match &there {
             Some(row) => crate::places::trouble(row, current)
-                .map(|trouble| trouble.lines(&crate::away::clock())),
+                .map(|trouble| (trouble.lines(&crate::away::clock()), trouble.status())),
             None => current.and_then(|state| {
                 let problem = state.output.problem.as_ref()?;
                 let clock = Clock {
@@ -345,7 +345,10 @@ impl Render for PlayerBar {
                     zone: jiff::tz::TimeZone::system(),
                     style: self.style,
                 };
-                Some(output_trouble(&state.output.name, problem, on, &clock))
+                Some((
+                    output_trouble(&state.output.name, problem, on, &clock),
+                    Status::Fail,
+                ))
             }),
         };
 
@@ -937,15 +940,17 @@ fn output_trouble(
     (wrong, then.to_owned())
 }
 
-/// The two lines of [`output_trouble`], set close enough that with the
-/// title they stand no taller than the cover.
-fn trouble_lines((wrong, then): (String, String)) -> [gpui::Div; 2] {
+/// The two lines of [`output_trouble`], or of a place's trouble, set close
+/// enough that with the title they stand no taller than the cover: what is
+/// wrong in its status's colour, amber for a place out of reach and red for
+/// an output that failed.
+fn trouble_lines(((wrong, then), status): ((String, String), Status)) -> [gpui::Div; 2] {
     [
         div()
             .truncate()
             .text_size(px(13.))
             .line_height(px(16.))
-            .text_color(theme::fail_text())
+            .text_color(status.text())
             .child(wrong),
         div()
             .truncate()

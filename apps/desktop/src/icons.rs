@@ -82,7 +82,7 @@ const ICONS: &[(&str, &str, bool)] = &[
 ];
 
 /// Whole SVG icons outside the 16-point icon set: the Settings toolbar icons
-/// and spinner segments.
+/// and the working arc.
 const PICTURES: &[(&str, &str)] = &[
     (
         "settings/library",
@@ -104,21 +104,11 @@ const PICTURES: &[(&str, &str)] = &[
         "settings/folder",
         r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 16"><path d="M1.5 3.5A1.5 1.5 0 0 1 3 2h4.2l1.6 1.8H17a1.5 1.5 0 0 1 1.5 1.5v7.7A1.5 1.5 0 0 1 17 14.5H3A1.5 1.5 0 0 1 1.5 13z" fill="black"/></svg>"#,
     ),
-    // The spinner: its ring, and the quarter of it that turns, as CSS
-    // draws a circle's border with a top border of another colour.
-    (
-        "settings/ring",
-        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 14 14"><path fill-rule="evenodd" d="M7 0a7 7 0 1 1 0 14A7 7 0 1 1 7 0zm0 2a5 5 0 1 0 0 10A5 5 0 1 0 7 2z" fill="black"/></svg>"#,
-    ),
     // What is being done: three quarters of a ring, from the top round
     // to the left, that turns (`marks::Mark`).
     (
         "marks/working",
         r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M8 1.5A6.5 6.5 0 1 1 1.5 8" fill="none" stroke="black" stroke-width="3" stroke-linecap="round"/></svg>"#,
-    ),
-    (
-        "settings/arc",
-        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 14 14"><path d="M2.05 2.05a7 7 0 0 1 9.9 0l-1.41 1.41a5 5 0 0 0-7.08 0z" fill="black"/></svg>"#,
     ),
 ];
 

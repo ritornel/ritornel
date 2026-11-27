@@ -331,9 +331,10 @@ mod fallback {
     /// What a button that shows a folder in the system's file manager says.
     pub(crate) const SHOW_FOLDER: &str = "Show in File Manager";
 
-    /// The accent the system's own controls wear where it names none, as
-    /// `0xrrggbbaa`: GNOME's default blue, which a desktop without a portal
-    /// accent draws its controls in.
+    /// The accent the Settings window's controls wear where the system names
+    /// none, as `0xrrggbbaa`: on Linux, where the portal reports no accent,
+    /// the app's fallback of GNOME's default blue, since nothing names the
+    /// desktop's own.
     pub(crate) const CONTROL_ACCENT: u32 = 0x3584e4ff;
 
     /// What the picker calls the computer the app runs on.

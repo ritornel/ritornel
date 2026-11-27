@@ -4,9 +4,10 @@
 //! so what a page is for wears the accent instead, and a button is never
 //! drawn in a status's colour but to take something away.
 //!
-//! The Settings window's push buttons are AppKit's (`settings/controls.rs`),
-//! and the banner's Play and Shuffle are drawn over its picture
-//! (`banner.rs`).
+//! A blank page's button is the one drawn with it so far, as `Secondary`;
+//! the other roles are here for the pages that need them. The Settings
+//! window's push buttons are AppKit's (`settings/controls.rs`), and the
+//! banner's Play and Shuffle are drawn over its picture (`banner.rs`).
 
 use gpui::{
     Div, ElementId, FontWeight, InteractiveElement, ParentElement, Rgba, SharedString, Stateful,
@@ -17,7 +18,7 @@ use crate::theme;
 
 /// What a button is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code, reason = "each is drawn where a page needs it")]
+#[allow(dead_code, reason = "only `Secondary` has a caller yet")]
 pub(crate) enum Role {
     /// Starts music on a record, an artist or a playlist: the ink.
     Play,
@@ -28,7 +29,8 @@ pub(crate) enum Role {
     /// More of the same thing, at a row's end or in a sentence: the
     /// accent's words alone.
     Quiet,
-    /// Takes something away: red words on a neutral ground, edged in red.
+    /// Takes something away: red words, edged in red, with a little red
+    /// under the pointer.
     Destructive,
 }
 
@@ -48,29 +50,20 @@ fn look(role: Role) -> Look {
     };
     match role {
         Role::Play => plain(theme::ink(), theme::bg()),
-        Role::Primary => plain(theme::acc(), on_accent()),
+        Role::Primary => plain(theme::acc(), theme::on_accent()),
         Role::Secondary => plain(theme::fill(), theme::ink()),
         Role::Quiet => Look {
             ground: None,
             words: theme::acc(),
             edge: None,
         },
+        // No neutral ground: on a raised surface in the dark, the red words
+        // would fall under 4.5:1 on one.
         Role::Destructive => Look {
-            ground: Some(theme::fill()),
+            ground: None,
             words: theme::fail_text(),
             edge: Some(theme::fail()),
         },
-    }
-}
-
-/// Words on the accent: the page's ground in the dark, where the accent is
-/// light, and white in the light, where it is deep. The accent is worked out
-/// to 4.5:1 on both (`accent::derive`).
-fn on_accent() -> Rgba {
-    if theme::dark() {
-        theme::bg()
-    } else {
-        theme::raised()
     }
 }
 
@@ -105,10 +98,13 @@ pub(crate) fn button(
     }
     button
         .hover(move |style| match role {
-            Role::Play | Role::Primary => theme::hovered_solid(style),
+            Role::Play => theme::hovered_solid(style),
+            // Darker in the light and lighter in the dark, away from its
+            // words, rather than fading toward the page.
+            Role::Primary => style.bg(theme::primary_hover()),
             Role::Secondary => theme::hovered_on_fill(style),
             Role::Quiet => theme::hovered(style),
-            Role::Destructive => style.bg(theme::fail_tint()),
+            Role::Destructive => style.bg(theme::destructive_hover()),
         })
         .active(theme::pressed)
         .child(label.into())
@@ -131,18 +127,12 @@ mod tests {
         let [play, primary, secondary, quiet, destructive] = looks;
         assert_ne!(play.ground, primary.ground);
         assert_eq!(primary.ground, Some(theme::acc()));
-        assert_eq!(secondary.ground, destructive.ground);
-        assert_eq!(quiet.ground, None);
+        assert_eq!(secondary.ground, Some(theme::fill()));
+        assert_eq!((quiet.ground, destructive.ground), (None, None));
         assert_eq!(destructive.words, theme::fail_text());
         for look in [play, primary, secondary, quiet] {
             assert_eq!(look.edge, None);
             assert!(look.words != theme::fail_text() && look.ground != Some(theme::fail()));
         }
-    }
-
-    #[test]
-    fn a_primary_button_s_words_read_on_the_accent() {
-        let ratio = crate::accent::contrast(on_accent(), theme::acc());
-        assert!(ratio >= crate::accent::CONTRAST, "{ratio:.2}");
     }
 }

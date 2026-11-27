@@ -144,14 +144,43 @@ pub(crate) fn fail() -> Rgba {
 pub(crate) fn fail_text() -> Rgba {
     pick(FAIL_TEXT)
 }
-/// The ground of a box, or a button under the pointer, that says what went
-/// wrong or takes something away.
+/// The ground of a box that says what went wrong.
+#[allow(dead_code, reason = "no box says what went wrong yet")]
 pub(crate) fn fail_tint() -> Rgba {
     pick(FAIL_TINT)
 }
 /// What is being done now: the open arc that turns (`marks::Mark`).
 pub(crate) fn working() -> Rgba {
     pick(WORKING)
+}
+
+// ---- Buttons that carry colour (`button.rs`). Each keeps its words at 4.5:1
+// under the pointer too, so neither fades as a solid control does.
+
+/// Words on the accent: the page's ground in the dark, where the accent is
+/// light, and white in the light, where it is deep. The accent is worked out
+/// to 4.5:1 on both (`accent::derive`).
+const ON_ACCENT: Token = (BG.0, RAISED.1);
+/// How far a primary button's accent moves toward the ink under the
+/// pointer: away from its words, which are the ink's opposite.
+const PRIMARY_HOVER: f32 = 0.12;
+/// How much red a destructive button takes as its ground under the pointer:
+/// as much as keeps its words at 4.5:1 on every ground.
+const DESTRUCTIVE_HOVER: f32 = 0.08;
+
+pub(crate) fn on_accent() -> Rgba {
+    pick(ON_ACCENT)
+}
+/// A primary button's ground under the pointer.
+pub(crate) fn primary_hover() -> Rgba {
+    mix(acc(), ink(), PRIMARY_HOVER)
+}
+/// A destructive button's ground under the pointer.
+pub(crate) fn destructive_hover() -> Rgba {
+    Rgba {
+        a: DESTRUCTIVE_HOVER,
+        ..fail()
+    }
 }
 
 /// What a status says, by its colour.
@@ -181,12 +210,12 @@ impl Status {
         }
     }
 
-    /// Its words' colour.
+    /// Its words' colour. What is being done is said plainly, beside its
+    /// arc.
     pub(crate) fn text(self) -> Rgba {
         match self {
-            Self::Quiet => dim(),
+            Self::Quiet | Self::Working => dim(),
             Self::Ok => ok_text(),
-            Self::Working => working(),
             Self::Need => need_text(),
             Self::Fail => fail_text(),
         }
@@ -688,8 +717,7 @@ mod tests {
                     let ratio = accent::contrast(side(words, dark), side(ground, dark));
                     assert!(ratio >= 4.5, "dark {dark}: {words:08x?}: {ratio:.2}");
                 }
-                // And on a neutral button on the page, as a destructive
-                // button's words are.
+                // And on a neutral button on the page.
                 let page = side(BG, dark);
                 let button = mix(
                     page,
@@ -704,6 +732,42 @@ mod tests {
                     ratio >= 4.5,
                     "dark {dark}: {words:08x?} on fill: {ratio:.2}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn a_destructive_button_s_words_read_on_every_ground_at_rest_and_under_the_pointer() {
+        for dark in [true, false] {
+            let words = side(FAIL_TEXT, dark);
+            for ground in [BG, BAR_BG, SURF, RAISED] {
+                let ground = side(ground, dark);
+                let hovered = mix(ground, side(FAIL, dark), DESTRUCTIVE_HOVER);
+                for (state, under) in [("rest", ground), ("hover", hovered)] {
+                    let ratio = accent::contrast(words, under);
+                    assert!(ratio >= 4.5, "dark {dark}, {state}: {ratio:.2}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_primary_button_s_words_read_on_the_accent_at_rest_and_under_the_pointer() {
+        let mut both = vec![ACC];
+        for system in [0x007affff, 0xffc600ff, 0xff3b30ff, 0x28cd41ff, 0x8c8c8cff] {
+            both.push(accents(Some(rgba(system))));
+        }
+        for accent in both {
+            for dark in [true, false] {
+                let (ground, words) = (side(accent, dark), side(ON_ACCENT, dark));
+                let hovered = mix(ground, side(INK, dark), PRIMARY_HOVER);
+                for (state, under) in [("rest", ground), ("hover", hovered)] {
+                    let ratio = accent::contrast(words, under);
+                    assert!(
+                        ratio >= 4.5,
+                        "{accent:08x?} dark {dark}, {state}: {ratio:.2}"
+                    );
+                }
             }
         }
     }

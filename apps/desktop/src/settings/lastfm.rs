@@ -11,7 +11,7 @@ use gpui::{
 use super::act;
 use super::controls::{
     MONO, actions, boxed, chosen, clickable, date_field, edit, group, grow, heading, label_status,
-    label_value, note, pop_up, problem, push, row, spinner, sub, sub_wraps, switch_row,
+    note, pop_up, problem, push, row, sub, sub_wraps, switch_row, working,
 };
 use super::model::{Busy, Group, Model, NO_LIBRARY_YET, SigningIn, Zones};
 use super::words::{Clock, all_zones, last_import, next_import, when, zone_name, zone_span};
@@ -145,7 +145,7 @@ pub(super) fn render(
     // ---- Account
     let account = match &model.signing_in {
         SigningIn::Waiting { .. } => row()
-            .child(spinner("signing-in"))
+            .child(working())
             .child(
                 grow()
                     .child("Waiting for you to allow Ritornel on Last.fm…")
@@ -182,9 +182,11 @@ pub(super) fn render(
             ))),
         _ => row()
             .child(grow().child(if status.sign_in_again {
-                "Last.fm turned the session down. Sign in again."
+                div()
+                    .text_color(theme::need_text())
+                    .child("Last.fm turned the session down. Sign in again.")
             } else {
-                "Not signed in"
+                div().child("Not signed in")
             }))
             .child(actions().child(push(
                 "sign-in",
@@ -267,7 +269,15 @@ pub(super) fn render(
                     Status::Quiet
                 },
             ),
-            label_value("Next import", next_import(&status.import, clock)),
+            label_status(
+                "Next import",
+                next_import(&status.import, clock),
+                if status.import.running {
+                    Status::Working
+                } else {
+                    Status::Quiet
+                },
+            ),
             row()
                 .child(grow().child(div().text_color(theme::dim()).child(format!(
                     "{} {} imported",
@@ -292,7 +302,7 @@ pub(super) fn render(
                 row()
                     .gap(px(8.))
                     .text_color(theme::dim())
-                    .child(spinner("reading-zones"))
+                    .child(working())
                     .child("Reading…"),
             );
         }
@@ -449,7 +459,7 @@ pub(super) fn render(
                 act(entity, |model, _, cx| model.remove(cx)),
             ))
             .when(busy(Busy::Zones), |foot| {
-                foot.child(div().ml(px(6.)).child(spinner("zones")))
+                foot.child(div().ml(px(6.)).child(working()))
             }),
     );
     let removing = entity.clone();
