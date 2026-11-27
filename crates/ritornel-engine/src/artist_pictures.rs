@@ -23,6 +23,7 @@ use serde::Deserialize;
 use unicode_normalization::UnicodeNormalization;
 
 use crate::media::{image_size, mime_of};
+use crate::platform::refused;
 use crate::resolve_store::{artist_mbids, rows};
 use crate::{Error, LibraryStore, WriteRequest, Written};
 
@@ -84,11 +85,6 @@ pub(crate) fn read_inside(root: &Path, rel: &str, cap: u64) -> std::io::Result<V
         return Err(refused("larger than it may be"));
     }
     Ok(bytes)
-}
-
-/// An error that says the folder holds something that may not be read.
-pub(crate) fn refused(why: &str) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::InvalidInput, why.to_owned())
 }
 
 /// A folder found to be a picture folder of format 1. An import takes one,

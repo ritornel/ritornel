@@ -1,11 +1,14 @@
 //! Walking a root: every audio file under it, with its size and when it
-//! was last modified, and each folder's own images. Nothing is opened, and
-//! nothing is ever written: a root is read-only to the server. See
+//! was last modified, and each folder's own images; and opening what it
+//! found for the scan to read. The walk opens only folders, each relative
+//! to the one before it and none followed if it is a link, and nothing is
+//! ever written: a root is read-only to the server. See
 //! "Scanning and audio hashing" and "Rescans and file moves" in
 //! docs/internals/identity.md.
 
 use std::collections::BTreeMap;
-use std::io::ErrorKind;
+use std::fs::File;
+use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::UNIX_EPOCH;
@@ -14,6 +17,7 @@ use ritornel_domain::layout;
 
 use crate::Error;
 use crate::media::is_folder_image;
+use crate::platform::{Folder, Kind, entry_missing, met_a_link, refused};
 
 /// The extensions of the files a scan takes to be audio. A file Symphonia
 /// cannot demux is here too, so that it is recorded as unreadable rather
@@ -122,37 +126,38 @@ fn unreadable(walked: &mut Walked, rel: &str) {
         .push((rel.to_owned(), "the folder cannot be read"));
 }
 
-/// Lists the folder `dir`, at `rel` under the root: its audio files and
-/// images go into `walked`, and the folders in it are returned, to be
-/// listed in their turn.
+/// Lists the open folder `folder`, at `rel` under the root: its audio
+/// files and images go into `walked`, and the folders in it are returned,
+/// relative to the root, to be listed in their turn. What is in it is
+/// described from the open folder, not by a path from the root.
 fn list(
-    dir: &Path,
+    folder: &Folder,
     rel: &str,
     walked: &mut Walked,
     stop: &AtomicBool,
-) -> Result<Vec<(PathBuf, String)>, Error> {
+) -> Result<Vec<String>, Error> {
     let mut folders = Vec::new();
-    let entries = match std::fs::read_dir(dir) {
+    let entries = match folder.list() {
         Ok(entries) => entries,
         // A folder inside the root that the server may not read, as a
         // disk's `lost+found` is, is passed over and named, and what was
         // known in it is kept. Any other failure fails the walk, rather
         // than what the folder held being taken for gone.
-        // A folder removed since its parent was listed is gone, with all
-        // that was in it, as it would be had the walk come a moment later.
-        Err(error) if !rel.is_empty() && error.kind() == ErrorKind::NotFound => return Ok(folders),
         Err(error) if !rel.is_empty() && error.kind() == ErrorKind::PermissionDenied => {
             unreadable(walked, rel);
             return Ok(folders);
         }
+        // Removed since it was opened: gone, as it would be had the walk
+        // come a moment later.
+        Err(error) if !rel.is_empty() && entry_missing(&error) => {
+            return Ok(folders);
+        }
         Err(error) => return Err(Error::Io(error)),
     };
-    for entry in entries {
+    for (name, kind) in entries {
         if stop.load(Ordering::Relaxed) {
             return Ok(Vec::new());
         }
-        let entry = entry.map_err(Error::Io)?;
-        let name = entry.file_name();
         let joined = |name: &str| {
             if rel.is_empty() {
                 name.to_owned()
@@ -160,7 +165,7 @@ fn list(
                 format!("{rel}/{name}")
             }
         };
-        let Some(name) = name.to_str() else {
+        let Some(text) = name.to_str() else {
             walked
                 .skipped
                 .push((joined(&name.to_string_lossy()), "its name is not UTF-8"));
@@ -168,77 +173,96 @@ fn list(
         };
         // Hidden files, and the resource forks macOS leaves on other
         // file systems.
-        if name.starts_with('.') {
+        if text.starts_with('.') {
             continue;
         }
-        let path = joined(name);
-        // A folder that may be listed but not gone into, mode `r--`, says
-        // no only here: it is passed over as one that cannot be listed.
-        let denied =
-            |error: &std::io::Error| !rel.is_empty() && error.kind() == ErrorKind::PermissionDenied;
-        let kind = match entry.file_type() {
-            Ok(kind) => kind,
-            Err(error) if error.kind() == ErrorKind::NotFound => continue,
-            Err(error) if denied(&error) => {
-                unreadable(walked, rel);
-                return Ok(Vec::new());
-            }
-            Err(error) => return Err(Error::Io(error)),
-        };
-        if kind.is_dir() {
-            folders.push((entry.path(), path));
+        let path = joined(text);
+        if kind == Kind::Folder {
+            folders.push(path);
             continue;
         }
         // A link to a file is followed. A link to a folder is not: it
         // could lead back to where the walk came from. A link that leads
-        // nowhere is passed over; a file the system will not describe
-        // fails the walk, rather than being taken for gone.
-        // A file removed since the folder was listed is gone, as it would
-        // be had the walk come a moment later.
-        let metadata = match std::fs::metadata(entry.path()) {
-            Ok(metadata) => metadata,
-            Err(_) if kind.is_symlink() => continue,
-            Err(error) if error.kind() == ErrorKind::NotFound => continue,
-            Err(error) if denied(&error) => {
+        // nowhere, or round to itself, is passed over. A file removed
+        // since the folder was listed is gone, as it would be had the walk
+        // come a moment later. A file the server may not describe, a link
+        // to one included, leaves the folder as one that cannot be read,
+        // as does a folder that may be listed but not gone into, mode
+        // `r--`, which says no only here. Any other failure fails the walk,
+        // rather than a file being taken for gone.
+        let described = match folder.describe(&name) {
+            Ok(described) => described,
+            Err(error) if kind == Kind::Link && (entry_missing(&error) || met_a_link(&error)) => {
+                continue;
+            }
+            Err(error) if entry_missing(&error) => continue,
+            Err(error) if !rel.is_empty() && error.kind() == ErrorKind::PermissionDenied => {
                 unreadable(walked, rel);
                 return Ok(Vec::new());
             }
             Err(error) => return Err(Error::Io(error)),
         };
-        if !metadata.is_file() {
+        if !described.is_file {
             continue;
         }
         let seen = Seen {
             path,
-            size: metadata.len(),
-            mtime_ms: mtime_ms(&metadata),
+            size: described.len,
+            mtime_ms: described.mtime_ms,
         };
-        if is_audio(name) {
+        if is_audio(text) {
             walked.files.push(seen);
-        } else if is_folder_image(name) {
+        } else if is_folder_image(text) {
             walked.images.entry(rel.to_owned()).or_default().push(seen);
-        } else if layout::kind(name).is_some() && seen.size <= layout::SIDECAR_MAX_BYTES {
+        } else if layout::kind(text).is_some() && seen.size <= layout::SIDECAR_MAX_BYTES {
             walked.sidecars.push(seen);
         }
     }
     Ok(folders)
 }
 
+/// What the walk asks of the system, which a test may answer instead.
+struct Seams<'a> {
+    /// Which folder is at the root's path once the walk is done.
+    root_id: &'a dyn Fn(&Path) -> Option<FolderId>,
+    /// Which folder the one opened at `rel` under the root is: `""` for
+    /// the root.
+    id: &'a dyn Fn(&str, &Folder) -> Option<FolderId>,
+    /// Told of each folder under the root, by its path relative to the
+    /// root, before it is opened.
+    opening: &'a dyn Fn(&str),
+}
+
+fn opened_id(_: &str, folder: &Folder) -> Option<FolderId> {
+    folder.id()
+}
+
+/// What the system says.
+const SYSTEM: Seams<'static> = Seams {
+    root_id: &folder_id,
+    id: &opened_id,
+    opening: &|_| {},
+};
+
 /// Lists the root and every folder under it, one at a time from a list of
 /// those still to go rather than by recursion, so that how deep a tree
 /// goes costs no stack. A folder that is one of the folders it is inside,
 /// as a bind mount can make, is passed over rather than gone round again.
+/// Every folder under the open root `top` is opened from it, a part at a
+/// time and none followed if it is a link: one on the way that has become
+/// a link since a folder was queued, or the folder itself, leads nowhere,
+/// as a link to a folder found in a listing does.
 fn walk_tree(
-    root: &Path,
+    top: &Folder,
     walked: &mut Walked,
     stop: &AtomicBool,
-    id_of: &dyn Fn(&Path) -> Option<FolderId>,
+    seams: &Seams<'_>,
 ) -> Result<(), Error> {
     // Each folder still to list, with how deep it is; and the identity of
     // each folder on the way down to the one being listed.
-    let mut todo = vec![(root.to_owned(), String::new(), 0)];
+    let mut todo = vec![(String::new(), 0)];
     let mut ancestors: Vec<Option<FolderId>> = Vec::new();
-    while let Some((dir, rel, depth)) = todo.pop() {
+    while let Some((rel, depth)) = todo.pop() {
         if stop.load(Ordering::Relaxed) {
             return Ok(());
         }
@@ -246,27 +270,29 @@ fn walk_tree(
         // this one are the first `depth` of those last gone down.
         ancestors.truncate(depth);
         if depth > 0 {
-            // Re-check the folder's own entry before going into it: a folder
-            // that is already a link when the walk reaches it is not
-            // followed.
-            match std::fs::symlink_metadata(&dir) {
-                Ok(metadata) if metadata.file_type().is_dir() => {}
-                Ok(_) => continue,
-                Err(error) if error.kind() == ErrorKind::NotFound => continue,
-                Err(error) if error.kind() == ErrorKind::PermissionDenied => {
-                    unreadable(walked, &rel);
-                    continue;
-                }
-                Err(error) => return Err(Error::Io(error)),
-            }
+            (seams.opening)(&rel);
         }
-        // A zero file index is what some network or virtual filesystems
+        let folder = match top.open_folder(&parts(&rel)) {
+            Ok(folder) => folder,
+            // A folder removed since its parent was listed is gone, with
+            // all that was in it, as it would be had the walk come a moment
+            // later.
+            Err(error) if depth > 0 && entry_missing(&error) => continue,
+            Err(error) if depth > 0 && met_a_link(&error) => continue,
+            Err(error) if depth > 0 && error.kind() == ErrorKind::PermissionDenied => {
+                unreadable(walked, &rel);
+                continue;
+            }
+            Err(error) => return Err(Error::Io(error)),
+        };
+        // Which folder was opened, asked of it rather than of a path. A
+        // zero file index is what some network or virtual filesystems
         // return for every folder, so it proves no cycle. Both device and
         // index must match an ancestor (`FolderId` is `(device, index)`).
         let here = if depth == 0 {
             Some(walked.root_id)
         } else {
-            id_of(&dir)
+            (seams.id)(&rel, &folder)
         }
         .filter(|&(_, index)| index != 0);
         // Not gone into, and what was known in it is kept, as in a folder
@@ -277,10 +303,54 @@ fn walk_tree(
             continue;
         }
         ancestors.push(here);
-        let folders = list(&dir, &rel, walked, stop)?;
-        todo.extend(folders.into_iter().map(|(dir, rel)| (dir, rel, depth + 1)));
+        let folders = list(&folder, &rel, walked, stop)?;
+        todo.extend(folders.into_iter().map(|rel| (rel, depth + 1)));
     }
     Ok(())
+}
+
+/// The parts of `rel`, a path the walk made relative to the root with `/`
+/// between its parts: none for the root.
+fn parts(rel: &str) -> Vec<&str> {
+    rel.split('/').filter(|part| !part.is_empty()).collect()
+}
+
+/// Opens the file at `rel` under `root`, a path the walk found, for the
+/// scan to read. Each folder on the way is opened from the last without
+/// following a link ([`Folder::open_folder`]), so the read stays under the
+/// root however a folder above the file changes during the scan; a link to
+/// a file is followed, as the walk follows it. A path with an empty part,
+/// `.` or `..` is refused, and so is anything but a regular file; a pipe
+/// does not hold the open up.
+pub(crate) fn open_under(root: &Path, rel: &str) -> std::io::Result<File> {
+    let parts: Vec<&str> = rel.split('/').collect();
+    if parts
+        .iter()
+        .any(|part| part.is_empty() || *part == "." || *part == "..")
+    {
+        return Err(refused("not a plain path"));
+    }
+    let Some((name, dirs)) = parts.split_last() else {
+        return Err(refused("no path"));
+    };
+    let file = Folder::open_root(root)?
+        .open_folder(dirs)?
+        .open(name, true)?;
+    if !file.metadata()?.is_file() {
+        return Err(refused("not a regular file"));
+    }
+    Ok(file)
+}
+
+/// Reads the file at `rel` under `root` whole, as [`open_under`] opens it,
+/// and of it at most `cap` bytes and one more, so that a file larger than
+/// it may be is seen to be.
+pub(crate) fn read_under(root: &Path, rel: &str, cap: u64) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    open_under(root, rel)?
+        .take(cap.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 /// Walks a root. A root that is missing, is not a folder, has no identity
@@ -290,30 +360,27 @@ fn walk_tree(
 /// must not mark its files missing. Emptiness is decided by what the walk
 /// counts, never by whether the folder has entries.
 pub(crate) fn walk(root: &Path, stop: &AtomicBool) -> Result<Walked, Error> {
-    walk_by(root, stop, &folder_id)
+    walk_by(root, stop, &SYSTEM)
 }
 
-/// [`walk`], with what says which folder is at a path.
-fn walk_by(
-    root: &Path,
-    stop: &AtomicBool,
-    id_of: &dyn Fn(&Path) -> Option<FolderId>,
-) -> Result<Walked, Error> {
+/// [`walk`], asking `seams` what it would ask the system.
+fn walk_by(root: &Path, stop: &AtomicBool, seams: &Seams<'_>) -> Result<Walked, Error> {
     let offline = || Error::RootOffline {
         path: root.to_owned(),
     };
-    std::fs::read_dir(root).map_err(|_| offline())?;
+    // The root is opened once, and its identity asked of what was opened.
     // A root that cannot be told from another folder mounted at its path
     // later is not walked: nothing could prove that what the scan then
     // reads, or does not find, is of the folder it walked.
+    let top = Folder::open_root(root).map_err(|_| offline())?;
     let mut walked = Walked {
-        root_id: id_of(root).ok_or_else(offline)?,
+        root_id: (seams.id)("", &top).ok_or_else(offline)?,
         ..Walked::default()
     };
-    walk_tree(root, &mut walked, stop, id_of)?;
+    walk_tree(&top, &mut walked, stop, seams)?;
     // A walk that was asked to stop has not looked everywhere.
     if !stop.load(Ordering::Relaxed)
-        && (walked.files.is_empty() || id_of(root) != Some(walked.root_id))
+        && (walked.files.is_empty() || (seams.root_id)(root) != Some(walked.root_id))
     {
         return Err(offline());
     }
@@ -500,12 +567,17 @@ mod tests {
             ("n", None),
             ("n/m", None),
         ];
-        let id_of = |path: &Path| {
+        let id_of = |rel: &str| {
             ids.iter()
-                .find(|(rel, _)| under(root, rel) == path)
+                .find(|(at, _)| *at == rel)
                 .and_then(|(_, id)| *id)
         };
-        let walked = walk_by(root, &AtomicBool::new(false), &id_of).unwrap();
+        let seams = Seams {
+            root_id: &|_| id_of(""),
+            id: &|rel, _| id_of(rel),
+            ..SYSTEM
+        };
+        let walked = walk_by(root, &AtomicBool::new(false), &seams).unwrap();
         let paths: Vec<&str> = walked.files.iter().map(|seen| seen.path.as_str()).collect();
         assert_eq!(
             paths,
@@ -533,7 +605,12 @@ mod tests {
         // index for every folder: subfolders must still be walked, and
         // nothing is skipped as inside itself.
         for id in [(1, 0), (0, 0)] {
-            let walked = walk_by(root, &AtomicBool::new(false), &|_| Some(id)).unwrap();
+            let seams = Seams {
+                root_id: &|_| Some(id),
+                id: &|_, _| Some(id),
+                ..SYSTEM
+            };
+            let walked = walk_by(root, &AtomicBool::new(false), &seams).unwrap();
             let paths: Vec<&str> = walked.files.iter().map(|seen| seen.path.as_str()).collect();
             assert_eq!(paths, ["a/01.flac", "a/b/02.flac", "c/03.flac"]);
             assert!(walked.skipped.is_empty(), "{:?}", walked.skipped);
@@ -548,7 +625,12 @@ mod tests {
         std::fs::write(root.join("01.flac"), b"12345").unwrap();
         // As a volume the system gives no identity for: what the scan
         // later finds there could be of any disk mounted at the path.
-        let refused = walk_by(root, &AtomicBool::new(false), &|_| None);
+        let seams = Seams {
+            root_id: &|_| None,
+            id: &|_, _| None,
+            ..SYSTEM
+        };
+        let refused = walk_by(root, &AtomicBool::new(false), &seams);
         assert!(
             matches!(&refused, Err(Error::RootOffline { path }) if path == root),
             "{refused:?}"
@@ -563,15 +645,14 @@ mod tests {
         let root = scratch.path();
         std::fs::write(root.join("01.flac"), b"12345").unwrap();
         let calls = AtomicUsize::new(0);
-        let id_of = |path: &Path| {
-            if path == root {
+        let seams = Seams {
+            root_id: &|_| {
                 let n = calls.fetch_add(1, Ordering::Relaxed);
                 Some((1, 1 + n as u64))
-            } else {
-                folder_id(path)
-            }
+            },
+            ..SYSTEM
         };
-        let refused = walk_by(root, &AtomicBool::new(false), &id_of);
+        let refused = walk_by(root, &AtomicBool::new(false), &seams);
         assert!(
             matches!(&refused, Err(Error::RootOffline { path }) if path == root),
             "{refused:?}"
@@ -590,23 +671,20 @@ mod tests {
         std::fs::write(root.join("b/02.flac"), b"12345").unwrap();
         std::fs::write(outside.join("escaped.flac"), b"12345").unwrap();
         let swapped = AtomicBool::new(false);
-        let id_of = |path: &Path| {
-            // Once the walk visits one sibling, replace the other queued
-            // sibling with a link to a folder outside the root.
-            if (path == root.join("a") || path == root.join("b"))
-                && !swapped.swap(true, Ordering::Relaxed)
-            {
-                let other = if path == root.join("a") {
-                    root.join("b")
-                } else {
-                    root.join("a")
-                };
+        // Once the walk opens one sibling, the other queued sibling is
+        // replaced with a link to a folder outside the root.
+        let opening = |rel: &str| {
+            if !swapped.swap(true, Ordering::Relaxed) {
+                let other = root.join(if rel == "a" { "b" } else { "a" });
                 std::fs::remove_dir_all(&other).unwrap();
                 crate::platform::link_folder(&outside, &other);
             }
-            folder_id(path)
         };
-        let walked = walk_by(&root, &AtomicBool::new(false), &id_of).unwrap();
+        let seams = Seams {
+            opening: &opening,
+            ..SYSTEM
+        };
+        let walked = walk_by(&root, &AtomicBool::new(false), &seams).unwrap();
         let paths: Vec<&str> = walked.files.iter().map(|seen| seen.path.as_str()).collect();
         assert!(swapped.load(Ordering::Relaxed));
         assert!(
@@ -614,6 +692,221 @@ mod tests {
             "{paths:?}"
         );
         assert_eq!(paths.len(), 1);
+    }
+
+    /// Makes `files` under `root`, each a copy of the fixture FLAC.
+    fn flacs(root: &Path, files: &[&str]) {
+        let flac = std::fs::read(crate::media_fixtures::fixtures().join("a.flac")).unwrap();
+        for path in files {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, &flac).unwrap();
+        }
+    }
+
+    /// Replaces the folder `rel` under `root` with a link to `outside`,
+    /// moving the folder to `moved`.
+    fn replace_with_link(root: &Path, rel: &str, outside: &Path, moved: &Path) {
+        std::fs::rename(under(root, rel), moved).unwrap();
+        crate::platform::link_folder(outside, &under(root, rel));
+    }
+
+    #[test]
+    fn a_folder_above_a_queued_one_replaced_by_a_link_is_not_followed() {
+        let scratch = Scratch::new();
+        let root = scratch.path().join("root");
+        let outside = scratch.path().join("outside");
+        flacs(
+            &root,
+            &["top.flac", "Artist/Album/01.flac", "Artist/Other/02.flac"],
+        );
+        flacs(&outside, &["Album/escaped.flac", "Other/escaped.flac"]);
+        let swapped = AtomicBool::new(false);
+        // Once `Artist` is listed and both its folders are queued, and
+        // before either is opened, `Artist` becomes a link to a folder
+        // outside the root that holds folders of the same names.
+        let opening = |rel: &str| {
+            if rel.starts_with("Artist/") && !swapped.swap(true, Ordering::Relaxed) {
+                replace_with_link(&root, "Artist", &outside, &scratch.path().join("moved"));
+            }
+        };
+        let seams = Seams {
+            opening: &opening,
+            ..SYSTEM
+        };
+        let walked = walk_by(&root, &AtomicBool::new(false), &seams).unwrap();
+        assert!(swapped.load(Ordering::Relaxed));
+        let paths: Vec<&str> = walked.files.iter().map(|seen| seen.path.as_str()).collect();
+        assert_eq!(paths, ["top.flac"]);
+        assert!(walked.skipped.is_empty(), "{:?}", walked.skipped);
+    }
+
+    #[test]
+    fn a_folder_replaced_by_a_link_to_the_root_is_a_link_and_not_inside_itself() {
+        let scratch = Scratch::new();
+        let root = scratch.path().join("root");
+        flacs(&root, &["a/01.flac", "b/02.flac"]);
+        let swapped = AtomicBool::new(false);
+        // Once the walk opens one sibling, the other becomes a link to the
+        // root: it is passed over as a link is, and what was known in it
+        // is not kept as if it were a folder inside itself.
+        let opening = |rel: &str| {
+            if !swapped.swap(true, Ordering::Relaxed) {
+                let other = if rel == "a" { "b" } else { "a" };
+                let moved = scratch.path().join("moved");
+                replace_with_link(&root, other, &root, &moved);
+            }
+        };
+        let seams = Seams {
+            opening: &opening,
+            ..SYSTEM
+        };
+        let walked = walk_by(&root, &AtomicBool::new(false), &seams).unwrap();
+        assert!(swapped.load(Ordering::Relaxed));
+        assert_eq!(walked.files.len(), 1);
+        assert!(walked.skipped.is_empty(), "{:?}", walked.skipped);
+        assert!(walked.unreadable.is_empty(), "{:?}", walked.unreadable);
+    }
+
+    #[test]
+    fn a_root_that_is_a_link_is_followed_and_what_was_opened_stays_open() {
+        let scratch = Scratch::new();
+        flacs(&scratch.path().join("real"), &["a/01.flac"]);
+        flacs(&scratch.path().join("other"), &["a/elsewhere.flac"]);
+        let root = scratch.path().join("root");
+        crate::platform::link_folder(&scratch.path().join("real"), &root);
+        let walked = walk(&root, &AtomicBool::new(false)).unwrap();
+        let paths: Vec<&str> = walked.files.iter().map(|seen| seen.path.as_str()).collect();
+        assert_eq!(paths, ["a/01.flac"]);
+        // A root opened, and then pointed elsewhere: the folders opened in
+        // it are still the ones it was.
+        let top = Folder::open_root(&root).unwrap();
+        std::fs::rename(&root, scratch.path().join("old-link")).unwrap();
+        crate::platform::link_folder(&scratch.path().join("other"), &root);
+        let names: Vec<_> = top.open_folder(&["a"]).unwrap().list().unwrap();
+        assert_eq!(names, [("01.flac".into(), Kind::Other)]);
+    }
+
+    #[test]
+    fn only_a_plain_path_to_a_regular_file_is_opened_for_the_scan() {
+        let scratch = Scratch::new();
+        let root = scratch.path();
+        flacs(root, &["a/b.flac"]);
+        assert!(open_under(root, "a/b.flac").is_ok());
+        for rel in [
+            "",
+            "/a/b.flac",
+            "a//b.flac",
+            "a/b.flac/",
+            "./a/b.flac",
+            "a/../a/b.flac",
+        ] {
+            let refused = open_under(root, rel).unwrap_err();
+            assert_eq!(refused.kind(), ErrorKind::InvalidInput, "{rel}");
+        }
+        let folder = open_under(root, "a").unwrap_err();
+        assert_eq!(folder.kind(), ErrorKind::InvalidInput, "{folder:?}");
+    }
+
+    // A pipe: the call that makes one is the system's.
+    #[cfg(unix)]
+    #[test]
+    fn a_pipe_where_a_file_was_is_refused_without_waiting_for_a_writer() {
+        let scratch = Scratch::new();
+        let root = scratch.path();
+        let done = std::process::Command::new("mkfifo")
+            .arg(root.join("pipe.flac"))
+            .output()
+            .unwrap();
+        assert!(done.status.success(), "{done:?}");
+        let refused = open_under(root, "pipe.flac").unwrap_err();
+        assert_eq!(refused.kind(), ErrorKind::InvalidInput, "{refused:?}");
+    }
+
+    #[test]
+    fn a_file_whose_folder_above_became_a_link_after_the_walk_is_not_read() {
+        use crate::media::{UNAVAILABLE, read_file, read_folder_image};
+        let scratch = Scratch::new();
+        let root = scratch.path().join("root");
+        let outside = scratch.path().join("outside");
+        let files = ["Album/01.flac", "Album/cover.jpg", "Album/rip.log"];
+        flacs(&root.join("Artist"), &files);
+        flacs(&outside, &files);
+        let walked = walk(&root, &AtomicBool::new(false)).unwrap();
+        assert_eq!(walked.files.len(), 1);
+        assert_eq!(walked.images.len(), 1);
+        assert_eq!(walked.sidecars.len(), 1);
+        let read = |rel: &str| read_file(&root, rel, 0, 0, Vec::new());
+        assert!(read("Artist/Album/01.flac").audio.is_some());
+        assert!(read_folder_image(&root, "Artist/Album/cover.jpg", 0).is_some());
+        assert!(read_under(&root, "Artist/Album/rip.log", 1 << 20).is_ok());
+
+        // The scan reads what the walk found after it has walked: by then
+        // `Artist` is a link to a folder outside the root.
+        replace_with_link(&root, "Artist", &outside, &scratch.path().join("moved"));
+        let payload = read("Artist/Album/01.flac");
+        assert_eq!(payload.error.unwrap().kind, UNAVAILABLE);
+        assert_eq!(payload.audio, None);
+        assert!(read_folder_image(&root, "Artist/Album/cover.jpg", 0).is_none());
+        let refused = read_under(&root, "Artist/Album/rip.log", 1 << 20).unwrap_err();
+        assert!(met_a_link(&refused), "{refused:?}");
+        // A path that climbs out is refused before anything is opened.
+        let climbs = read_under(&root, "../outside/Album/rip.log", 1 << 20).unwrap_err();
+        assert_eq!(climbs.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn links_inside_the_root_are_passed_over_or_followed_as_they_were() {
+        use crate::platform::{link_file, link_folder};
+        let scratch = Scratch::new();
+        let root = scratch.path();
+        flacs(root, &["a/01.flac", "c/02.flac"]);
+        // A link to a file is followed, a link to a folder is not, and a
+        // link that leads nowhere is passed over: none stops the walk.
+        link_file(&root.join("a/01.flac"), &root.join("a/linked.flac"));
+        std::fs::create_dir(root.join("b")).unwrap();
+        link_folder(&root.join("a"), &root.join("b/loop"));
+        link_file(&root.join("gone.flac"), &root.join("c/dangling.flac"));
+        let walked = walk(root, &AtomicBool::new(false)).unwrap();
+        let paths: Vec<&str> = walked.files.iter().map(|seen| seen.path.as_str()).collect();
+        assert_eq!(paths, ["a/01.flac", "a/linked.flac", "c/02.flac"]);
+        assert!(walked.skipped.is_empty(), "{:?}", walked.skipped);
+        assert!(walked.unreadable.is_empty(), "{:?}", walked.unreadable);
+        // The scan reads a linked file as the walk found it.
+        let payload = crate::media::read_file(root, "a/linked.flac", 0, 0, Vec::new());
+        assert!(payload.audio.is_some(), "{:?}", payload.error);
+    }
+
+    #[test]
+    fn a_file_in_a_folder_that_cannot_be_read_is_unavailable_to_the_scan() {
+        use crate::platform::set_listable;
+        let scratch = Scratch::new();
+        let root = scratch.path();
+        flacs(root, &["a/01.flac", "a/rip.log"]);
+        set_listable(&root.join("a"), false);
+        let payload = crate::media::read_file(root, "a/01.flac", 0, 0, Vec::new());
+        let sidecar = read_under(root, "a/rip.log", 1 << 20);
+        set_listable(&root.join("a"), true);
+        assert_eq!(payload.error.unwrap().kind, crate::media::UNAVAILABLE);
+        assert_eq!(payload.audio, None);
+        let denied = sidecar.unwrap_err();
+        assert_eq!(denied.kind(), ErrorKind::PermissionDenied, "{denied:?}");
+    }
+
+    #[test]
+    fn the_walk_gives_each_file_the_size_and_time_the_system_does() {
+        let scratch = Scratch::new();
+        let root = scratch.path();
+        flacs(root, &["a/01.flac", "02.flac"]);
+        let walked = walk(root, &AtomicBool::new(false)).unwrap();
+        assert_eq!(walked.files.len(), 2);
+        // A rescan tells a changed file by these, so they must be what
+        // `std` would have said.
+        for seen in &walked.files {
+            let metadata = std::fs::metadata(under(root, &seen.path)).unwrap();
+            assert_eq!(seen.size, metadata.len());
+            assert_eq!(seen.mtime_ms, mtime_ms(&metadata));
+        }
     }
 
     // Only Linux keeps a name that is not UTF-8 as it was given.

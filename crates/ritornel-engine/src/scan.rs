@@ -31,7 +31,6 @@
 //! were due (docs/internals/corrections.md, "Disc layouts").
 
 use std::collections::{HashMap, HashSet};
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -46,7 +45,7 @@ use crate::evidence_store::{KnownSidecar, LAYOUTS_METHOD, SIDECARS_METHOD, Sidec
 use crate::jobs::{Job, Progress, step_command};
 use crate::media::{UNAVAILABLE, read_file, read_folder_image};
 use crate::scan_store::{Known, RecordOp, Source};
-use crate::walk::{Seen, Walked, folder_id, folder_of, under, walk};
+use crate::walk::{Seen, Walked, folder_id, folder_of, read_under, walk};
 use crate::{Command, Error, Fingerprint, LibraryStore, Resolved, ServerStore, WriteRequest};
 
 /// The most sidecar bytes one step reads and records.
@@ -350,8 +349,7 @@ impl ScanRun {
                         .into_iter()
                         .flatten()
                         .filter_map(|image| {
-                            let name = image.path.rsplit('/').next().unwrap_or(&image.path);
-                            read_folder_image(&under(&self.root, &image.path), name, image.mtime_ms)
+                            read_folder_image(&self.root, &image.path, image.mtime_ms)
                         })
                         .collect();
                     self.images.insert(folder.to_owned(), images);
@@ -976,12 +974,7 @@ impl ScanRun {
                 .filter(|known| !known.missing)
                 .map(|known| known.id);
             let name = seen.path.rsplit('/').next().unwrap_or(&seen.path);
-            let read = std::fs::File::open(under(&self.root, &seen.path)).and_then(|file| {
-                let mut bytes = Vec::new();
-                file.take(layout::SIDECAR_MAX_BYTES + 1)
-                    .read_to_end(&mut bytes)
-                    .map(|_| bytes)
-            });
+            let read = read_under(&self.root, &seen.path, layout::SIDECAR_MAX_BYTES);
             if let Ok(bytes) = &read {
                 bytes_read += bytes.len();
             }
@@ -997,7 +990,7 @@ impl ScanRun {
                 Ok(_) => self
                     .sidecar_ops
                     .extend(live.map(|id| SidecarOp::Gone { id })),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Err(error) if crate::platform::entry_missing(&error) => {
                     self.sidecar_ops
                         .extend(live.map(|id| SidecarOp::Gone { id }));
                 }

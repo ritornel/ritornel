@@ -1,6 +1,6 @@
-//! What a handle says about the file it is open on: which file it is, and
-//! the path it really has; the room left on a disk; and a rename written
-//! through to it.
+//! What a handle says about the file it is open on: which file it is, the
+//! path it really has, and whether it is a link; the room left on a disk;
+//! and a rename written through to it.
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -10,9 +10,11 @@ use std::path::{Path, PathBuf};
 
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_NAME_NORMALIZED,
-    FILE_READ_ATTRIBUTES, GetDiskFreeSpaceExW, GetFileInformationByHandle,
-    GetFinalPathNameByHandleW, MOVEFILE_WRITE_THROUGH, MoveFileExW, VOLUME_NAME_DOS,
+    BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_INFO, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES,
+    FileAttributeTagInfo, FileIdInfo, GetDiskFreeSpaceExW, GetFileInformationByHandle,
+    GetFileInformationByHandleEx, GetFinalPathNameByHandleW, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    VOLUME_NAME_DOS,
 };
 
 /// Which file or folder is at `path`: the serial number of its volume and
@@ -23,6 +25,12 @@ pub fn id(path: &Path) -> io::Result<(u64, u64)> {
         .access_mode(FILE_READ_ATTRIBUTES)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
         .open(path)?;
+    id_of(&file)
+}
+
+/// Which file or folder `file` is open on, as [`id`] says of a path. The
+/// handle must be open to read attributes.
+pub fn id_of(file: &File) -> io::Result<(u64, u64)> {
     // SAFETY: plain data, for which all zeroes is valid.
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: the handle is open for the call and `info` is written by it.
@@ -31,6 +39,31 @@ pub fn id(path: &Path) -> io::Result<(u64, u64)> {
     }
     let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
     Ok((u64::from(info.dwVolumeSerialNumber), index))
+}
+
+/// Which file or folder `file` is open on, by its volume's serial number
+/// and its 128-bit file ID (`FileIdInfo`). Returns `None` when the file
+/// system gives a zero ID, and returns an error when `FileIdInfo` fails so
+/// callers never compare mixed or colliding 64-bit fallback indices.
+pub fn identity(file: &File) -> io::Result<Option<(u64, u128)>> {
+    // SAFETY: plain data, for which all zeroes is valid.
+    let mut info: FILE_ID_INFO = unsafe { std::mem::zeroed() };
+    let size = u32::try_from(std::mem::size_of::<FILE_ID_INFO>()).unwrap_or(u32::MAX);
+    // SAFETY: the handle is open for the call, and `info` is as large as
+    // `size` says and written by it.
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle() as HANDLE,
+            FileIdInfo,
+            (&raw mut info).cast(),
+            size,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let id = u128::from_ne_bytes(info.FileId.Identifier);
+    Ok((id != 0).then_some((info.VolumeSerialNumber, id)))
 }
 
 /// The path `file` is really open at, with every link and junction on the
@@ -60,6 +93,41 @@ pub fn final_path(file: &File) -> io::Result<PathBuf> {
         use std::os::windows::ffi::OsStringExt;
         return Ok(PathBuf::from(std::ffi::OsString::from_wide(&buffer)));
     }
+}
+
+/// Whether `file`, opened without following it, is a link: a symbolic link,
+/// a junction, or another reparse point that names somewhere else (a name
+/// surrogate). A reparse point that does not, as a cloud file's placeholder
+/// is, is the file or folder itself. A file system without reparse points,
+/// as FAT and exFAT are, has no links, and is not asked for a tag.
+pub fn is_link(file: &File) -> io::Result<bool> {
+    use std::os::windows::fs::MetadataExt;
+    if file.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+        return Ok(false);
+    }
+    // SAFETY: plain data, for which all zeroes is valid.
+    let mut info: FILE_ATTRIBUTE_TAG_INFO = unsafe { std::mem::zeroed() };
+    let size = u32::try_from(std::mem::size_of::<FILE_ATTRIBUTE_TAG_INFO>()).unwrap_or(u32::MAX);
+    // SAFETY: the handle is open for the call, and `info` is as large as
+    // `size` says and written by it.
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle() as HANDLE,
+            FileAttributeTagInfo,
+            (&raw mut info).cast(),
+            size,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 && names_elsewhere(info.ReparseTag))
+}
+
+/// Whether a reparse tag names somewhere else (`IsReparseTagNameSurrogate`:
+/// bit 29 of the tag), as a symbolic link's and a junction's do.
+pub fn names_elsewhere(tag: u32) -> bool {
+    tag & 0x2000_0000 != 0
 }
 
 /// The bytes this user may still write on the disk that holds `path`.
@@ -130,6 +198,30 @@ mod tests {
         let real = final_path(&opened).unwrap();
         assert_eq!(real.file_name().unwrap(), "Mixed.flac");
         assert!(real.to_string_lossy().starts_with(r"\\?\"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_junction_is_a_link_and_the_folder_it_names_is_not() {
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        let dir = scratch("link");
+        std::fs::create_dir(dir.join("real")).unwrap();
+        let done = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(dir.join("junction"))
+            .arg(dir.join("real"))
+            .output()
+            .unwrap();
+        assert!(done.status.success(), "{done:?}");
+        let open = |name: &str| {
+            OpenOptions::new()
+                .access_mode(FILE_READ_ATTRIBUTES)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(dir.join(name))
+                .unwrap()
+        };
+        assert!(is_link(&open("junction")).unwrap());
+        assert!(!is_link(&open("real")).unwrap());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

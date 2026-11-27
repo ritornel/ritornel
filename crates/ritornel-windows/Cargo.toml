@@ -1,6 +1,6 @@
 [package]
 name = "ritornel-windows"
-description = "What Ritornel asks of Windows that the standard library cannot: a lock on one byte, owner-only access, a file's identity, a rename written through to the disk, a clock that counts through sleep, the machine's name as it was set, a hidden window, and the system's media transport controls."
+description = "What Ritornel asks of Windows that the standard library cannot: a lock on one byte, owner-only access, a file's identity, opening and listing relative to an open folder, a rename written through to the disk, a clock that counts through sleep, the machine's name as it was set, a hidden window, and the system's media transport controls."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,6 +12,8 @@ publish.workspace = true
 # other platform.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_Security",

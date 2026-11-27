@@ -8,6 +8,9 @@
 //! The rest of `mod.rs` is pure: how each kernel writes the boot it is on,
 //! read by every system's tests.
 
+use std::fs::File;
+use std::path::Path;
+
 use crate::Id;
 
 #[cfg(unix)]
@@ -34,9 +37,43 @@ use windows as system;
 ))]
 use other_unix as system;
 
-pub(crate) use system::{file_id, met_a_link, mono_ms, open_inside, read_at, read_boot};
+pub(crate) use system::{Folder, entry_missing, file_id, met_a_link, mono_ms, read_at, read_boot};
 #[cfg(test)]
 pub(crate) use system::{link_file, link_folder, mode_of, seal, set_listable};
+
+/// An error that says a folder holds something that may not be read.
+pub(crate) fn refused(why: &str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidInput, why.to_owned())
+}
+
+/// Opens `name` in the folders `dirs` under `root`, none of them nor the
+/// file followed if it is a link, as [`Folder`] opens them.
+pub(crate) fn open_inside(root: &Path, dirs: &[&str], name: &str) -> std::io::Result<File> {
+    Folder::open_root(root)?
+        .open_folder(dirs)?
+        .open(name, false)
+}
+
+/// What a folder's listing says one of its entries is, without following
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Kind {
+    Folder,
+    /// A symbolic link, or on Windows a junction too.
+    Link,
+    /// A file, or anything else that is not a folder.
+    Other,
+}
+
+/// What the system says of a file in a folder, following a link to it:
+/// whether it is a regular file, its size, and when it was last modified,
+/// in milliseconds since the epoch and 0 before it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Described {
+    pub(crate) is_file: bool,
+    pub(crate) len: u64,
+    pub(crate) mtime_ms: i64,
+}
 
 /// Any other Unix: its monotonic clock, and no boot ID.
 #[cfg(all(

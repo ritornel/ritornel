@@ -1,10 +1,17 @@
-//! What every Unix shares: its clocks, a file's device and inode, opening
-//! relative to an open folder, and reading at an offset.
+//! What every Unix shares: its clocks, a file's device and inode, listing,
+//! describing and opening relative to an open folder, and reading at an
+//! offset.
 
+use std::ffi::{OsStr, OsString};
 use std::fs::{File, Metadata};
+use std::os::fd::OwnedFd;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
+use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, open, openat, statat};
 use rustix::time::ClockId;
+
+use super::{Described, Kind};
 
 /// Milliseconds on the clock `clock`.
 pub(super) fn clock_ms(clock: ClockId) -> i64 {
@@ -20,26 +27,123 @@ pub(crate) fn file_id(_path: &Path, metadata: &Metadata) -> Option<(u64, u64)> {
     Some((metadata.dev(), metadata.ino()))
 }
 
-/// Opens `name` in the folders `dirs` under `root`. Each part is opened
-/// from the last without following a link, and the file without waiting,
-/// so a pipe cannot hold the read up.
-pub(crate) fn open_inside(root: &Path, dirs: &[&str], name: &str) -> std::io::Result<File> {
-    use rustix::fs::{Mode, OFlags, open, openat};
-    let into = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
-    let mut dir = open(root, into, Mode::empty())?;
-    for part in dirs {
-        dir = openat(&dir, *part, into | OFlags::NOFOLLOW, Mode::empty())?;
+/// A folder, open. Folders are opened in it, and what is in it listed,
+/// described and opened, relative to the open folder, never by a path
+/// from elsewhere: a folder above it that is renamed or replaced by a link
+/// meanwhile changes nothing reached through it.
+#[derive(Debug)]
+pub(crate) struct Folder(OwnedFd);
+
+const INTO: OFlags = OFlags::RDONLY
+    .union(OFlags::DIRECTORY)
+    .union(OFlags::CLOEXEC);
+
+impl Folder {
+    /// Opens the folder at `root`, following it if it is a link, as it was
+    /// given.
+    pub(crate) fn open_root(root: &Path) -> std::io::Result<Folder> {
+        Ok(Folder(open(root, INTO, Mode::empty())?))
     }
-    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
-    Ok(File::from(openat(&dir, name, flags, Mode::empty())?))
+
+    /// Opens the folders `dirs` in this one, each from the last without
+    /// following a link: one that is a link is `ELOOP` or `ENOTDIR`, as
+    /// [`met_a_link`] says, and so is one that is not a folder.
+    pub(crate) fn open_folder(&self, dirs: &[&str]) -> std::io::Result<Folder> {
+        let mut dir = self.0.try_clone()?;
+        for part in dirs {
+            dir = openat(&dir, *part, INTO | OFlags::NOFOLLOW, Mode::empty())?;
+        }
+        Ok(Folder(dir))
+    }
+
+    /// Which folder this is: its device and inode.
+    // The fields' types differ from one Unix to another; `std` casts them
+    // so too.
+    #[allow(clippy::unnecessary_cast)]
+    pub(crate) fn id(&self) -> Option<(u64, u64)> {
+        let stat = rustix::fs::fstat(&self.0).ok()?;
+        Some((stat.st_dev as u64, stat.st_ino as u64))
+    }
+
+    /// Every entry in the folder but `.` and `..`, with what it is. An
+    /// entry removed since the folder was read is left out; any other
+    /// failure to say what one is fails the listing, rather than a folder
+    /// being taken for a file.
+    pub(crate) fn list(&self) -> std::io::Result<Vec<(OsString, Kind)>> {
+        let mut entries = Vec::new();
+        for entry in Dir::read_from(&self.0)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if [&b"."[..], b".."].contains(&name.to_bytes()) {
+                continue;
+            }
+            // Some file systems leave the kind out of a listing.
+            let kind = match entry.file_type() {
+                FileType::Unknown => match statat(&self.0, name, AtFlags::SYMLINK_NOFOLLOW) {
+                    Ok(stat) => FileType::from_raw_mode(stat.st_mode),
+                    Err(rustix::io::Errno::NOENT) => continue,
+                    Err(error) => return Err(error.into()),
+                },
+                kind => kind,
+            };
+            let kind = match kind {
+                FileType::Directory => Kind::Folder,
+                FileType::Symlink => Kind::Link,
+                _ => Kind::Other,
+            };
+            entries.push((OsStr::from_bytes(name.to_bytes()).to_owned(), kind));
+        }
+        Ok(entries)
+    }
+
+    /// What the file `name` in the folder is, following it if it is a
+    /// link. Nothing is opened.
+    // The fields' types differ from one Unix to another.
+    #[allow(clippy::useless_conversion)]
+    pub(crate) fn describe(&self, name: &OsStr) -> std::io::Result<Described> {
+        let stat = statat(&self.0, name, AtFlags::empty())?;
+        let seconds = i64::from(stat.st_mtime);
+        let nanos = i64::try_from(stat.st_mtime_nsec).unwrap_or(0);
+        // As `std` counts it: the whole milliseconds since the epoch.
+        let mtime_ms = if seconds < 0 {
+            0
+        } else {
+            seconds
+                .saturating_mul(1000)
+                .saturating_add(nanos / 1_000_000)
+        };
+        Ok(Described {
+            is_file: FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile,
+            len: u64::try_from(stat.st_size).unwrap_or(0),
+            mtime_ms,
+        })
+    }
+
+    /// Opens the file `name` in the folder, following it if it is a link
+    /// only if `follow` says to, and without waiting, so a pipe cannot hold
+    /// the read up.
+    pub(crate) fn open(&self, name: &str, follow: bool) -> std::io::Result<File> {
+        let mut flags = OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC;
+        if !follow {
+            flags |= OFlags::NOFOLLOW;
+        }
+        Ok(File::from(openat(&self.0, name, flags, Mode::empty())?))
+    }
 }
 
-/// Whether [`open_inside`] failed on a link where a folder or the file
-/// should be.
+/// Whether opening failed on a link where a folder or the file should be,
+/// or on a file where a folder should be: what [`Folder::open_folder`] and
+/// [`Folder::open`] say of a link they do not follow.
 pub(crate) fn met_a_link(error: &std::io::Error) -> bool {
     [rustix::io::Errno::LOOP, rustix::io::Errno::NOTDIR]
         .iter()
         .any(|errno| error.raw_os_error() == Some(errno.raw_os_error()))
+}
+
+/// Whether a failure says that what was asked for is not there, and so is
+/// gone, rather than that it could not be reached.
+pub(crate) fn entry_missing(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound
 }
 
 /// Reads into `buffer` from `at` in `file`, leaving no place of its own.

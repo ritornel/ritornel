@@ -10,9 +10,12 @@
 //!   file holds can still be read while the lock is held.
 //! - `private`: a file or folder only its owner can open, and the check
 //!   that one is.
-//! - `file`: which file a path is (its volume and file index), the path a
-//!   handle really has, the room left on a disk, and a rename that asks
-//!   to be written through to the disk.
+//! - `file`: which file a path or a handle is (its volume and file index),
+//!   the path a handle really has, whether a handle is open on a link, the
+//!   room left on a disk, and a rename that asks to be written through to
+//!   the disk.
+//! - `folder`: a name opened relative to an open folder, as Unix's `openat`
+//!   opens one, and a folder listed by its handle.
 //! - `clock`: milliseconds since the machine started, through sleep.
 //! - `name`: the machine's host name, in the case it was set.
 //! - `window`: a hidden window, for a process that has none: it hears a
@@ -35,6 +38,7 @@
 
 pub mod clock;
 pub mod file;
+pub mod folder;
 pub mod lock;
 #[cfg(feature = "media")]
 pub mod media;
