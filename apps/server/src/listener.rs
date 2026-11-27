@@ -456,9 +456,12 @@ async fn require_credential(
     if request.method() == Method::POST && request.uri().path() == route::LINK {
         if !secure {
             info!("a satellite tried to join without TLS: it runs an older release");
+            // A conflict, as for another contract version, so a satellite of
+            // an older release shows this rather than calling the invite spent.
             return (
-                StatusCode::FORBIDDEN,
-                "join over TLS: this server runs a newer release than the one joining\n",
+                StatusCode::CONFLICT,
+                "this hub takes a join over TLS alone, and runs a newer release than this \
+                 server: update this server, then join with the same invite\n",
             )
                 .into_response();
         }

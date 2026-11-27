@@ -533,7 +533,12 @@ pub(crate) async fn request(
         server_id,
         name: name.to_owned(),
         public_key: hex::encode(&signer.public_key()),
-        proof: hex::encode(&signer.sign(&link_request_proof(invite.hub, &invite.secret))),
+        proof: hex::encode(&signer.sign(&link_request_proof(
+            invite.hub,
+            server_id,
+            CONTRACT_VERSION,
+            &invite.secret,
+        ))),
         contract_version: CONTRACT_VERSION,
     };
     // The secret travels inside TLS pinned to the invite's key, so only

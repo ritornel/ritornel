@@ -4794,7 +4794,8 @@ export type LinkRequest = {
   publicKey: string,
   /**
    * The signature, as 128 hex digits, of [`link_request_proof`] for the
-   * hub and this secret: proof that the satellite holds its key.
+   * hub, this server, this contract version and this secret: proof that
+   * the satellite holds its key, which also binds what it asks to it.
    */
   proof: string,
   /**

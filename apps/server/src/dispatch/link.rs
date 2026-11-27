@@ -422,7 +422,12 @@ impl Core {
             .is_some_and(|(key, proof)| {
                 ritornel_engine::verify_signature(
                     &key,
-                    &link_request_proof(self.server_id, &secret),
+                    &link_request_proof(
+                        self.server_id,
+                        asked.server_id,
+                        asked.contract_version,
+                        &secret,
+                    ),
                     &proof,
                 )
             });

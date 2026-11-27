@@ -1338,8 +1338,9 @@ async fn descriptor_answered(connection: &mut (impl AsyncReadExt + AsyncWriteExt
 #[tokio::test]
 async fn a_handshake_and_the_first_request_share_one_deadline() {
     bounded(async {
-        // Long enough that a handshake on loopback takes a small part of it.
-        let header_wait = Duration::from_secs(4);
+        // Long enough that each case below misses or meets it by seconds,
+        // which a handshake on loopback never takes.
+        let header_wait = Duration::from_secs(8);
         let running = start_with(Bounds {
             header_wait,
             ..Bounds::default()
@@ -1370,10 +1371,13 @@ async fn a_handshake_and_the_first_request_share_one_deadline() {
                 stalled.write_all(&[0x16]).await.unwrap();
                 read_until_closed(&mut stalled).await
             },
-            // Within the deadline, the handshake and the request together.
+            // Within the deadline, the handshake and the request together:
+            // asked at a half of it.
             late(header_wait / 4, header_wait / 4),
-            // Each within its own deadline, but not both within one.
-            late(header_wait * 3 / 4, header_wait / 2),
+            // Each within a deadline of its own, but not both within one:
+            // the handshake at a half of it, the request at a quarter past
+            // it, three quarters before a second deadline would end.
+            late(header_wait / 2, header_wait * 3 / 4),
             async {
                 let mut tls = ritornel_server::test_support::dial_hub(endpoint, key)
                     .await

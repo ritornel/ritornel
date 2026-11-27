@@ -177,7 +177,12 @@ fn request(invite: &InviteLink, server_id: ritornel_client::contract::Id, seed: 
         server_id,
         name: "invented".to_owned(),
         public_key: hex::encode(&signer.public_key()),
-        proof: hex::encode(&signer.sign(&link_request_proof(invite.hub, &invite.secret))),
+        proof: hex::encode(&signer.sign(&link_request_proof(
+            invite.hub,
+            server_id,
+            CONTRACT_VERSION,
+            &invite.secret,
+        ))),
         contract_version: CONTRACT_VERSION,
     }
 }
@@ -412,11 +417,16 @@ async fn an_invite_works_once_and_only_for_the_hub_it_names() {
         )
         .await
         .unwrap();
-        assert_eq!(plain.status, 403);
+        assert_eq!(plain.status, 409);
         assert!(
-            String::from_utf8_lossy(&plain.body).contains("join over TLS"),
+            String::from_utf8_lossy(&plain.body).contains("update this server"),
             "{plain:?}"
         );
+        // Nor can whoever read a join send it again as another server: the
+        // proof names the server it is for.
+        let mut taken = request(&parsed, other.server_id(), 1);
+        taken.server_id = ritornel_client::contract::Id::from_bytes([3; 16]);
+        assert_eq!(post(&hub, &taken).await.0, 400);
         // The secret is spent by the satellite that uses it first.
         assert_eq!(
             post(&hub, &request(&parsed, other.server_id(), 1)).await.0,
@@ -3887,7 +3897,12 @@ async fn a_conflicting_peer_key_does_not_consume_the_invite() {
 
         // An imposter tries to claim desk's server_id with a different keypair.
         let imposter_key = ritornel_engine::Signer::from_seed([0x99; 32]);
-        let proof = link_request_proof(parsed.hub, &parsed.secret);
+        let proof = link_request_proof(
+            parsed.hub,
+            desk.server_id(),
+            CONTRACT_VERSION,
+            &parsed.secret,
+        );
         let forged = LinkRequest {
             secret: hex::encode(&parsed.secret),
             server_id: desk.server_id(),
