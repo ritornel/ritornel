@@ -63,6 +63,7 @@ use serde::Serialize;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::{JoinHandle, JoinSet};
+use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
 
 use crate::dispatch::{Core, MAX_MESSAGE_BYTES};
@@ -152,8 +153,10 @@ impl Listening {
     ) -> Result<Self, Error> {
         let endpoint = listener.local_addr().map_err(Error::Runtime)?;
         let (stopping, stopped) = watch::channel(false);
+        let tls = crate::tls::acceptor(core.signer())
+            .map_err(|error| Error::Runtime(std::io::Error::other(error)))?;
         let router = router(core, Arc::new(tickets));
-        let task = tokio::spawn(accept(listener, listen, router, stopped, bounds));
+        let task = tokio::spawn(accept(listener, listen, router, tls, stopped, bounds));
         Ok(Self {
             endpoint,
             stopping,
@@ -206,6 +209,7 @@ async fn accept(
     listener: TcpListener,
     listen: Listen,
     router: Router,
+    tls: TlsAcceptor,
     mut stopping: watch::Receiver<bool>,
     bounds: Bounds,
 ) {
@@ -232,10 +236,12 @@ async fn accept(
             Ok((_, peer)) if !listen.admits(peer.ip()) => {
                 debug!(%peer, "a connection from outside the private network is closed");
             }
-            Ok((stream, _)) => {
+            Ok((stream, peer)) => {
                 connections.spawn(serve(
                     stream,
+                    peer,
                     router.clone(),
+                    tls.clone(),
                     stopping.clone(),
                     bounds.header_wait,
                     admitted,
@@ -255,15 +261,108 @@ async fn accept(
     }
 }
 
+/// Whether a connection is TLS: what [`require_credential`] asks before
+/// it takes a link session's token or a satellite joining.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Secure(bool);
+
 /// Serves one connection until it ends, holding its place among the
 /// admitted connections until then.
+///
+/// Its first byte says what it is: a TLS handshake, which a satellite
+/// opens with to reach its hub, or plain HTTP, which this machine's
+/// clients and the private network's speak. The connection has
+/// `header_wait` from being accepted to send a whole first request, its
+/// handshake included, and Hyper's own wait for each request after that.
 async fn serve(
     stream: TcpStream,
+    peer: SocketAddr,
     router: Router,
+    tls: TlsAcceptor,
     mut stopping: watch::Receiver<bool>,
     header_wait: Duration,
     _admitted: OwnedSemaphorePermit,
 ) {
+    let deadline = tokio::time::Instant::now() + header_wait;
+    // Whether the first request has reached the routes, after which the
+    // deadline no longer applies.
+    let asked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let opened = async {
+        let mut first = [0; 1];
+        match stream.peek(&mut first).await {
+            // Closed before it said anything.
+            Ok(0) | Err(_) => None,
+            Ok(_) if first[0] == crate::tls::HANDSHAKE => match tls.accept(stream).await {
+                Ok(session) => Some(Opened::Tls(Box::new(session))),
+                Err(failed) => {
+                    debug!(%peer, error = %failed, "a TLS handshake failed");
+                    None
+                }
+            },
+            Ok(_) => Some(Opened::Plain(stream)),
+        }
+    };
+    let opened = tokio::select! {
+        () = stopped(&mut stopping) => return,
+        opened = tokio::time::timeout_at(deadline, opened) => opened,
+    };
+    let Ok(Some(opened)) = opened else { return };
+    match opened {
+        Opened::Tls(session) => {
+            serve_http(
+                *session,
+                Secure(true),
+                router,
+                asked,
+                deadline,
+                stopping,
+                header_wait,
+            )
+            .await;
+        }
+        Opened::Plain(stream) => {
+            serve_http(
+                stream,
+                Secure(false),
+                router,
+                asked,
+                deadline,
+                stopping,
+                header_wait,
+            )
+            .await;
+        }
+    }
+}
+
+/// A connection, once its first byte has said what it is.
+enum Opened {
+    Tls(Box<tokio_rustls::server::TlsStream<TcpStream>>),
+    Plain(TcpStream),
+}
+
+/// Serves HTTP on a connection until it ends. Until its first request
+/// reaches the routes, it is cut off at `deadline`.
+async fn serve_http<S>(
+    stream: S,
+    secure: Secure,
+    router: Router,
+    asked: Arc<std::sync::atomic::AtomicBool>,
+    deadline: tokio::time::Instant,
+    mut stopping: watch::Receiver<bool>,
+    header_wait: Duration,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    use std::sync::atomic::Ordering;
+
+    let seen = Arc::clone(&asked);
+    let router = router
+        .layer(middleware::from_fn(move |request: Request, next: Next| {
+            seen.store(true, Ordering::Relaxed);
+            next.run(request)
+        }))
+        .layer(Extension(secure));
     let mut http = http1::Builder::new();
     // The deadline needs the timer: without one it would never fire.
     http.timer(TokioTimer::new())
@@ -273,13 +372,23 @@ async fn serve(
         .serve_connection(TokioIo::new(stream), TowerToHyperService::new(router))
         .with_upgrades();
     tokio::pin!(connection);
+    let mut waiting_for_first = true;
     // A connection that fails has failed for its own client alone, and
     // there is nobody to tell.
-    tokio::select! {
-        _ = connection.as_mut() => {}
-        () = stopped(&mut stopping) => {
-            connection.as_mut().graceful_shutdown();
-            let _ = connection.await;
+    loop {
+        tokio::select! {
+            _ = connection.as_mut() => return,
+            () = stopped(&mut stopping) => {
+                connection.as_mut().graceful_shutdown();
+                let _ = connection.await;
+                return;
+            }
+            () = tokio::time::sleep_until(deadline), if waiting_for_first => {
+                if !asked.load(Ordering::Relaxed) {
+                    return;
+                }
+                waiting_for_first = false;
+            }
         }
     }
 }
@@ -334,17 +443,42 @@ async fn require_credential(
     mut request: Request,
     next: Next,
 ) -> Response {
-    // The descriptor is public, and a satellite joining presents the
-    // invite's secret in its body, which is checked there.
-    if (request.method() == Method::GET && request.uri().path() == route::DESCRIPTOR)
-        || (request.method() == Method::POST && request.uri().path() == route::LINK)
-    {
+    let secure = request
+        .extensions()
+        .get::<Secure>()
+        .is_some_and(|secure| secure.0);
+    // The descriptor is public.
+    if request.method() == Method::GET && request.uri().path() == route::DESCRIPTOR {
+        return next.run(request).await;
+    }
+    // A satellite joining presents the invite's secret in its body, which
+    // is checked there, and only over TLS: the secret is never read from a
+    // connection anyone between could read too.
+    if request.method() == Method::POST && request.uri().path() == route::LINK {
+        if !secure {
+            info!("a satellite tried to join without TLS: it runs an older release");
+            return (
+                StatusCode::FORBIDDEN,
+                "join over TLS: this server runs a newer release than the one joining\n",
+            )
+                .into_response();
+        }
         return next.run(request).await;
     }
     // Each check is a comparison in memory. It reads no file and no
     // database, so a request costs an async worker nothing it could wait on.
     let by_header = bearer(request.headers())
         .and_then(|token| core.authenticate(&token))
+        // A link session's token is taken over TLS alone, which is all a
+        // satellite speaks. Over plain HTTP it is refused like any unknown
+        // token, and the satellite that sent it runs an older release.
+        .filter(|(_, peer)| {
+            let taken = secure || peer.is_none();
+            if !taken {
+                info!(satellite = ?peer.as_ref().map(|peer| peer.server), "a satellite's link session came without TLS: it runs an older release");
+            }
+            taken
+        })
         .map(|(grant, peer)| (grant, peer, Presented::Header));
     let admitted = by_header
         .or_else(|| {
@@ -686,9 +820,20 @@ async fn art(
         };
         let path = format!("{}/{art}/{size}", route::ART);
         let credential = uplink.credential();
-        return match ritornel_client::get_media(route, &path, Some(&credential), MAX_COVER_BYTES)
+        // Over TLS pinned to the hub's key, as everything of the link is.
+        let fetched = match uplink.dial(route).await {
+            Ok(stream) => ritornel_client::get_media_over(
+                stream,
+                route,
+                &path,
+                Some(&credential),
+                MAX_COVER_BYTES,
+            )
             .await
-        {
+            .map_err(|error| error.to_string()),
+            Err(why) => Err(why),
+        };
+        return match fetched {
             Ok(answer) if answer.status == 200 => {
                 let body = answer.body.clone();
                 // Written beside it and moved into place, so a reader never

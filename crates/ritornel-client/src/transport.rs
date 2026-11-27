@@ -10,7 +10,6 @@ use futures_util::{
     stream::{SplitSink, SplitStream},
 };
 use ritornel_contract::route;
-use tokio::net::TcpStream;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -18,10 +17,14 @@ use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 use tokio_tungstenite::tungstenite::{self, Message};
 
 use crate::error::transport;
+use crate::http::Stream;
 use crate::{Credential, Error, http};
 
+/// The socket, over whatever connection it was opened on.
+type Socket = WebSocketStream<Box<dyn Stream>>;
+
 pub(crate) enum Transport {
-    Socket(Box<WebSocketStream<TcpStream>>),
+    Socket(Box<Socket>),
     Memory {
         outgoing: Sender<String>,
         incoming: Receiver<String>,
@@ -44,7 +47,7 @@ impl Transport {
     /// something to check about who is at the other end checks it between
     /// connecting and this.
     pub(crate) async fn upgrade(
-        stream: TcpStream,
+        stream: impl Stream,
         endpoint: SocketAddr,
         credential: &Credential,
     ) -> Result<Self, Error> {
@@ -55,6 +58,7 @@ impl Transport {
             .headers_mut()
             .insert(AUTHORIZATION, http::authorization(credential)?);
         http::within_deadline(async {
+            let stream: Box<dyn Stream> = Box::new(stream);
             match tokio_tungstenite::client_async(request, stream).await {
                 Ok((socket, _)) => Ok(Self::Socket(Box::new(socket))),
                 Err(tungstenite::Error::Http(response)) => Err(Error::Refused {
@@ -96,12 +100,12 @@ impl From<Lost> for Error {
 }
 
 pub(crate) enum Writer {
-    Socket(SplitSink<WebSocketStream<TcpStream>, Message>),
+    Socket(SplitSink<Socket, Message>),
     Memory(Sender<String>),
 }
 
 pub(crate) enum Reader {
-    Socket(SplitStream<WebSocketStream<TcpStream>>),
+    Socket(SplitStream<Socket>),
     Memory(Receiver<String>),
 }
 

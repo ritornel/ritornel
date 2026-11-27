@@ -182,10 +182,35 @@ fn request(invite: &InviteLink, server_id: ritornel_client::contract::Id, seed: 
     }
 }
 
-async fn post(hub: &Server, asked: &LinkRequest) -> (u16, String) {
-    let answer = ritornel_client::post(hub.endpoint(), route::LINK, None, asked)
+/// A connection to `hub` over TLS pinned to its key, as a satellite makes
+/// one before it sends anything of its link.
+async fn tls(hub: &Server) -> impl ritornel_client::Stream {
+    let key = hex::decode_array::<32>(&hub.public_key()).unwrap();
+    ritornel_server::dial_hub(hub.endpoint(), key)
         .await
-        .unwrap();
+        .unwrap()
+}
+
+/// A socket at `hub` with a link session, over TLS as a satellite opens it.
+async fn linked_socket(hub: &Server, credential: &Credential) -> Client {
+    Client::connect_over(tls(hub).await, hub.endpoint(), credential)
+        .await
+        .unwrap()
+}
+
+/// `GET <path>` at `hub` over TLS, as a satellite asks.
+async fn get_linked(hub: &Server, path: &str, credential: &Credential) -> u16 {
+    ritornel_client::get_over(tls(hub).await, hub.endpoint(), path, Some(credential))
+        .await
+        .unwrap()
+        .status
+}
+
+async fn post(hub: &Server, asked: &LinkRequest) -> (u16, String) {
+    let answer =
+        ritornel_client::post_over(tls(hub).await, hub.endpoint(), route::LINK, None, asked)
+            .await
+            .unwrap();
     (
         answer.status,
         String::from_utf8_lossy(&answer.body).into_owned(),
@@ -396,25 +421,26 @@ async fn an_invite_works_once_and_only_for_the_hub_it_names() {
         // And a page in a browser may not try at all. It is refused on its
         // origin alone, before a body is read, so it sends none: a body the
         // hub never reads could reset the connection before the answer.
-        let page = tokio::task::spawn_blocking({
+        let page = {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let endpoint = hub.endpoint();
-            move || {
-                use std::io::{Read, Write};
-                let mut stream = std::net::TcpStream::connect(endpoint).unwrap();
-                write!(
-                    stream,
-                    "POST /v1/link HTTP/1.1\r\nHost: {endpoint}\r\nOrigin: http://example.invalid\r\n\
-                     Content-Length: 0\r\nConnection: close\r\n\r\n"
+            let mut stream = tls(&hub).await;
+            stream
+                .write_all(
+                    format!(
+                        "POST /v1/link HTTP/1.1\r\nHost: {endpoint}\r\nOrigin: http://example.invalid\r\n\
+                         Content-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
                 )
+                .await
                 .unwrap();
-                let mut answer = String::new();
-                stream.read_to_string(&mut answer).unwrap();
-                answer
-            }
-        })
-        .await
-        .unwrap();
+            let mut answer = Vec::new();
+            stream.read_to_end(&mut answer).await.unwrap();
+            String::from_utf8_lossy(&answer).into_owned()
+        };
         assert!(page.starts_with("HTTP/1.1 403"), "{page}");
+        assert!(page.contains("a page may not link"), "{page}");
         assert_eq!(
             desk_client.status().await.unwrap().role,
             ServerRole::Unassigned
@@ -505,7 +531,7 @@ async fn a_satellite_opens_a_socket_at_its_hub_with_its_link_session_and_no_tick
             .unwrap()
         };
         let credential = Credential::new(&token);
-        let linked = Client::connect(hub.endpoint(), &credential).await.unwrap();
+        let linked = linked_socket(&hub, &credential).await;
         linked
             .hello(&HelloParams {
                 presence: None,
@@ -542,9 +568,20 @@ async fn a_satellite_opens_a_socket_at_its_hub_with_its_link_session_and_no_tick
             assert_eq!(code(&refused), Some(ErrorCode::Forbidden), "{method}");
         }
         // And it is given no ticket.
+        let ticket = ritornel_client::post_over(
+            tls(&hub).await,
+            hub.endpoint(),
+            route::TICKET,
+            Some(&credential),
+            &serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ticket.status, 403);
+        // Over plain HTTP its link session is not taken at all.
         assert!(matches!(
             ritornel_client::ticket(hub.endpoint(), &credential).await,
-            Err(ritornel_client::Error::Refused { status: 403 })
+            Err(ritornel_client::Error::Refused { status: 401 })
         ));
     })
     .await;
@@ -1272,9 +1309,7 @@ async fn a_listen_sent_again_is_taken_once_and_only_from_its_own_player() {
             })
             .unwrap()
         };
-        let linked = Client::connect(hub.endpoint(), &Credential::new(&token))
-            .await
-            .unwrap();
+        let linked = linked_socket(&hub, &Credential::new(&token)).await;
         linked
             .hello(&HelloParams {
                 presence: None,
@@ -1346,9 +1381,7 @@ async fn a_satellite_pings_its_hub_and_only_the_hubs_own_machine_says_when_it_st
             })
             .unwrap()
         };
-        let linked = Client::connect(hub.endpoint(), &Credential::new(&token))
-            .await
-            .unwrap();
+        let linked = linked_socket(&hub, &Credential::new(&token)).await;
         linked
             .hello(&HelloParams {
                 presence: None,
@@ -1685,8 +1718,21 @@ struct Relay {
 }
 
 impl Relay {
-    async fn to(hub: std::net::SocketAddr) -> Self {
+    /// A relay to `hub`, whose data directory is `name`'s in `scratch`. It
+    /// answers a satellite with the hub's own key, so the satellite takes
+    /// it for the hub, and reaches the hub over TLS itself: what passes is
+    /// plain to it.
+    async fn to(scratch: &Scratch, name: &str, hub: &Server) -> Self {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let seed: [u8; 32] = rusqlite::Connection::open(scratch.data_dir(name).join("server.db"))
+            .unwrap()
+            .query_row("SELECT signing_key FROM server_identity", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let acceptor = ritornel_server::hub_tls(seed).unwrap();
+        let endpoint = hub.endpoint();
+        let key = hex::decode_array::<32>(&hub.public_key()).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let holding = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1695,17 +1741,22 @@ impl Relay {
         let hearing = Arc::clone(&heard);
         tokio::spawn(async move {
             while let Ok((satellite, _)) = listener.accept().await {
-                let Ok(hub) = tokio::net::TcpStream::connect(hub).await else {
-                    continue;
-                };
-                let (mut from_satellite, mut to_satellite) = satellite.into_split();
-                let (mut from_hub, mut to_hub) = hub.into_split();
-                tokio::spawn(async move {
-                    let _ = tokio::io::copy(&mut from_satellite, &mut to_hub).await;
-                });
+                let acceptor = acceptor.clone();
                 let held = Arc::clone(&held);
                 let hearing = Arc::clone(&hearing);
                 tokio::spawn(async move {
+                    let Ok(satellite) = acceptor.accept(satellite).await else {
+                        return;
+                    };
+                    let Ok(hub) = ritornel_server::dial_hub(endpoint, key).await else {
+                        return;
+                    };
+                    let (mut from_satellite, mut to_satellite) = tokio::io::split(satellite);
+                    let (mut from_hub, mut to_hub) = tokio::io::split(hub);
+                    tokio::spawn(async move {
+                        let _ = tokio::io::copy(&mut from_satellite, &mut to_hub).await;
+                        let _ = to_hub.shutdown().await;
+                    });
                     let mut chunk = vec![0; 16 * 1024];
                     while let Ok(read @ 1..) = from_hub.read(&mut chunk).await {
                         while held.load(Ordering::SeqCst) {
@@ -1754,7 +1805,7 @@ async fn a_satellite_stops_in_time_while_its_hub_does_not_answer_and_its_listens
         let mut hub_client = client(&scratch, "hub", &hub).await;
         hub_client.create_library(key()).await.unwrap();
         scan(&scratch, &mut hub_client).await;
-        let relay = Relay::to(hub.endpoint()).await;
+        let relay = Relay::to(&scratch, "hub", &hub).await;
         let grace = Duration::from_secs(1);
         // In real time: a track lasts half a second.
         let desk = Server::start_run(
@@ -1950,7 +2001,7 @@ async fn a_satellites_client_that_unsubscribes_is_unsubscribed_at_the_hub() {
         let scratch = Scratch::new();
         let (hub, mut hub_client, _desk, desk_client) = two(&scratch).await;
         scan(&scratch, &mut hub_client).await;
-        let relay = Relay::to(hub.endpoint()).await;
+        let relay = Relay::to(&scratch, "hub", &hub).await;
         let link = hub_client
             .call::<LinkInvite>(&LinkInviteParams {
                 routes: vec![relay.address.to_string()],
@@ -2020,7 +2071,7 @@ async fn cache_routes_require_a_link_and_serve_the_exact_pinned_bytes() {
                 req.push_str(&format!("If-Range: {tag}\r\n"));
             }
             req.push_str("\r\n");
-            let mut conn = tokio::net::TcpStream::connect(endpoint).await.unwrap();
+            let mut conn = tls(&hub).await;
             conn.write_all(req.as_bytes()).await.unwrap();
             let mut bytes = Vec::new();
             conn.read_to_end(&mut bytes).await.unwrap();
@@ -2195,7 +2246,7 @@ async fn a_streaming_download_survives_prune_and_releases_its_pin_at_shutdown() 
         let hub = start(&scratch,"hub").await;
         let mut c = client(&scratch,"hub",&hub).await;
         let ep = hub.endpoint();
-        let mut socket = tokio::net::TcpStream::connect(ep).await.unwrap();
+        let mut socket = tls(&hub).await;
         socket.write_all(format!("GET /v1/cache/derivative/{} HTTP/1.1\r\nHost: {ep}\r\nAuthorization: Bearer {link}\r\n\r\n",entry.key()).as_bytes()).await.unwrap();
         let mut download = BufReader::new(socket);
         let mut first = String::new();
@@ -2831,7 +2882,7 @@ async fn the_player_loads_hub_checked_tracks_without_validation_round_trips() {
         let mut controller = client(&scratch, "hub", &hub).await;
         controller.create_library(key()).await.unwrap();
         scan(&scratch, &mut controller).await;
-        let relay = Relay::to(hub.endpoint()).await;
+        let relay = Relay::to(&scratch, "hub", &hub).await;
         let link = controller
             .call::<LinkInvite>(&LinkInviteParams {
                 routes: vec![relay.address.to_string()],
@@ -3221,7 +3272,7 @@ async fn scripted_peer(
         .unwrap()
         .query_row("SELECT token FROM hub_link", [], |r| r.get(0))
         .unwrap();
-    let mut c = Client::connect_peer(hub.endpoint(), &Credential::new(&token))
+    let mut c = Client::connect_peer_over(tls(hub).await, hub.endpoint(), &Credential::new(&token))
         .await
         .unwrap();
     let requests = c.take_requests().unwrap();
@@ -3643,26 +3694,14 @@ async fn scoped_invites_enforce_delegation_http_permissions_and_report_role_in_l
         };
         let guest_cred = Credential::new(&guest_token);
         // Guest lacks status:read -> /v1/health is 403.
-        assert_eq!(
-            ritornel_client::get(hub.endpoint(), route::HEALTH, Some(&guest_cred))
-                .await
-                .unwrap()
-                .status,
-            403
-        );
+        assert_eq!(get_linked(&hub, route::HEALTH, &guest_cred).await, 403);
         // Guest has library:read -> /v1/art/* is NOT 403 (404 for unknown art ID).
         let art_path = format!(
             "{}/{}/96",
             route::ART,
             ritornel_client::contract::Id::from_bytes([1; 16])
         );
-        assert_eq!(
-            ritornel_client::get(hub.endpoint(), &art_path, Some(&guest_cred))
-                .await
-                .unwrap()
-                .status,
-            404
-        );
+        assert_eq!(get_linked(&hub, &art_path, &guest_cred).await, 404);
 
         // Now invite a Monitor satellite and verify the reverse on HTTP routes.
         let monitor_server = start(&scratch, "monitor").await;
@@ -3707,48 +3746,22 @@ async fn scoped_invites_enforce_delegation_http_permissions_and_report_role_in_l
         assert_eq!(code(&err), Some(ErrorCode::Forbidden));
 
         // Monitor has status:read -> /v1/health is 200.
-        assert_eq!(
-            ritornel_client::get(hub.endpoint(), route::HEALTH, Some(&monitor_cred))
-                .await
-                .unwrap()
-                .status,
-            200
-        );
+        assert_eq!(get_linked(&hub, route::HEALTH, &monitor_cred).await, 200);
         // Monitor lacks library:read -> /v1/art/*, /v1/audio/*, /v1/cache/* are 403.
-        assert_eq!(
-            ritornel_client::get(hub.endpoint(), &art_path, Some(&monitor_cred))
-                .await
-                .unwrap()
-                .status,
-            403
-        );
+        assert_eq!(get_linked(&hub, &art_path, &monitor_cred).await, 403);
         let audio_path = format!(
             "{}/{}/{}/1",
             route::AUDIO,
             ritornel_client::contract::Id::from_bytes([1; 16]),
             ritornel_client::contract::Id::from_bytes([2; 16]),
         );
-        assert_eq!(
-            ritornel_client::get(hub.endpoint(), &audio_path, Some(&monitor_cred))
-                .await
-                .unwrap()
-                .status,
-            403
-        );
+        assert_eq!(get_linked(&hub, &audio_path, &monitor_cred).await, 403);
         let cache_path = format!("{}/{}", route::CACHE_DERIVATIVE, "00".repeat(32));
-        assert_eq!(
-            ritornel_client::get(hub.endpoint(), &cache_path, Some(&monitor_cred))
-                .await
-                .unwrap()
-                .status,
-            403
-        );
+        assert_eq!(get_linked(&hub, &cache_path, &monitor_cred).await, 403);
 
         // Over WebSocket, a Monitor link can ping and list servers, but is refused
         // link.tracks, link.copies, and link.listen.
-        let monitor_ws = Client::connect(hub.endpoint(), &monitor_cred)
-            .await
-            .unwrap();
+        let monitor_ws = linked_socket(&hub, &monitor_cred).await;
         monitor_ws
             .hello(&HelloParams {
                 presence: None,
@@ -3807,9 +3820,10 @@ async fn a_conflicting_peer_key_does_not_consume_the_invite() {
             proof: hex::encode(&imposter_key.sign(&proof)),
             contract_version: CONTRACT_VERSION,
         };
-        let answer = ritornel_client::post(hub.endpoint(), route::LINK, None, &forged)
-            .await
-            .unwrap();
+        let answer =
+            ritornel_client::post_over(tls(&hub).await, hub.endpoint(), route::LINK, None, &forged)
+                .await
+                .unwrap();
         assert_eq!(answer.status, 409);
 
         // The invite was NOT consumed: another server can still join with it.

@@ -198,7 +198,7 @@ impl LocalServer {
     /// so the connection is to it, and only then is the credential sent.
     pub async fn connect(&self) -> Result<Client, Error> {
         let stream = self.reach().await?;
-        Client::upgrade(stream, self.endpoint, &self.credential).await
+        Client::connect_over(stream, self.endpoint, &self.credential).await
     }
 
     /// Trades the local credential for a ticket that opens one socket,

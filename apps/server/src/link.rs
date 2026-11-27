@@ -468,7 +468,12 @@ pub(crate) async fn reach(
         route::DESCRIPTOR,
         hex::encode(&nonce)
     );
-    let answer = ritornel_client::get(route, &path, None)
+    // Over TLS pinned to the key the invite names, so what answers is the
+    // hub before anything is read from it, or nothing is.
+    let stream = crate::tls::dial(route, *key, CONNECT_WAIT)
+        .await
+        .map_err(|error| error.to_string())?;
+    let answer = ritornel_client::get_over(stream, route, &path, None)
         .await
         .map_err(|error| error.to_string())?;
     if answer.status != 200 {
@@ -531,7 +536,12 @@ pub(crate) async fn request(
         proof: hex::encode(&signer.sign(&link_request_proof(invite.hub, &invite.secret))),
         contract_version: CONTRACT_VERSION,
     };
-    let answer = ritornel_client::post(route, route::LINK, None, &asked)
+    // The secret travels inside TLS pinned to the invite's key, so only
+    // the hub can read it.
+    let stream = crate::tls::dial(route, invite.key, CONNECT_WAIT)
+        .await
+        .map_err(|error| error.to_string())?;
+    let answer = ritornel_client::post_over(stream, route, route::LINK, None, &asked)
         .await
         .map_err(|error| error.to_string())?;
     match answer.status {

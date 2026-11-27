@@ -59,6 +59,7 @@ mod session;
 #[cfg(test)]
 mod testing;
 mod ticket;
+mod tls;
 mod transport;
 mod uplink;
 mod views;
@@ -81,3 +82,25 @@ pub use ritornel_contract::local::Env;
 pub use ritornel_engine::playback::Output;
 pub use server::Server;
 pub use watch::WatchRun;
+
+/// Opens a TLS connection to the hub at `address` and checks that it holds
+/// the identity key `key`, as a satellite does before it sends anything of
+/// its link. The integration tests use it to stand in for a satellite.
+pub async fn dial_hub(
+    address: std::net::SocketAddr,
+    key: [u8; 32],
+) -> Result<impl ritornel_client::Stream, String> {
+    tls::dial(address, key, link::CONNECT_WAIT)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// The TLS a hub whose identity key is made from `seed` answers with. The
+/// integration tests' relay presents it to stand between a satellite and
+/// its hub and read what passes.
+pub fn hub_tls(seed: [u8; 32]) -> Result<tokio_rustls::TlsAcceptor, String> {
+    tls::acceptor(std::sync::Arc::new(ritornel_engine::Signer::from_seed(
+        seed,
+    )))
+    .map_err(|error| error.to_string())
+}

@@ -10,10 +10,21 @@ use hyper::{Method, Request, StatusCode};
 use hyper_util::rt::TokioIo;
 use ritornel_contract::route::{self, Health};
 use ritornel_contract::{PublicDescriptor, SocketTicket};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 
 use crate::error::transport;
 use crate::{Credential, Error};
+
+/// A connection already made to a server, over which a request or the
+/// socket is sent: a TCP stream, or something the caller wrapped around
+/// one, such as a TLS session it has checked. The `*_over` functions and
+/// [`Client::connect_over`](crate::Client::connect_over) take one, so a
+/// caller that must check who is at the other end before anything is sent
+/// does so first, and this crate needs no TLS of its own.
+pub trait Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
+
+impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Stream for T {}
 
 /// The largest body the client reads from one of these routes. What they
 /// answer is small, and something else might be answering.
@@ -50,7 +61,18 @@ pub async fn get(
     path: &str,
     credential: Option<&Credential>,
 ) -> Result<Answer, Error> {
-    let stream = connect(endpoint).await?;
+    get_over(connect(endpoint).await?, endpoint, path, credential).await
+}
+
+/// As [`get`], over a connection that is already made to `endpoint`.
+/// Nothing has been sent on it yet, and the request is the first thing
+/// that is.
+pub async fn get_over(
+    stream: impl Stream,
+    endpoint: SocketAddr,
+    path: &str,
+    credential: Option<&Credential>,
+) -> Result<Answer, Error> {
     send(
         stream,
         endpoint,
@@ -72,7 +94,24 @@ pub async fn get_media(
     credential: Option<&Credential>,
     max_bytes: usize,
 ) -> Result<Answer, Error> {
-    let stream = connect(endpoint).await?;
+    get_media_over(
+        connect(endpoint).await?,
+        endpoint,
+        path,
+        credential,
+        max_bytes,
+    )
+    .await
+}
+
+/// As [`get_media`], over a connection that is already made to `endpoint`.
+pub async fn get_media_over(
+    stream: impl Stream,
+    endpoint: SocketAddr,
+    path: &str,
+    credential: Option<&Credential>,
+    max_bytes: usize,
+) -> Result<Answer, Error> {
     send(
         stream,
         endpoint,
@@ -95,7 +134,29 @@ pub async fn post(
 ) -> Result<Answer, Error> {
     let body = serde_json::to_vec(body)
         .map_err(|error| Error::Protocol(format!("a body for POST {path}: {error}")))?;
-    let stream = connect(endpoint).await?;
+    post_bytes_over(connect(endpoint).await?, endpoint, path, credential, body).await
+}
+
+/// As [`post`], over a connection that is already made to `endpoint`.
+pub async fn post_over(
+    stream: impl Stream,
+    endpoint: SocketAddr,
+    path: &str,
+    credential: Option<&Credential>,
+    body: &impl serde::Serialize,
+) -> Result<Answer, Error> {
+    let body = serde_json::to_vec(body)
+        .map_err(|error| Error::Protocol(format!("a body for POST {path}: {error}")))?;
+    post_bytes_over(stream, endpoint, path, credential, body).await
+}
+
+async fn post_bytes_over(
+    stream: impl Stream,
+    endpoint: SocketAddr,
+    path: &str,
+    credential: Option<&Credential>,
+    body: Vec<u8>,
+) -> Result<Answer, Error> {
     send(
         stream,
         endpoint,
@@ -123,9 +184,28 @@ pub async fn download(
     to: &std::path::Path,
     max_bytes: u64,
 ) -> Result<u64, Error> {
+    download_over(
+        connect(endpoint).await?,
+        endpoint,
+        path,
+        credential,
+        to,
+        max_bytes,
+    )
+    .await
+}
+
+/// As [`download`], over a connection that is already made to `endpoint`.
+pub async fn download_over(
+    stream: impl Stream,
+    endpoint: SocketAddr,
+    path: &str,
+    credential: &Credential,
+    to: &std::path::Path,
+    max_bytes: u64,
+) -> Result<u64, Error> {
     use std::io::Write;
 
-    let stream = connect(endpoint).await?;
     let mut body = within_deadline(async {
         let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
             .await
@@ -189,7 +269,7 @@ pub async fn download(
 /// credential if there is one and a JSON body if there is one, and returns
 /// whatever came back. Nothing has been sent on the connection yet.
 async fn send(
-    stream: TcpStream,
+    stream: impl Stream,
     endpoint: SocketAddr,
     method: Method,
     path: &str,
@@ -296,7 +376,7 @@ pub async fn ticket(endpoint: SocketAddr, credential: &Credential) -> Result<Soc
 /// As [`ticket`], over a connection that is already made. Nothing has been
 /// sent on it yet, and the credential is the first thing that is.
 pub(crate) async fn ticket_over(
-    stream: TcpStream,
+    stream: impl Stream,
     endpoint: SocketAddr,
     credential: &Credential,
 ) -> Result<SocketTicket, Error> {

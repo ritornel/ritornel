@@ -136,7 +136,7 @@ pub(crate) struct Core {
     /// What a presented credential is checked against.
     local_credential: Verifier,
     /// What the descriptor's proof is signed with.
-    signer: ritornel_engine::Signer,
+    signer: Arc<ritornel_engine::Signer>,
     /// The invites this hub has made and not seen used.
     invites: crate::link::Invites,
     /// The link sessions this hub has issued, checked as the local
@@ -298,7 +298,6 @@ impl Core {
                 identity.name.clone(),
                 runtime.clone(),
                 Arc::clone(&clock),
-                Arc::clone(&entropy),
                 bounds.hub_call_wait,
             ))),
             _ => None,
@@ -317,7 +316,7 @@ impl Core {
             cover_pool: CoverPool::start(COVER_THREADS),
             job_events: Mutex::default(),
             local_credential,
-            signer,
+            signer: Arc::new(signer),
             invites: crate::link::Invites::default(),
             players,
             moves: Default::default(),
@@ -403,6 +402,12 @@ impl Core {
         self.link_sessions
             .peer(token)
             .map(|peer| (peer.grant, Some(peer)))
+    }
+
+    /// What this server signs with: its identity key, for the TLS its
+    /// listener offers satellites.
+    pub(crate) fn signer(&self) -> Arc<ritornel_engine::Signer> {
+        Arc::clone(&self.signer)
     }
 
     /// On a satellite, its link to its hub.
