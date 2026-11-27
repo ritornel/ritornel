@@ -1316,48 +1316,71 @@ async fn a_connection_that_sends_no_whole_request_is_closed_when_its_time_is_up(
             );
         }
 
-        // The same over TLS, which a satellite opens with: a handshake
-        // begun and never finished, one finished with no request after it,
-        // and one with a whole request. The handshake takes from the same
-        // time as the request.
-        let key = hex::decode_array::<32>(&running.server.public_key()).unwrap();
-        let mut stalled = TcpStream::connect(running.endpoint()).await.unwrap();
-        let opened = Instant::now();
-        stalled.write_all(&[0x16]).await.unwrap();
-        assert_eq!(read_until_closed(&mut stalled).await, "");
-        assert!(
-            opened.elapsed() >= header_wait / 2,
-            "{:?}",
-            opened.elapsed()
-        );
-        for (sent, answered) in [
-            ("", false),
-            ("GET /v1/descriptor HTTP/1.1\r\nHost: test\r\n\r\n", true),
-        ] {
-            let opened = Instant::now();
-            let mut connection = ritornel_server::dial_hub(running.endpoint(), key)
-                .await
-                .unwrap();
-            connection.write_all(sent.as_bytes()).await.unwrap();
-            let mut received = Vec::new();
-            let _ = connection.read_to_end(&mut received).await;
-            let received = String::from_utf8_lossy(&received);
-            assert!(
-                opened.elapsed() >= header_wait / 2,
-                "{sent:?} over TLS was closed after {:?}",
-                opened.elapsed()
-            );
-            assert_eq!(
-                received.starts_with("HTTP/1.1 200 OK"),
-                answered,
-                "{sent:?} over TLS: {received:?}"
-            );
-        }
-
         // The server is as it was.
         ritornel_client::descriptor(running.endpoint())
             .await
             .unwrap();
+    })
+    .await;
+}
+
+/// `GET /v1/descriptor` on `connection`, and whether it was answered.
+async fn descriptor_answered(connection: &mut (impl AsyncReadExt + AsyncWriteExt + Unpin)) -> bool {
+    let asked = connection
+        .write_all(b"GET /v1/descriptor HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
+        .await;
+    let mut answer = Vec::new();
+    // A connection the server cut off may end in a reset.
+    let _ = connection.read_to_end(&mut answer).await;
+    asked.is_ok() && answer.starts_with(b"HTTP/1.1 200 OK")
+}
+
+#[tokio::test]
+async fn a_handshake_and_the_first_request_share_one_deadline() {
+    bounded(async {
+        // Long enough that a handshake on loopback takes a small part of it.
+        let header_wait = Duration::from_secs(4);
+        let running = start_with(Bounds {
+            header_wait,
+            ..Bounds::default()
+        })
+        .await;
+        let endpoint = running.endpoint();
+        let key = hex::decode_array::<32>(&running.server.public_key()).unwrap();
+        // A connection that begins its handshake once `before` has gone
+        // by since it was made, then asks once `after` more has.
+        let late = |before: Duration, after: Duration| async move {
+            let tcp = TcpStream::connect(endpoint).await.unwrap();
+            // sleep: the test spends part of the server's deadline on
+            // purpose, and no event marks the time going by.
+            tokio::time::sleep(before).await;
+            // Within its own time, the handshake always succeeds.
+            let mut tls = ritornel_server::handshake_with_hub(tcp, key).await.unwrap();
+            // sleep: as above, after the handshake.
+            tokio::time::sleep(after).await;
+            descriptor_answered(&mut tls).await
+        };
+        let (stalled, in_time, too_late, at_once) = tokio::join!(
+            async {
+                // A handshake begun and never finished is closed, with
+                // nothing said.
+                let mut stalled = TcpStream::connect(endpoint).await.unwrap();
+                stalled.write_all(&[0x16]).await.unwrap();
+                read_until_closed(&mut stalled).await
+            },
+            // Within the deadline, the handshake and the request together.
+            late(header_wait / 4, header_wait / 4),
+            // Each within its own deadline, but not both within one.
+            late(header_wait * 3 / 4, header_wait / 2),
+            async {
+                let mut tls = ritornel_server::dial_hub(endpoint, key).await.unwrap();
+                descriptor_answered(&mut tls).await
+            },
+        );
+        assert_eq!(stalled, "");
+        assert!(in_time, "a request within the deadline was not answered");
+        assert!(!too_late, "a request after the deadline was answered");
+        assert!(at_once, "a request over TLS was not answered");
     })
     .await;
 }

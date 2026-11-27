@@ -253,14 +253,24 @@ pub(crate) async fn dial(
         let tcp = TcpStream::connect(address)
             .await
             .map_err(DialError::Unreachable)?;
-        connector(key)
-            .map_err(|error| DialError::Handshake(std::io::Error::other(error)))?
-            .connect(ServerName::from(address.ip()), tcp)
-            .await
-            .map_err(handshake_failed)
+        handshake(tcp, key).await
     })
     .await
     .map_err(|_| DialError::TimedOut)?
+}
+
+/// The TLS handshake of [`dial`], on a connection already made, with no
+/// wait of its own.
+pub(crate) async fn handshake(
+    tcp: TcpStream,
+    key: [u8; 32],
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>, DialError> {
+    let address = tcp.peer_addr().map_err(DialError::Unreachable)?;
+    connector(key)
+        .map_err(|error| DialError::Handshake(std::io::Error::other(error)))?
+        .connect(ServerName::from(address.ip()), tcp)
+        .await
+        .map_err(handshake_failed)
 }
 
 #[cfg(test)]
@@ -273,7 +283,8 @@ mod tests {
     }
 
     /// A server on loopback that completes each handshake with `acceptor`
-    /// and answers `pong` to the first four bytes it is sent.
+    /// and answers `pong` to the first four bytes it is sent, or `name` if
+    /// the client named the server it wanted.
     async fn serve_tls(acceptor: TlsAcceptor) -> SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -282,9 +293,10 @@ mod tests {
                 let acceptor = acceptor.clone();
                 tokio::spawn(async move {
                     if let Ok(mut tls) = acceptor.accept(tcp).await {
+                        let named = tls.get_ref().1.server_name().is_some();
                         let mut asked = [0; 4];
                         if tls.read_exact(&mut asked).await.is_ok() {
-                            let _ = tls.write_all(b"pong").await;
+                            let _ = tls.write_all(if named { b"name" } else { b"pong" }).await;
                         }
                     }
                 });
@@ -296,20 +308,25 @@ mod tests {
     const WAIT: Duration = Duration::from_secs(60);
 
     #[tokio::test]
-    async fn the_pinned_key_connects_and_says_no_name() {
+    async fn the_pinned_key_connects_with_a_full_handshake_each_time_and_no_name() {
         let hub = signer(7);
         let address = serve_tls(acceptor(Arc::clone(&hub)).unwrap()).await;
-        let mut tls = dial(address, hub.public_key(), WAIT).await.unwrap();
-        let (_, session) = tls.get_ref();
-        assert_eq!(
-            session.protocol_version(),
-            Some(rustls::ProtocolVersion::TLSv1_3)
-        );
-        assert_eq!(session.alpn_protocol(), Some(ALPN));
-        tls.write_all(b"ping").await.unwrap();
-        let mut answer = [0; 4];
-        tls.read_exact(&mut answer).await.unwrap();
-        assert_eq!(&answer, b"pong");
+        // The second connection could resume the first if either side let
+        // it: neither does.
+        for _ in 0..2 {
+            let mut tls = dial(address, hub.public_key(), WAIT).await.unwrap();
+            let (_, session) = tls.get_ref();
+            assert_eq!(
+                session.protocol_version(),
+                Some(rustls::ProtocolVersion::TLSv1_3)
+            );
+            assert_eq!(session.handshake_kind(), Some(rustls::HandshakeKind::Full));
+            assert_eq!(session.alpn_protocol(), Some(ALPN));
+            tls.write_all(b"ping").await.unwrap();
+            let mut answer = [0; 4];
+            tls.read_exact(&mut answer).await.unwrap();
+            assert_eq!(&answer, b"pong", "the client sent a server name");
+        }
     }
 
     #[tokio::test]
@@ -326,13 +343,20 @@ mod tests {
     async fn plain_http_is_not_tls() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
+        // As a hub of an older release answers: it reads the whole
+        // ClientHello as a request it cannot parse, answers 400, and waits
+        // for the client to close.
         tokio::spawn(async move {
             let (mut tcp, _) = listener.accept().await.unwrap();
-            let mut hello = [0; 5];
-            let _ = tcp.read_exact(&mut hello).await;
-            let _ = tcp
-                .write_all(b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\n\r\n")
-                .await;
+            let mut header = [0; 5];
+            tcp.read_exact(&mut header).await.unwrap();
+            let mut hello = vec![0; usize::from(u16::from_be_bytes([header[3], header[4]]))];
+            tcp.read_exact(&mut hello).await.unwrap();
+            tcp.write_all(b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            let mut rest = Vec::new();
+            let _ = tcp.read_to_end(&mut rest).await;
         });
         assert!(matches!(
             dial(address, signer(7).public_key(), WAIT).await,

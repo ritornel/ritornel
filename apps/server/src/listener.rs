@@ -237,13 +237,15 @@ async fn accept(
                 debug!(%peer, "a connection from outside the private network is closed");
             }
             Ok((stream, peer)) => {
+                // From now, not from whenever the task first runs.
+                let deadline = tokio::time::Instant::now() + bounds.header_wait;
                 connections.spawn(serve(
                     stream,
                     peer,
                     router.clone(),
                     tls.clone(),
                     stopping.clone(),
-                    bounds.header_wait,
+                    (deadline, bounds.header_wait),
                     admitted,
                 ));
             }
@@ -271,19 +273,19 @@ struct Secure(bool);
 ///
 /// Its first byte says what it is: a TLS handshake, which a satellite
 /// opens with to reach its hub, or plain HTTP, which this machine's
-/// clients and the private network's speak. The connection has
-/// `header_wait` from being accepted to send a whole first request, its
-/// handshake included, and Hyper's own wait for each request after that.
+/// clients and the private network's speak. The connection has until
+/// `deadline`, `header_wait` from being accepted, to send a whole first
+/// request, its handshake included, and Hyper's own `header_wait` for each
+/// request after that.
 async fn serve(
     stream: TcpStream,
     peer: SocketAddr,
     router: Router,
     tls: TlsAcceptor,
     mut stopping: watch::Receiver<bool>,
-    header_wait: Duration,
+    (deadline, header_wait): (tokio::time::Instant, Duration),
     _admitted: OwnedSemaphorePermit,
 ) {
-    let deadline = tokio::time::Instant::now() + header_wait;
     // Whether the first request has reached the routes, after which the
     // deadline no longer applies.
     let asked = Arc::new(std::sync::atomic::AtomicBool::new(false));

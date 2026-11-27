@@ -92,6 +92,27 @@ pub(crate) fn job_for(job: &ritornel_engine::Job, show_paths: bool) -> Job {
     }
 }
 
+/// What a session needs to cancel a job of `kind`: what starting one needs,
+/// so a transcode needs `server:manage` to cancel as it does to start. A
+/// kind no call here starts is cancelled only by a session that holds every
+/// permission.
+fn needed_to_cancel(kind: &str) -> &'static [ritornel_contract::Permission] {
+    use ritornel_contract::methods::{
+        ImportsApply, ImportsDryRun, ImportsUndo, LastfmSync, TranscodePrune, TranscodeStart,
+    };
+    match kind {
+        // Scans the watcher starts are the same kind as those a call does.
+        "scan" => ScanStart::NEEDS,
+        crate::imports::DRY_RUN_JOB => ImportsDryRun::NEEDS,
+        crate::imports::APPLY_JOB => ImportsApply::NEEDS,
+        crate::imports::UNDO_JOB => ImportsUndo::NEEDS,
+        crate::lastfm::SYNC_JOB => LastfmSync::NEEDS,
+        TranscodeStart::NAME => TranscodeStart::NEEDS,
+        TranscodePrune::NAME => TranscodePrune::NEEDS,
+        _ => ritornel_contract::Permission::ALL,
+    }
+}
+
 fn no_library() -> RpcError {
     RpcError::new(
         ErrorCode::Unavailable,
@@ -594,8 +615,8 @@ impl Core {
     /// `jobs.cancel`: a request. A queued job is cancelled at once, and a
     /// running one stops after the step in flight.
     ///
-    /// A session cancels only a job it could have started: a transcode
-    /// needs `server:manage` to cancel as it did to start.
+    /// A session cancels only a job it could have started
+    /// ([`needed_to_cancel`]).
     pub(super) fn jobs_cancel(
         &self,
         stores: &Stores,
@@ -607,9 +628,7 @@ impl Core {
             .job(params.job_id)
             .map_err(stored)?
             .ok_or_else(Self::no_job)?;
-        if let Some(started_by) = ritornel_contract::methods::method(&found.kind)
-            && !session.has_all(started_by.needs)
-        {
+        if !session.has_all(needed_to_cancel(&found.kind)) {
             return Err(RpcError::new(
                 ErrorCode::Forbidden,
                 format!(
@@ -744,5 +763,16 @@ mod tests {
         assert!(shown.label.is_some() && shown.error.is_some());
         let hidden = job_for(&scanning, false);
         assert_eq!((hidden.label, hidden.error), (None, None));
+    }
+
+    #[test]
+    fn a_job_is_cancelled_with_what_starts_it() {
+        use ritornel_contract::Permission;
+        assert_eq!(needed_to_cancel("scan"), [Permission::LibraryWrite]);
+        assert_eq!(
+            needed_to_cancel("transcode.prune"),
+            [Permission::ServerManage]
+        );
+        assert_eq!(needed_to_cancel("library.wipe"), Permission::ALL);
     }
 }

@@ -95,6 +95,17 @@ pub async fn dial_hub(
         .map_err(|error| error.to_string())
 }
 
+/// The handshake of [`dial_hub`], on a connection to the hub already made:
+/// for a test that holds a connection open before it begins.
+pub async fn handshake_with_hub(
+    tcp: tokio::net::TcpStream,
+    key: [u8; 32],
+) -> Result<impl ritornel_client::Stream, String> {
+    tls::handshake(tcp, key)
+        .await
+        .map_err(|error| error.to_string())
+}
+
 /// The TLS a hub whose identity key is made from `seed` answers with. The
 /// integration tests' relay presents it to stand between a satellite and
 /// its hub and read what passes.
