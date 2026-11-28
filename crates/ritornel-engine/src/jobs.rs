@@ -809,7 +809,13 @@ mod tests {
         }
         start(0, "active");
         assert!(store.job_of_command(command(1, "a")).unwrap().is_none());
-        assert_eq!(start(2, "active").public_id, active.public_id);
+        assert_eq!(
+            store
+                .job_of_command(command(2, "a"))
+                .unwrap()
+                .map(|job| job.public_id),
+            Some(active.public_id)
+        );
         assert_eq!(start(3, "recent").public_id, recent.public_id);
         assert!(matches!(
             store.job_of_command(command(3, "different")),

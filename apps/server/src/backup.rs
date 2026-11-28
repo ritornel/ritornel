@@ -47,6 +47,7 @@ use ritornel_contract::{BackupReason, Id};
 use ritornel_engine::backup::{
     Database, Pending, copy_database, hold_sending, pending_migrations, recorded_id,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::{info, warn};
 
@@ -232,7 +233,7 @@ pub(crate) struct Taken {
 }
 
 /// What a backup records about the server, when it is known.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct About {
     pub(crate) server_id: Option<Id>,
     pub(crate) library_id: Option<Id>,
@@ -559,42 +560,128 @@ pub(crate) fn before_migrations(
     if server.is_none() && library.is_none() {
         return Ok(BeforeMigrations::default());
     }
-    // HeldDir serializes startups. Reserve the attempt before writing a byte
-    // of the snapshot, including when a supervisor kills the server mid-copy.
-    let marker = migration_marker(dir);
-    create_private_file(&marker)
-        .and_then(|file| file.sync_all())
-        .and_then(|()| sync_dir(dir.root()))
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                io_error("retry the upgrade while this marker exists", &marker)(
-                    std::io::Error::other("the previous upgrade did not finish; check its error and remove the marker after repair to take a fresh snapshot and retry")
-                )
-            } else {
-                io_error("reserve the migration attempt at", &marker)(error)
-            }
-        })?;
-    snapshot_before(dir, place, at_ms, server, library, say).inspect_err(|_| {
-        if let Err(error) = migrations_finished(dir) {
-            warn!(%error, "could not clear the migration marker after a failed snapshot");
-        }
+    let about = About {
+        server_id: recorded(&dir.server_db(), Database::Server),
+        library_id: recorded(&dir.library_db(), Database::Library),
+        server_schema: server.map(|pending| pending.from),
+        library_schema: library.map(|pending| pending.from),
+    };
+    let marker = dir.root().join(MIGRATION_BACKUP);
+    let previous = MigrationBackup::read(&marker);
+    let backup = if let Some(previous) = previous.filter(|b| b.reusable(dir, place, about)) {
+        info!(path = %previous.path.display(), "reusing the snapshot from the previous migration attempt");
+        previous
+    } else {
+        info!(
+            ?server,
+            ?library,
+            "a database will be migrated, so it is copied first"
+        );
+        say(Preparing::Backup);
+        let (taken, failed) = snapshot_before(dir, place, at_ms, about)?;
+        let backup = MigrationBackup {
+            about,
+            server_target: ritornel_engine::SERVER_SCHEMA_VERSION,
+            library_target: ritornel_engine::LIBRARY_SCHEMA_VERSION,
+            path: taken.path,
+            at_ms: taken.at_ms,
+            in_place: place.is_some() && failed.is_none(),
+            failed,
+        };
+        backup
+            .save(dir, &marker)
+            .map_err(io_error("record the migration snapshot in", &marker))?;
+        backup
+    };
+    say(Preparing::Migration);
+    Ok(BeforeMigrations {
+        taken: backup.in_place.then_some(Taken {
+            path: backup.path,
+            at_ms: backup.at_ms,
+            reason: BackupReason::BeforeMigration,
+        }),
+        failed: backup.failed,
     })
 }
 
-fn migration_marker(dir: &DataDir) -> PathBuf {
-    dir.root().join(format!(
-        "migration-{}-{}.pending",
-        ritornel_engine::SERVER_SCHEMA_VERSION,
-        ritornel_engine::LIBRARY_SCHEMA_VERSION
-    ))
+const MIGRATION_BACKUP: &str = "migration-backup.json";
+
+#[derive(Serialize, Deserialize)]
+struct MigrationBackup {
+    #[serde(flatten)]
+    about: About,
+    server_target: i64,
+    library_target: i64,
+    path: PathBuf,
+    at_ms: i64,
+    in_place: bool,
+    failed: Option<String>,
 }
 
-pub(crate) fn migrations_finished(dir: &DataDir) -> Result<(), crate::Error> {
-    let marker = migration_marker(dir);
-    match std::fs::remove_file(&marker) {
-        Ok(()) => sync_dir(dir.root()).map_err(io_error("sync", dir.root())),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(io_error("remove", &marker)(error)),
+impl MigrationBackup {
+    fn read(marker: &Path) -> Option<Self> {
+        if !marker.symlink_metadata().ok()?.is_file() {
+            return None;
+        }
+        serde_json::from_reader(std::fs::File::open(marker).ok()?).ok()
+    }
+
+    fn reusable(&self, dir: &DataDir, place: Option<&Path>, about: About) -> bool {
+        if self.about != about
+            || self.server_target != ritornel_engine::SERVER_SCHEMA_VERSION
+            || self.library_target != ritornel_engine::LIBRARY_SCHEMA_VERSION
+        {
+            return false;
+        }
+        let Some(parent) = self.path.parent() else {
+            return false;
+        };
+        let destination_matches = if self.in_place {
+            place.is_some_and(|place| {
+                same_dir(parent, &resolved(place)) && outside(dir, place).is_ok()
+            })
+        } else {
+            same_dir(parent, &resolved(&dir.backups())) && is_inside(parent, dir.root())
+        };
+        destination_matches
+            && self.path.symlink_metadata().is_ok_and(|m| m.is_dir())
+            && self
+                .path
+                .join("backup.json")
+                .symlink_metadata()
+                .is_ok_and(|m| m.is_file())
+            && taken_from(&self.path)
+                .is_ok_and(|(at, from)| at == self.at_ms && same_dir(&from, &resolved(dir.root())))
+            && ["server.db", "library.db"].into_iter().all(|name| {
+                let live = present(&dir.root().join(name));
+                let copy = self.path.join(name).symlink_metadata();
+                match (live, copy) {
+                    (Ok(true), Ok(file)) => file.is_file() && file.len() > 0,
+                    (Ok(false), Err(error)) => error.kind() == std::io::ErrorKind::NotFound,
+                    _ => false,
+                }
+            })
+    }
+
+    fn save(&self, dir: &DataDir, marker: &Path) -> std::io::Result<()> {
+        let temp = tempfile::NamedTempFile::new_in(dir.root())?;
+        close_to_others(temp.path())?;
+        serde_json::to_writer(temp.as_file(), self)?;
+        temp.as_file().sync_all()?;
+        temp.persist(marker)?;
+        sync_dir(dir.root())
+    }
+}
+
+pub(crate) fn migrations_finished(dir: &DataDir) {
+    let marker = dir.root().join(MIGRATION_BACKUP);
+    let cleared = match std::fs::remove_file(&marker) {
+        Ok(()) => sync_dir(dir.root()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => Err(error),
+    };
+    if let Err(error) = cleared {
+        warn!(%error, path = %marker.display(), "could not clear the migration snapshot marker");
     }
 }
 
@@ -602,33 +689,15 @@ fn snapshot_before(
     dir: &DataDir,
     place: Option<&Path>,
     at_ms: i64,
-    server: Option<Pending>,
-    library: Option<Pending>,
-    say: &dyn Fn(Preparing),
-) -> Result<BeforeMigrations, crate::Error> {
-    let about = About {
-        server_id: recorded(&dir.server_db(), Database::Server),
-        library_id: recorded(&dir.library_db(), Database::Library),
-        server_schema: server.map(|pending| pending.from),
-        library_schema: library.map(|pending| pending.from),
-    };
-    info!(
-        ?server,
-        ?library,
-        "a database will be migrated, so it is copied first"
-    );
-    say(Preparing::Backup);
+    about: About,
+) -> Result<(Taken, Option<String>), crate::Error> {
     let reason = BackupReason::BeforeMigration;
     let mut failed = None;
     if let Some(place) = place {
         match to_place(dir, place, at_ms, reason, about) {
             Ok(taken) => {
                 info!(path = %taken.path.display(), "backed up before migrating");
-                say(Preparing::Migration);
-                return Ok(BeforeMigrations {
-                    taken: Some(taken),
-                    failed: None,
-                });
+                return Ok((taken, None));
             }
             Err(error) => {
                 warn!(
@@ -664,11 +733,7 @@ fn snapshot_before(
         source: std::io::Error::other(error.to_string()),
     })?;
     info!(path = %kept.path.display(), "kept a copy in the data directory before migrating");
-    say(Preparing::Migration);
-    Ok(BeforeMigrations {
-        taken: None,
-        failed,
-    })
+    Ok((kept, failed))
 }
 
 /// The ID a database records for itself, as a backup taken before it is
@@ -1023,10 +1088,12 @@ mod tests {
         let original = finished(&dir.backups());
         assert_eq!(original.len(), 1);
         for _ in 0..3 {
-            let Err(error) = start().await else {
-                panic!("an unfinished migration was repeated")
-            };
-            assert!(error.to_string().contains("remove the marker"), "{error}");
+            assert!(matches!(
+                start().await,
+                Err(crate::Error::Store(
+                    ritornel_engine::Error::MigrationFailed { .. }
+                ))
+            ));
         }
         assert_eq!(finished(&dir.backups()), original);
 
@@ -1034,13 +1101,79 @@ mod tests {
             .unwrap()
             .execute_batch("DROP TRIGGER fail_upgrade")
             .unwrap();
-        std::fs::remove_file(migration_marker(&dir)).unwrap();
         start().await.unwrap().stop().await.unwrap();
-        assert_eq!(finished(&dir.backups()).len(), 2);
-        assert!(!migration_marker(&dir).exists());
+        assert_eq!(finished(&dir.backups()), original);
+        assert!(!dir.root().join(MIGRATION_BACKUP).exists());
 
         std::fs::copy(&old, dir.server_db()).unwrap();
         start().await.unwrap().stop().await.unwrap();
+        assert_eq!(finished(&dir.backups()).len(), 2);
+    }
+
+    #[test]
+    fn retries_replace_missing_or_incomplete_snapshots_and_back_up_a_replaced_database() {
+        let scratch = Scratch::new();
+        let dir = data(&scratch);
+        let place = elsewhere(&scratch);
+        let take = |at_ms| {
+            before_migrations(&dir, Some(&place), at_ms, server_pending(), &|_| {})
+                .unwrap()
+                .taken
+                .unwrap()
+        };
+
+        let first = take(AT);
+        let steps = std::cell::RefCell::new(Vec::new());
+        let again = before_migrations(&dir, Some(&place), AT + 1, server_pending(), &|step| {
+            steps.borrow_mut().push(step)
+        })
+        .unwrap();
+        assert_eq!(again.taken.as_ref(), Some(&first));
+        assert_eq!(steps.into_inner(), [Preparing::Migration]);
+        assert_eq!(finished(&place).len(), 1);
+
+        std::fs::remove_dir_all(&first.path).unwrap();
+        let replacement = take(AT + 1_000);
+        assert_ne!(replacement.path, first.path);
+        std::fs::remove_file(replacement.path.join("server.db")).unwrap();
+        let complete = take(AT + 2_000);
+        assert_ne!(complete.path, replacement.path);
+
+        let other = Scratch::new();
+        let other_dir = data(&other);
+        std::fs::copy(other_dir.server_db(), dir.server_db()).unwrap();
+        let restored = take(AT + 3_000);
+        assert_ne!(restored.path, complete.path);
+        assert_ne!(
+            manifest_of(&complete.path)["serverId"],
+            manifest_of(&restored.path)["serverId"]
+        );
+        assert_eq!(take(AT + 4_000), restored);
+    }
+
+    #[test]
+    fn a_partial_migration_takes_one_snapshot_of_the_new_starting_schemas() {
+        let scratch = Scratch::new();
+        let dir = data(&scratch);
+        with_library(&dir);
+        let both: &IsPending = &|_, _| Ok(Some(Pending { from: 1, to: 2 }));
+        let library_only: &IsPending =
+            &|_, db| Ok((db == Database::Library).then_some(Pending { from: 1, to: 2 }));
+        let unplugged = scratch.path().join("unplugged");
+        let run =
+            |pending| before_migrations(&dir, Some(&unplugged), AT, pending, &|_| {}).unwrap();
+        let first = run(both);
+        assert!(first.failed.is_some());
+        let partial = run(library_only);
+        assert_eq!(finished(&dir.backups()).len(), 2);
+        let again = run(library_only);
+        assert!(again.taken.is_none());
+        assert_eq!(again.failed, partial.failed);
+        assert_eq!(finished(&dir.backups()).len(), 2);
+
+        std::fs::write(dir.root().join(MIGRATION_BACKUP), b"{").unwrap();
+        run(library_only);
+        run(library_only);
         assert_eq!(finished(&dir.backups()).len(), 3);
     }
 
@@ -2000,7 +2133,7 @@ mod tests {
         );
         assert!(!dir.backups().exists());
 
-        migrations_finished(&dir).unwrap();
+        migrations_finished(&dir);
         // None named: the way back is kept in the data directory, and it
         // is not a backup.
         let done = before_migrations(&dir, None, AT, pending, &|_| {}).unwrap();
@@ -2011,7 +2144,7 @@ mod tests {
                 .is_file()
         );
 
-        migrations_finished(&dir).unwrap();
+        migrations_finished(&dir);
         // A place that cannot be written: the way back is kept all the
         // same, and the failure is said.
         let unplugged = scratch.path().join("unplugged");

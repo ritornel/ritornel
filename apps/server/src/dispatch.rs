@@ -84,6 +84,26 @@ pub(crate) use corrections::catalogue;
 use lists::Fanout;
 pub(crate) use settings::StartUp;
 
+/// Client-supplied log text stays readable on a single line in a terminal.
+struct LogText<'a>(&'a str);
+
+impl std::fmt::Display for LogText<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use std::fmt::Write;
+        for c in self.0.chars() {
+            if c.is_control()
+                || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' |
+                '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+            {
+                write!(f, "{}", c.escape_debug())?;
+            } else {
+                f.write_char(c)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The largest frame the server reads, in bytes: 1 MiB, which keeps bulk
 /// out of the control channel ("Listener and transport boundaries" in
 /// docs/internals/linking.md).
@@ -1387,9 +1407,9 @@ impl Core {
         }
         info!(
             session = session.id(),
-            client = %hello.name.escape_debug(),
+            client = %LogText(&hello.name),
             client_kind = hello.kind.as_str(),
-            client_version = %hello.version.escape_debug(),
+            client_version = %LogText(&hello.version),
             "hello"
         );
         // A person opening an app may want their latest plays: the
@@ -1771,8 +1791,8 @@ mod tests {
         let (core, scratch) = core();
         let session = core.open_session(SessionGrant::OWNER).unwrap();
         let mut params = hello();
-        params["name"] = json!("café\r\nforged");
-        params["version"] = json!("1\u{1b}[31m\u{2028}");
+        params["name"] = json!("Jo's Mac\r\nforged");
+        params["version"] = json!("1\u{1b}[31m\u{2028}\u{202e}");
         let events = crate::logs::tests::events(scratch.path(), || {
             call(&core, &session, "server.hello", Some(params)).unwrap();
         });
@@ -1780,8 +1800,8 @@ mod tests {
             .iter()
             .find(|event| event["message"] == "hello")
             .unwrap();
-        assert_eq!(hello["client"], r"café\r\nforged");
-        assert_eq!(hello["client_version"], r"1\u{1b}[31m\u{2028}");
+        assert_eq!(hello["client"], r"Jo's Mac\r\nforged");
+        assert_eq!(hello["client_version"], r"1\u{1b}[31m\u{2028}\u{202e}");
     }
 
     #[test]

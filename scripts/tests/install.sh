@@ -67,3 +67,12 @@ make_bundle "$built_v2" v2
     [[ $(<"$app_dir/$name.old/sentinel") == keep-old ]]
     [[ -z $(find "$app_dir" -maxdepth 1 -mindepth 1 -name '.*') ]]
 )
+
+# A minimal installation can still ask a compatible server for its status.
+(
+    bin_dir=$tmp/tools
+    mkdir "$bin_dir"
+    printf '%s\n' '#!/bin/sh' 'test "$1" = status' >"$bin_dir/ritornelctl"
+    chmod +x "$bin_dir/ritornelctl"
+    PATH=$bin_dir server_running
+)

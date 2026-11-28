@@ -216,7 +216,7 @@ impl Server {
         }
 
         let (identity, library) = library::open(dir, &store, identity, &clock, &entropy)?;
-        crate::backup::migrations_finished(dir)?;
+        crate::backup::migrations_finished(dir);
         // A hub renamed at start, as after its computer's name, keeps the
         // library's registry of servers in step, and one a crash or a
         // failed write left behind catches up.
