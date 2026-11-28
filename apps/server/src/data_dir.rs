@@ -94,15 +94,16 @@ impl DataDir {
     /// `bytes:`, which no absolute path begins with, so no two paths are
     /// one place.
     pub(crate) fn place(&self) -> String {
-        let path = crate::platform::plain_path(&crate::backup::resolved(&self.root));
-        match path.to_str() {
-            Some(text) => text.to_owned(),
-            None => {
-                let bytes = path.as_os_str().as_encoded_bytes();
-                let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
-                format!("bytes:{hex}")
-            }
+        let resolved = crate::backup::resolved(&self.root);
+        // Asked before it is made plain, which on Windows reads it lossily.
+        if resolved.to_str().is_some() {
+            return crate::platform::plain_path(&resolved)
+                .to_string_lossy()
+                .into_owned();
         }
+        let bytes = resolved.as_os_str().as_encoded_bytes();
+        let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        format!("bytes:{hex}")
     }
 
     pub(crate) fn lock_file(&self) -> PathBuf {

@@ -405,7 +405,7 @@ impl ServerStore {
         method: &'static str,
         new: NewJob,
     ) -> Result<(Job, bool), Error> {
-        self.start_job_upgrading(command, method, new, |_| None)
+        self.start_with(command, method, new, None::<fn(&str) -> Option<String>>)
     }
 
     /// As [`start_job`](Self::start_job), and asks more of a queued or
@@ -422,6 +422,16 @@ impl ServerStore {
         method: &'static str,
         new: NewJob,
         upgrade: impl FnOnce(&str) -> Option<String> + Send + 'static,
+    ) -> Result<(Job, bool), Error> {
+        self.start_with(command, method, new, Some(upgrade))
+    }
+
+    fn start_with(
+        &self,
+        command: Command,
+        method: &'static str,
+        new: NewJob,
+        upgrade: Option<impl FnOnce(&str) -> Option<String> + Send + 'static>,
     ) -> Result<(Job, bool), Error> {
         self.transact(move |transaction, now_ms, entropy| {
             if let Some(result) = receipt(transaction, &command)? {
@@ -440,17 +450,19 @@ impl ServerStore {
                 .optional()?;
             let (row, created) = match running {
                 Some(row) => {
-                    let current = job_by_row(transaction, row)?;
-                    if let Some(params) = upgrade(&current.params_json) {
-                        // One being cancelled will not do it, and the
-                        // command is kept for none.
+                    if let Some(upgrade) = upgrade {
+                        let current = job_by_row(transaction, row)?;
+                        // One being cancelled will do nothing more that is
+                        // asked of it, and the command is kept for none.
                         if current.state == JobState::Cancelling {
                             return Err(Error::JobEnding);
                         }
-                        transaction.execute(
-                            "UPDATE job SET params_json = ?2 WHERE id = ?1",
-                            (row, &params),
-                        )?;
+                        if let Some(params) = upgrade(&current.params_json) {
+                            transaction.execute(
+                                "UPDATE job SET params_json = ?2 WHERE id = ?1",
+                                (row, &params),
+                            )?;
+                        }
                     }
                     (row, false)
                 }
@@ -1074,21 +1086,29 @@ mod tests {
             .unwrap();
         let claimed = store.claim_job(id(0xb0)).unwrap();
         assert!(claimed.is_none(), "a queued job cancelled ends at once");
-        let (dying, _) = ask(9, "{}");
+        let (dying, _) = ask(9, "{\"full\":true}");
         store.claim_job(id(0xb0)).unwrap().unwrap();
         store
             .cancel_job(command(10, "cancel"), "jobs.cancel", dying.public_id)
             .unwrap();
-        let asked = store.start_job_upgrading(
-            command(11, "{\"full\":true}"),
-            "scan.start",
-            NewJob {
-                params_json: "{\"full\":true}".to_owned(),
-                ..scan("main")
-            },
-            |_| Some("{\"full\":true}".to_owned()),
-        );
-        assert!(matches!(asked, Err(Error::JobEnding)), "{asked:?}");
+        // Whether or not it would need upgrading: here it is full already.
+        for upgrade in [None, Some("{\"full\":true}")] {
+            let asked = store.start_job_upgrading(
+                command(11, "{\"full\":true}"),
+                "scan.start",
+                NewJob {
+                    params_json: "{\"full\":true}".to_owned(),
+                    ..scan("main")
+                },
+                move |_| upgrade.map(str::to_owned),
+            );
+            assert!(matches!(asked, Err(Error::JobEnding)), "{asked:?}");
+        }
+        // A plain start finds the job that is ending, as before.
+        let (found, created) = store
+            .start_job(command(12, "{}"), "scan.start", scan("main"))
+            .unwrap();
+        assert_eq!((found.id, created), (dying.id, false));
         store
             .finish_job(dying.id, JobState::Cancelled, None)
             .unwrap();
