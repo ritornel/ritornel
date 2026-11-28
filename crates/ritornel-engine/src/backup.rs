@@ -51,15 +51,9 @@ pub struct Pending {
 ///
 /// The file is only read.
 pub fn pending_migrations(path: &Path, database: Database) -> Result<Option<Pending>, Error> {
-    // One whose details cannot be read is an error, never taken for one
-    // that is not there.
-    match std::fs::metadata(path) {
-        Ok(file) if file.len() == 0 => return Ok(None),
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(Error::Io(error)),
-    }
-    let connection = Location::File(path.to_owned()).open(OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let Some(connection) = open_existing(path)? else {
+        return Ok(None);
+    };
     pending_in(&connection, database.migrations())
 }
 
@@ -71,12 +65,9 @@ pub fn pending_migrations(path: &Path, database: Database) -> Result<Option<Pend
 ///
 /// The file is only read.
 pub fn recorded_id(path: &Path, database: Database) -> Result<Option<Id>, Error> {
-    match std::fs::metadata(path) {
-        Ok(file) if file.len() == 0 => return Ok(None),
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(Error::Io(error)),
-    }
+    let Some(connection) = open_existing(path)? else {
+        return Ok(None);
+    };
     let (table, query) = match database {
         Database::Server => (
             "server_identity",
@@ -87,13 +78,7 @@ pub fn recorded_id(path: &Path, database: Database) -> Result<Option<Id>, Error>
             "SELECT library_id FROM library_meta WHERE id = 1",
         ),
     };
-    let connection = Location::File(path.to_owned()).open(OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    let made: bool = connection.query_row(
-        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
-        [table],
-        |row| row.get(0),
-    )?;
-    if !made {
+    if !has_table(&connection, table)? {
         return Ok(None);
     }
     let bytes = connection
@@ -103,6 +88,202 @@ pub fn recorded_id(path: &Path, database: Database) -> Result<Option<Id>, Error>
     Ok(bytes
         .and_then(|bytes| <[u8; 16]>::try_from(bytes).ok())
         .map(Id::from_bytes))
+}
+
+fn open_existing(path: &Path) -> Result<Option<rusqlite::Connection>, Error> {
+    match std::fs::metadata(path) {
+        Ok(file) if file.len() == 0 => Ok(None),
+        Ok(_) => Location::File(path.to_owned())
+            .open(OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(Error::Io(error)),
+    }
+}
+
+fn has_table(db: &rusqlite::Connection, name: &str) -> Result<bool, Error> {
+    Ok(db.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        [name],
+        |row| row.get(0),
+    )?)
+}
+
+/// The committed application state a pre-migration snapshot protects. Only
+/// the digest is kept: server rows include local credentials and service keys.
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MigrationState {
+    server_digest: Option<String>,
+    history: HistoryStart,
+    library_revision: Option<i64>,
+}
+
+impl MigrationState {
+    /// Read through SQLite so committed WAL frames count, and journal-mode
+    /// changes, rolled-back statements and file timestamps do not.
+    pub fn read(server: &Path, library: &Path) -> Result<Self, Error> {
+        Self::read_from(server, library, None)
+    }
+
+    /// Compare with the saved state. Jobs that had finished and receipts
+    /// that were final at capture can be skipped on every retry.
+    pub fn unchanged(&self, server: &Path, library: &Path) -> Result<bool, Error> {
+        Ok(self == &Self::read_from(server, library, Some(self.history))?)
+    }
+
+    fn read_from(
+        server: &Path,
+        library: &Path,
+        history: Option<HistoryStart>,
+    ) -> Result<Self, Error> {
+        let (server_digest, history) = if let Some(db) = open_existing(server)? {
+            let tx = db.unchecked_transaction()?;
+            let history = match history {
+                Some(known) => known,
+                None => HistoryStart::read(&tx)?,
+            };
+            (Some(server_digest(&tx, history)?), history)
+        } else {
+            (None, HistoryStart::default())
+        };
+        let library_revision = match open_existing(library)? {
+            Some(db) if has_table(&db, "library_meta")? => db
+                .query_row("SELECT rev FROM library_meta WHERE id = 1", [], |row| {
+                    row.get(0)
+                })
+                .optional()?,
+            _ => None,
+        };
+        Ok(Self {
+            server_digest,
+            history,
+            library_revision,
+        })
+    }
+}
+
+// The oldest row that may still change, or the highest existing ID if
+// all rows are final. New jobs and receipts append above that ID.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct HistoryStart {
+    job: i64,
+    receipt: i64,
+}
+
+const ACTIVE_JOB: &str = "state IN ('queued','running','cancelling')";
+const OPEN_MOVE: &str =
+    "method = 'playback.move' AND json_extract(result_json, '$.status') = 'accepted'";
+
+impl HistoryStart {
+    fn read(db: &rusqlite::Connection) -> Result<Self, Error> {
+        let first = |table, predicate| -> Result<i64, Error> {
+            if !has_table(db, table)? {
+                return Ok(0);
+            }
+            Ok(db.query_row(&format!(
+                "SELECT coalesce((SELECT min(id) FROM {table} WHERE {predicate}), max(id), 0) FROM {table}"
+            ), [], |row| row.get(0))?)
+        };
+        Ok(Self {
+            job: first("job", ACTIVE_JOB)?,
+            receipt: first("command_receipt", OPEN_MOVE)?,
+        })
+    }
+}
+
+fn server_digest(db: &rusqlite::Connection, history: HistoryStart) -> Result<String, Error> {
+    let mut digest = blake3::Hasher::new();
+    // Old schemas lack some tables. Skip the migration ledger itself: a
+    // repair to a broken migration must not look like new player activity.
+    let mut tables = db.prepare(
+        "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT GLOB 'sqlite_*'
+         AND name != 'schema_migration' ORDER BY name",
+    )?;
+    for table in tables.query_map([], |row| row.get::<_, String>(0))? {
+        let table = table?;
+        digest.update(&(table.len() as u64).to_le_bytes());
+        digest.update(table.as_bytes());
+        let quoted = format!("\"{}\"", table.replace('"', "\"\""));
+        // Jobs and their item records accumulate over the life of the
+        // server. Finished jobs and committed items do not change.
+        if matches!(
+            table.as_str(),
+            "job" | "job_item" | "command_receipt" | "listen_staging" | "queue_entry" | "outbox"
+        ) {
+            // Separate aggregates let SQLite count the b-tree and seek its
+            // last row without decoding every historical payload.
+            hash_rows(
+                db,
+                &format!(
+                    "SELECT (SELECT count(*) FROM {quoted}), coalesce(max(id), 0) FROM {quoted}"
+                ),
+                &mut digest,
+            )?;
+        }
+        let sql = match table.as_str() {
+            // Closed listens are immutable until delivered. Include the
+            // latest listen's identity too: SQLite can reuse a deleted rowid.
+            "listen_staging" => "SELECT * FROM listen_staging WHERE ended_at_utc_ms IS NULL
+                UNION ALL SELECT * FROM listen_staging WHERE id = (SELECT max(id) FROM listen_staging)
+                ORDER BY id".to_owned(),
+            // Queue edits advance playback_session.queue_revision; marking
+            // an unplayable entry can also change its reason independently.
+            "queue_entry" => "SELECT id, failed_reason FROM queue_entry WHERE failed_reason IS NOT NULL
+                ORDER BY id".to_owned(),
+            // New deliveries have zero attempts. A retry updates an existing
+            // row. Include the newest delivery even before its first attempt.
+            "outbox" => "SELECT * FROM outbox WHERE attempts != 0 OR id = (SELECT max(id) FROM outbox)
+                ORDER BY id".to_owned(),
+            "job_item" => continue,
+            "job" => format!("SELECT * FROM job WHERE id >= {} AND {ACTIVE_JOB} ORDER BY id", history.job),
+            // A move receipt can change from accepted to done with no new
+            // receipt. Its recovery journal may already be gone by the retry.
+            "command_receipt" => format!("SELECT id FROM command_receipt WHERE id >= {} AND {OPEN_MOVE} ORDER BY id", history.receipt),
+            _ => format!("SELECT * FROM {quoted} ORDER BY rowid"),
+        };
+        hash_rows(db, &sql, &mut digest)?;
+    }
+    Ok(digest.finalize().to_hex().to_string())
+}
+
+/// Frame each value by its SQLite type and length so adjacent text and
+/// blob fields cannot run together in the digest.
+fn hash_rows(
+    db: &rusqlite::Connection,
+    sql: &str,
+    digest: &mut blake3::Hasher,
+) -> Result<(), Error> {
+    use rusqlite::types::ValueRef;
+    let mut stmt = db.prepare(sql)?;
+    let columns = stmt.column_count();
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        digest.update(b"row");
+        for col in 0..columns {
+            match row.get_ref(col)? {
+                ValueRef::Null => {
+                    digest.update(b"n");
+                }
+                ValueRef::Integer(i) => {
+                    digest.update(b"i").update(&i.to_le_bytes());
+                }
+                ValueRef::Real(f) => {
+                    digest.update(b"f").update(&f.to_le_bytes());
+                }
+                value @ (ValueRef::Text(bytes) | ValueRef::Blob(bytes)) => {
+                    digest
+                        .update(if matches!(value, ValueRef::Text(_)) {
+                            b"t"
+                        } else {
+                            b"b"
+                        })
+                        .update(&(bytes.len() as u64).to_le_bytes())
+                        .update(bytes);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn pending_in(
@@ -205,6 +386,54 @@ mod tests {
             Arc::new(OsEntropy),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn migration_state_tracks_commits_in_the_wal_and_ignores_rolled_back_updates() {
+        let scratch = Scratch::new("migration-state");
+        let path = scratch.0.join("server.db");
+        drop(open(&path));
+        let writer = rusqlite::Connection::open(&path).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode=DELETE;
+             INSERT INTO outbox(kind, dedupe_key, next_attempt_at_ms, created_at_ms)
+             VALUES ('history.ingest', x'01', 0, 0), ('history.ingest', x'02', 0, 0)",
+            )
+            .unwrap();
+        let state = || MigrationState::read(&path, &scratch.0.join("library.db")).unwrap();
+        let before = state();
+        writer.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+        assert_eq!(state(), before);
+        writer
+            .execute_batch("BEGIN; UPDATE outbox SET attempts = attempts + 1 WHERE id = 1")
+            .unwrap();
+        assert_eq!(state(), before);
+        writer.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(state(), before);
+        writer
+            .execute("UPDATE outbox SET attempts = attempts + 1 WHERE id = 1", [])
+            .unwrap();
+        assert_ne!(state(), before);
+        writer
+            .execute_batch(
+                r#"INSERT INTO command_receipt
+            (command_id, request_fingerprint, method, result_json, created_at_ms)
+            VALUES (zeroblob(16), zeroblob(32), 'playback.move', '{"status":"accepted"}', 0)"#,
+            )
+            .unwrap();
+        let accepted = state();
+        writer
+            .execute(
+                r#"UPDATE command_receipt SET result_json = '{"status":"done"}'"#,
+                [],
+            )
+            .unwrap();
+        assert!(
+            !accepted
+                .unchanged(&path, &scratch.0.join("library.db"))
+                .unwrap()
+        );
     }
 
     #[test]

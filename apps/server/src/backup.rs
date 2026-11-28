@@ -45,7 +45,7 @@ use std::sync::Mutex;
 use ritornel_contract::local::Preparing;
 use ritornel_contract::{BackupReason, Id};
 use ritornel_engine::backup::{
-    Database, Pending, copy_database, hold_sending, pending_migrations, recorded_id,
+    Database, MigrationState, Pending, copy_database, hold_sending, pending_migrations, recorded_id,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -567,31 +567,41 @@ pub(crate) fn before_migrations(
         library_schema: library.map(|pending| pending.from),
     };
     let marker = dir.root().join(MIGRATION_BACKUP);
-    let previous = MigrationBackup::read(&marker);
-    let backup = if let Some(previous) = previous.filter(|b| b.reusable(dir, place, about)) {
-        info!(path = %previous.path.display(), "reusing the snapshot from the previous migration attempt");
-        previous
-    } else {
-        info!(
-            ?server,
-            ?library,
-            "a database will be migrated, so it is copied first"
-        );
-        say(Preparing::Backup);
-        let (taken, failed) = snapshot_before(dir, place, at_ms, about)?;
-        let backup = MigrationBackup {
-            about,
-            server_target: ritornel_engine::SERVER_SCHEMA_VERSION,
-            library_target: ritornel_engine::LIBRARY_SCHEMA_VERSION,
-            path: taken.path,
-            at_ms: taken.at_ms,
-            in_place: place.is_some() && failed.is_none(),
-            failed,
-        };
-        backup
-            .save(dir, &marker)
-            .map_err(io_error("record the migration snapshot in", &marker))?;
-        backup
+    let previous = MigrationBackup::read(&marker).filter(|backup| {
+        backup.reusable(dir, place, about, at_ms)
+            && backup.state.as_ref().is_some_and(|state| {
+                state
+                    .unchanged(&dir.server_db(), &dir.library_db())
+                    .unwrap_or(false)
+            })
+    });
+    let backup = match previous {
+        Some(previous) if previous.in_place || place.is_none() => {
+            info!(path = %previous.path.display(), "reusing the snapshot from the previous migration attempt");
+            previous
+        }
+        fallback => {
+            say(Preparing::Backup);
+            let (taken, failed) = snapshot_before(dir, place, at_ms, about, fallback.as_ref())?;
+            let backup = MigrationBackup {
+                about,
+                state: fallback.and_then(|previous| previous.state).or_else(|| {
+                    MigrationState::read(&dir.server_db(), &dir.library_db()).inspect_err(|error| {
+                        warn!(%error, "could not record database state for migration snapshot reuse");
+                    }).ok()
+                }),
+                server_target: ritornel_engine::SERVER_SCHEMA_VERSION,
+                library_target: ritornel_engine::LIBRARY_SCHEMA_VERSION,
+                path: taken.path,
+                at_ms: taken.at_ms,
+                in_place: place.is_some() && failed.is_none(),
+                failed,
+            };
+            if let Err(error) = backup.save(dir, &marker) {
+                warn!(%error, path = %marker.display(), "could not record the completed migration snapshot for reuse");
+            }
+            backup
+        }
     };
     say(Preparing::Migration);
     Ok(BeforeMigrations {
@@ -604,12 +614,14 @@ pub(crate) fn before_migrations(
     })
 }
 
+const REUSE_MS: i64 = 24 * 60 * 60 * 1_000;
 const MIGRATION_BACKUP: &str = "migration-backup.json";
 
 #[derive(Serialize, Deserialize)]
 struct MigrationBackup {
     #[serde(flatten)]
     about: About,
+    state: Option<MigrationState>,
     server_target: i64,
     library_target: i64,
     path: PathBuf,
@@ -626,8 +638,9 @@ impl MigrationBackup {
         serde_json::from_reader(std::fs::File::open(marker).ok()?).ok()
     }
 
-    fn reusable(&self, dir: &DataDir, place: Option<&Path>, about: About) -> bool {
-        if self.about != about
+    fn reusable(&self, dir: &DataDir, place: Option<&Path>, about: About, at_ms: i64) -> bool {
+        if !(self.at_ms..=self.at_ms.saturating_add(REUSE_MS)).contains(&at_ms)
+            || self.about != about
             || self.server_target != ritornel_engine::SERVER_SCHEMA_VERSION
             || self.library_target != ritornel_engine::LIBRARY_SCHEMA_VERSION
         {
@@ -690,6 +703,7 @@ fn snapshot_before(
     place: Option<&Path>,
     at_ms: i64,
     about: About,
+    fallback: Option<&MigrationBackup>,
 ) -> Result<(Taken, Option<String>), crate::Error> {
     let reason = BackupReason::BeforeMigration;
     let mut failed = None;
@@ -708,6 +722,17 @@ fn snapshot_before(
                 failed = Some(error.to_string());
             }
         }
+    }
+    if let Some(previous) = fallback {
+        info!(path = %previous.path.display(), "reusing the local migration snapshot");
+        return Ok((
+            Taken {
+                path: previous.path.clone(),
+                at_ms: previous.at_ms,
+                reason,
+            },
+            failed,
+        ));
     }
     let rollback = dir.backups();
     // A `backups/` that leads out of the data directory, as a link to
@@ -1075,7 +1100,8 @@ mod tests {
         rusqlite::Connection::open(dir.server_db())
             .unwrap()
             .execute_batch(
-                "CREATE TRIGGER fail_upgrade BEFORE INSERT ON schema_migration BEGIN
+                "INSERT INTO server_setting (key, value_json) VALUES ('test.setting', '1');
+                 CREATE TRIGGER fail_upgrade BEFORE INSERT ON schema_migration BEGIN
                  SELECT raise(ABORT, 'migration failed'); END",
             )
             .unwrap();
@@ -1097,17 +1123,49 @@ mod tests {
         }
         assert_eq!(finished(&dir.backups()), original);
 
+        // A previous build changes an existing setting while the failed
+        // upgrade's marker remains. The row count, ID and schema all match.
+        let sqlite = rusqlite::Connection::open(dir.server_db()).unwrap();
+        assert_eq!(
+            sqlite
+                .execute(
+                    "UPDATE server_setting SET value_json = '2' WHERE key = 'test.setting'",
+                    []
+                )
+                .unwrap(),
+            1
+        );
+        drop(sqlite);
+        assert!(matches!(
+            start().await,
+            Err(crate::Error::Store(
+                ritornel_engine::Error::MigrationFailed { .. }
+            ))
+        ));
+        let updated = finished(&dir.backups());
+        assert_eq!(updated.len(), 2);
+        let marker = MigrationBackup::read(&dir.root().join(MIGRATION_BACKUP)).unwrap();
+        let value: String = rusqlite::Connection::open(marker.path.join("server.db"))
+            .unwrap()
+            .query_row(
+                "SELECT value_json FROM server_setting WHERE key = 'test.setting'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(value, "2");
+
         rusqlite::Connection::open(dir.server_db())
             .unwrap()
             .execute_batch("DROP TRIGGER fail_upgrade")
             .unwrap();
         start().await.unwrap().stop().await.unwrap();
-        assert_eq!(finished(&dir.backups()), original);
+        assert_eq!(finished(&dir.backups()), updated);
         assert!(!dir.root().join(MIGRATION_BACKUP).exists());
 
         std::fs::copy(&old, dir.server_db()).unwrap();
         start().await.unwrap().stop().await.unwrap();
-        assert_eq!(finished(&dir.backups()).len(), 2);
+        assert_eq!(finished(&dir.backups()).len(), 3);
     }
 
     #[test]
@@ -1175,6 +1233,66 @@ mod tests {
         run(library_only);
         run(library_only);
         assert_eq!(finished(&dir.backups()).len(), 3);
+    }
+
+    #[test]
+    fn migration_reuse_expires_and_a_library_write_requires_a_new_copy() {
+        let scratch = Scratch::new();
+        let dir = data(&scratch);
+        with_library(&dir);
+        let place = elsewhere(&scratch);
+        let take = |at| {
+            before_migrations(&dir, Some(&place), at, server_pending(), &|_| {})
+                .unwrap()
+                .taken
+                .unwrap()
+        };
+        let first = take(AT);
+        assert_eq!(take(AT + REUSE_MS), first);
+        let expired = take(AT + REUSE_MS + 1);
+        assert_ne!(expired, first);
+        let earlier = take(AT);
+        assert_ne!(earlier, expired);
+        rusqlite::Connection::open(dir.library_db())
+            .unwrap()
+            .execute("UPDATE library_meta SET rev = rev + 1", [])
+            .unwrap();
+        assert_ne!(take(AT), earlier);
+    }
+
+    #[test]
+    fn a_retry_promotes_a_local_snapshot_when_the_backup_disk_returns() {
+        let scratch = Scratch::new();
+        let dir = data(&scratch);
+        let place = scratch.path().join("backup-disk");
+        let take =
+            |at| before_migrations(&dir, Some(&place), at, server_pending(), &|_| {}).unwrap();
+        assert!(take(AT).failed.is_some());
+        assert!(take(AT + 1).failed.is_some());
+        let local = finished(&dir.backups());
+        assert_eq!(local.len(), 1);
+        std::fs::create_dir(&place).unwrap();
+        let promoted = take(AT + 2).taken.unwrap();
+        assert_eq!(take(AT + 3).taken, Some(promoted.clone()));
+        assert_eq!(finished(&place), [promoted.path]);
+        assert_eq!(finished(&dir.backups()), local);
+    }
+
+    #[test]
+    fn a_marker_that_cannot_be_replaced_does_not_block_migration_after_the_copy() {
+        let scratch = Scratch::new();
+        let dir = data(&scratch);
+        std::fs::create_dir(dir.root().join(MIGRATION_BACKUP)).unwrap();
+        let steps = std::cell::RefCell::new(Vec::new());
+        before_migrations(&dir, None, AT, server_pending(), &|step| {
+            steps.borrow_mut().push(step)
+        })
+        .unwrap();
+        assert_eq!(
+            steps.into_inner(),
+            [Preparing::Backup, Preparing::Migration]
+        );
+        assert_eq!(finished(&dir.backups()).len(), 1);
     }
 
     #[test]
