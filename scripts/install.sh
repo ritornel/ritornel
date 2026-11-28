@@ -147,8 +147,9 @@ main() {
         fi
     fi
 
-    if "$bin_dir/ritornelctl" status >/dev/null 2>&1; then
-        echo "A server is running on the old build. To use this one: quit Ritornel if it started the server, or run ritornel-server service install again if it is the background service, or stop one started by hand"
+    # The installed client may already speak a newer contract than the server.
+    if pgrep -u "$(id -u)" -x ritornel-server >/dev/null 2>&1; then
+        echo "Warning: ritornel-server is running. Restart it to use the installed build. Quit and reopen Ritornel if it started the server, reinstall the background service with ritornel-server service install, or restart a server started by hand." >&2
     fi
 }
 

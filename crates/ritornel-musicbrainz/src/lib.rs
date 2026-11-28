@@ -65,6 +65,7 @@ pub struct MusicBrainz {
     pace: Duration,
     /// When the last request was sent.
     last: Mutex<Option<Instant>>,
+    stopped: tokio::sync::watch::Sender<bool>,
 }
 
 impl Drop for MusicBrainz {
@@ -114,6 +115,7 @@ impl MusicBrainz {
             base_url,
             pace,
             last: Mutex::new(None),
+            stopped: tokio::sync::watch::Sender::new(false),
         })
     }
 }
@@ -182,72 +184,86 @@ impl Catalogue for MusicBrainz {
         // The turn is held until the reply is in, so no two requests are
         // ever under way at once, and each starts a second after the last.
         let mut last = self.last.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(sent) = *last {
-            let since = sent.elapsed();
-            if since < self.pace {
-                std::thread::sleep(self.pace - since);
-            }
-        }
-        *last = Some(Instant::now());
+        let mut stopped = self.stopped.subscribe();
         runtime.block_on(async {
-            let mut response = self
-                .client
-                .get(&url)
-                .header("Accept", "application/json")
-                .send()
-                .await
-                .map_err(|error| {
-                    let what = if error.is_timeout() {
-                        "did not answer in time"
-                    } else {
-                        "could not be reached"
-                    };
-                    Error::source(format!("MusicBrainz {what}"))
-                })?;
-            let status = response.status().as_u16();
-            match status {
-                200 | 404 => {}
-                503 | 429 => {
-                    return Err(Error::source(format!(
-                        "MusicBrainz is busy ({status}): ask again later"
-                    )));
-                }
-                400..=499 => {
-                    return Err(Error::source(format!(
-                        "MusicBrainz will not take this request ({status})"
-                    )));
-                }
-                _ => {
-                    return Err(Error::source(format!("MusicBrainz failed ({status})")));
-                }
+            tokio::select! {
+                biased;
+                _ = stopped.wait_for(|stopped| *stopped) => Err(Error::source("MusicBrainz lookup stopped")),
+                result = async {
+                    if let Some(sent) = *last {
+                        tokio::time::sleep(self.pace.saturating_sub(sent.elapsed())).await;
+                    }
+                    *last = Some(Instant::now());
+                    self.fetch(&url).await
+                } => result,
             }
-            // Only JSON is a reply: a page from something between here and
-            // MusicBrainz is a failure.
-            let json = response
-                .headers()
-                .get(reqwest::header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .is_some_and(|value| value.to_ascii_lowercase().starts_with("application/json"));
-            if !json {
+        })
+    }
+
+    fn stop(&self) {
+        self.stopped.send_replace(true);
+    }
+}
+
+impl MusicBrainz {
+    async fn fetch(&self, url: &str) -> Result<Reply, Error> {
+        let mut response = self
+            .client
+            .get(url)
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .map_err(|error| {
+                let what = if error.is_timeout() {
+                    "did not answer in time"
+                } else {
+                    "could not be reached"
+                };
+                Error::source(format!("MusicBrainz {what}"))
+            })?;
+        let status = response.status().as_u16();
+        match status {
+            200 | 404 => {}
+            503 | 429 => {
                 return Err(Error::source(format!(
-                    "MusicBrainz's reply ({status}) was not JSON"
+                    "MusicBrainz is busy ({status}): ask again later"
                 )));
             }
-            let mut bytes = Vec::new();
-            while let Some(chunk) = response
-                .chunk()
-                .await
-                .map_err(|_| Error::source("MusicBrainz's reply was cut off"))?
-            {
-                if bytes.len() + chunk.len() > MAX_REPLY_BYTES {
-                    return Err(Error::source("MusicBrainz's reply was too large"));
-                }
-                bytes.extend_from_slice(&chunk);
+            400..=499 => {
+                return Err(Error::source(format!(
+                    "MusicBrainz will not take this request ({status})"
+                )));
             }
-            let body = String::from_utf8(bytes)
-                .map_err(|_| Error::source("MusicBrainz's reply was not UTF-8"))?;
-            Ok(Reply { status, body })
-        })
+            _ => {
+                return Err(Error::source(format!("MusicBrainz failed ({status})")));
+            }
+        }
+        // Only JSON is a reply: a page from something between here and
+        // MusicBrainz is a failure.
+        let json = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.to_ascii_lowercase().starts_with("application/json"));
+        if !json {
+            return Err(Error::source(format!(
+                "MusicBrainz's reply ({status}) was not JSON"
+            )));
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| Error::source("MusicBrainz's reply was cut off"))?
+        {
+            if bytes.len() + chunk.len() > MAX_REPLY_BYTES {
+                return Err(Error::source("MusicBrainz's reply was too large"));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let body = String::from_utf8(bytes)
+            .map_err(|_| Error::source("MusicBrainz's reply was not UTF-8"))?;
+        Ok(Reply { status, body })
     }
 }
 
@@ -257,6 +273,24 @@ mod tests {
     use crate::fake::FakeMusicBrainz;
 
     const DISC: &str = "49HHV7Eb8UKF3aQiNmu1GR8vKTY-";
+
+    #[tokio::test]
+    async fn stopping_interrupts_a_request_waiting_for_the_response() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let catalogue = std::sync::Arc::new(MusicBrainz::new(Some(&url)).unwrap());
+        let asking = catalogue.clone();
+        let request = tokio::task::spawn_blocking(move || asking.ask(&asking.disc(DISC)));
+        let (_unanswered, _) = tokio::time::timeout(Duration::from_secs(60), listener.accept())
+            .await
+            .expect("the catalogue never connected")
+            .unwrap();
+        catalogue.stop();
+        assert_eq!(
+            request.await.unwrap().unwrap_err().to_string(),
+            "MusicBrainz lookup stopped"
+        );
+    }
 
     #[test]
     fn a_disc_is_asked_for_once_with_its_inclusions_and_the_reply_comes_back_whole() {

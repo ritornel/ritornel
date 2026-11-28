@@ -559,6 +559,53 @@ pub(crate) fn before_migrations(
     if server.is_none() && library.is_none() {
         return Ok(BeforeMigrations::default());
     }
+    // HeldDir serializes startups. Reserve the attempt before writing a byte
+    // of the snapshot, including when a supervisor kills the server mid-copy.
+    let marker = migration_marker(dir);
+    create_private_file(&marker)
+        .and_then(|file| file.sync_all())
+        .and_then(|()| sync_dir(dir.root()))
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                io_error("retry the upgrade while this marker exists", &marker)(
+                    std::io::Error::other("the previous upgrade did not finish; check its error and remove the marker after repair to take a fresh snapshot and retry")
+                )
+            } else {
+                io_error("reserve the migration attempt at", &marker)(error)
+            }
+        })?;
+    snapshot_before(dir, place, at_ms, server, library, say).inspect_err(|_| {
+        if let Err(error) = migrations_finished(dir) {
+            warn!(%error, "could not clear the migration marker after a failed snapshot");
+        }
+    })
+}
+
+fn migration_marker(dir: &DataDir) -> PathBuf {
+    dir.root().join(format!(
+        "migration-{}-{}.pending",
+        ritornel_engine::SERVER_SCHEMA_VERSION,
+        ritornel_engine::LIBRARY_SCHEMA_VERSION
+    ))
+}
+
+pub(crate) fn migrations_finished(dir: &DataDir) -> Result<(), crate::Error> {
+    let marker = migration_marker(dir);
+    match std::fs::remove_file(&marker) {
+        Ok(()) => sync_dir(dir.root()).map_err(io_error("sync", dir.root())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(io_error("remove", &marker)(error)),
+    }
+}
+
+fn snapshot_before(
+    dir: &DataDir,
+    place: Option<&Path>,
+    at_ms: i64,
+    server: Option<Pending>,
+    library: Option<Pending>,
+    say: &dyn Fn(Preparing),
+) -> Result<BeforeMigrations, crate::Error> {
     let about = About {
         server_id: recorded(&dir.server_db(), Database::Server),
         library_id: recorded(&dir.library_db(), Database::Library),
@@ -925,6 +972,76 @@ mod tests {
             .unwrap();
         store.ensure_identity("desk").unwrap();
         dir
+    }
+
+    #[tokio::test]
+    async fn a_failed_upgrade_takes_one_snapshot_until_repaired() {
+        let scratch = Scratch::new();
+        let dir = data(&scratch);
+        let start = || async {
+            crate::Server::start(
+                crate::HeldDir::take(dir.root().to_owned())?,
+                crate::Listen::on_port(0),
+                Arc::new(SystemClock),
+                Arc::new(OsEntropy),
+            )
+            .await
+        };
+        // Build a database at the shipped first schema, with its real ledger
+        // row. Restoring it later exercises a separate upgrade to the same target.
+        let old = scratch.path().join("first-schema.db");
+        let fixture = rusqlite::Connection::open(&old).unwrap();
+        fixture
+            .execute_batch(include_str!(
+                "../../../crates/ritornel-engine/migrations/server/0001_server.sql"
+            ))
+            .unwrap();
+        fixture
+            .execute(
+                "ATTACH DATABASE ?1 AS current",
+                [dir.server_db().to_str().unwrap()],
+            )
+            .unwrap();
+        fixture.execute_batch(
+            "INSERT INTO main.schema_migration SELECT * FROM current.schema_migration WHERE version = 1"
+        ).unwrap();
+        drop(fixture);
+        std::fs::copy(&old, dir.server_db()).unwrap();
+        rusqlite::Connection::open(dir.server_db())
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_upgrade BEFORE INSERT ON schema_migration BEGIN
+                 SELECT raise(ABORT, 'migration failed'); END",
+            )
+            .unwrap();
+        assert!(matches!(
+            start().await,
+            Err(crate::Error::Store(
+                ritornel_engine::Error::MigrationFailed { .. }
+            ))
+        ));
+        let original = finished(&dir.backups());
+        assert_eq!(original.len(), 1);
+        for _ in 0..3 {
+            let Err(error) = start().await else {
+                panic!("an unfinished migration was repeated")
+            };
+            assert!(error.to_string().contains("remove the marker"), "{error}");
+        }
+        assert_eq!(finished(&dir.backups()), original);
+
+        rusqlite::Connection::open(dir.server_db())
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_upgrade")
+            .unwrap();
+        std::fs::remove_file(migration_marker(&dir)).unwrap();
+        start().await.unwrap().stop().await.unwrap();
+        assert_eq!(finished(&dir.backups()).len(), 2);
+        assert!(!migration_marker(&dir).exists());
+
+        std::fs::copy(&old, dir.server_db()).unwrap();
+        start().await.unwrap().stop().await.unwrap();
+        assert_eq!(finished(&dir.backups()).len(), 3);
     }
 
     #[test]
@@ -1883,6 +2000,7 @@ mod tests {
         );
         assert!(!dir.backups().exists());
 
+        migrations_finished(&dir).unwrap();
         // None named: the way back is kept in the data directory, and it
         // is not a backup.
         let done = before_migrations(&dir, None, AT, pending, &|_| {}).unwrap();
@@ -1893,6 +2011,7 @@ mod tests {
                 .is_file()
         );
 
+        migrations_finished(&dir).unwrap();
         // A place that cannot be written: the way back is kept all the
         // same, and the failure is said.
         let unplugged = scratch.path().join("unplugged");

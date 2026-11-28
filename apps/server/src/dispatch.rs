@@ -699,6 +699,9 @@ impl Core {
     pub(crate) fn close_sessions(&self) {
         let mut sessions = lock(&self.sessions);
         sessions.closed = true;
+        if let Some(catalogue) = self.catalogue() {
+            catalogue.stop();
+        }
         for session in sessions.open.values() {
             session.close();
         }
@@ -961,6 +964,9 @@ impl Core {
             }
         }
         match method {
+            CorrectionsLookup::NAME => {
+                return run::<CorrectionsLookup>(params, |params| self.corrections_lookup(&params));
+            }
             methods::LinkHandoff::NAME => {
                 return Err(RpcError::new(
                     ErrorCode::Forbidden,
@@ -1066,9 +1072,6 @@ impl Core {
             LibrarySetSettings::NAME => run::<LibrarySetSettings>(params, |params| {
                 self.library_set_settings(stores, &params)
             }),
-            CorrectionsLookup::NAME => {
-                run::<CorrectionsLookup>(params, |params| self.corrections_lookup(stores, &params))
-            }
             CorrectionsSummaryCall::NAME => {
                 run::<CorrectionsSummaryCall>(params, |_| self.corrections_summary(stores))
             }
@@ -1384,9 +1387,9 @@ impl Core {
         }
         info!(
             session = session.id(),
-            client = %hello.name,
+            client = %hello.name.escape_debug(),
             client_kind = hello.kind.as_str(),
-            client_version = %hello.version,
+            client_version = %hello.version.escape_debug(),
             "hello"
         );
         // A person opening an app may want their latest plays: the
@@ -1761,6 +1764,24 @@ mod tests {
                 .0,
             ErrorCode::IdempotencyMismatch
         );
+    }
+
+    #[test]
+    fn hello_logs_client_text_without_line_breaks_or_terminal_controls() {
+        let (core, scratch) = core();
+        let session = core.open_session(SessionGrant::OWNER).unwrap();
+        let mut params = hello();
+        params["name"] = json!("café\r\nforged");
+        params["version"] = json!("1\u{1b}[31m\u{2028}");
+        let events = crate::logs::tests::events(scratch.path(), || {
+            call(&core, &session, "server.hello", Some(params)).unwrap();
+        });
+        let hello = events
+            .iter()
+            .find(|event| event["message"] == "hello")
+            .unwrap();
+        assert_eq!(hello["client"], r"café\r\nforged");
+        assert_eq!(hello["client_version"], r"1\u{1b}[31m\u{2028}");
     }
 
     #[test]

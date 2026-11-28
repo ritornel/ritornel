@@ -279,7 +279,7 @@ pub(crate) fn utc(ms: i64) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::atomic::{AtomicI64, Ordering};
 
     use ritornel_engine::SessionToken;
@@ -308,6 +308,11 @@ mod tests {
         let clock = Arc::new(TestClock(AtomicI64::new(T0)));
         let logger = JsonLines::new(dir, Id::from_bytes([0xb0; 16]), level, clock.clone()).unwrap();
         tracing::subscriber::with_default(logger, || body(&clock));
+    }
+
+    pub(crate) fn events(dir: &Path, body: impl FnOnce()) -> Vec<Value> {
+        logging(dir, Level::INFO, |_| body());
+        lines(&dir.join("server.2026-11-15.jsonl"))
     }
 
     fn lines(path: &Path) -> Vec<Value> {
