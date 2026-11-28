@@ -30,6 +30,14 @@
 #                                          with the pinned ffmpeg in
 #                                          apps/desktop/.tones, played
 #                                          into nothing
+#   scripts/desktop.sh devices [args] run it against a library that syncs:
+#                                          eighteen invented albums of tones
+#                                          with covers (scripts/
+#                                          invent-tones.sh), and two folders
+#                                          to sync them to, a car's stick
+#                                          with little room and a player's
+#                                          card, made once in apps/desktop/
+#                                          .devices, or in $RITORNEL_DEVICES_DIR
 #
 # With RITORNEL_OFFSCREEN=1, `run` and `tones` open their windows on a
 # display no one sees, out of the Dock and never taking the keyboard, so
@@ -157,6 +165,33 @@ case "${1:-}" in
         fi
         "$app/target/release/ritornel-gpui" --data-dir "$data" "${@:2}"
         ;;
+    devices)
+        hide
+        # The invented library has no audio, so nothing of it can be encoded
+        # or copied: this one is real files, made up.
+        home=${RITORNEL_DEVICES_DIR:-$app/.devices}
+        data=$home/data
+        if [[ ! -d $home/music ]]; then
+            "$root/scripts/invent-tones.sh" "$home/music" 18
+        fi
+        gpui build --locked --release --quiet
+        serve
+        if [[ ! -f $data/.scanned ]]; then
+            (cd "$root" && cargo build --locked --release --quiet -p ritornelctl)
+            ctl=$root/target/release/ritornelctl
+            "$ctl" library create --data-dir "$data" >/dev/null
+            "$ctl" scan "$home/music" --data-dir "$data" >/dev/null
+            # Two folders to sync to, neither set up: nothing is written to
+            # either until its first sync.
+            mkdir -p "$home/targets/Car stick" "$home/targets/Walkman card"
+            "$ctl" devices add-folder "$home/targets/Car stick" --name "Car stick" \
+                --for car --limit 64MB --data-dir "$data" >/dev/null
+            "$ctl" devices add-folder "$home/targets/Walkman card" --name "Walkman card" \
+                --for player --data-dir "$data" >/dev/null
+            touch "$data/.scanned"
+        fi
+        "$app/target/release/ritornel-gpui" --data-dir "$data" "${@:2}"
+        ;;
     app)
         # The app and the server it starts, side by side in one bundle, as
         # the launcher looks for them (`ritornel_client::launch`).
@@ -186,7 +221,7 @@ case "${1:-}" in
         echo "built $bundle"
         ;;
     *)
-        echo "usage: $0 check | release | app | run [args] | tones [args]" >&2
+        echo "usage: $0 check | release | app | run [args] | tones [args] | devices [args]" >&2
         exit 2
         ;;
 esac

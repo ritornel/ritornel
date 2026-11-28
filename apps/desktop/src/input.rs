@@ -171,6 +171,22 @@ impl Field {
         cx.notify();
     }
 
+    /// What is typed in it.
+    pub(crate) fn text(&self) -> &str {
+        &self.content
+    }
+
+    /// Puts `text` in it, as if typed, without saying so: for a field that
+    /// opens on what it is to change.
+    pub(crate) fn set(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.selected = text.len()..text.len();
+        self.content = text.into();
+        self.reversed = false;
+        self.marked = None;
+        window.notify_text_input_changed(&self.focus);
+        cx.notify();
+    }
+
     /// Empties it, and says so.
     pub(crate) fn clear(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.content.is_empty() {

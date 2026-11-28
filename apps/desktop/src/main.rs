@@ -17,6 +17,7 @@ mod blur;
 mod button;
 mod carry;
 mod covers;
+mod devices;
 mod drawn;
 mod elastic;
 mod find;

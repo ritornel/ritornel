@@ -22,6 +22,7 @@ use gpui::{
 use crate::album::{Album, AlbumEvent};
 use crate::artist::{Artist, ArtistEvent};
 use crate::bar::PlayerBar;
+use crate::devices::DevicesPage;
 use crate::frame::{self, Back};
 use crate::frost;
 use crate::history::HistoryPage;
@@ -115,6 +116,8 @@ pub(crate) enum Page {
     },
     /// History: the picture of your listening life.
     History(Entity<HistoryPage>),
+    /// Devices: what the library is synced to.
+    Devices(Entity<DevicesPage>),
     /// A tab whose page is not built yet.
     NotBuilt(Tab),
 }
@@ -124,6 +127,7 @@ impl Place for Page {
         match self {
             Self::Library | Self::Album { .. } | Self::Artist { .. } => Tab::Library,
             Self::History(_) => Tab::History,
+            Self::Devices(_) => Tab::Devices,
             Self::NotBuilt(tab) => *tab,
         }
     }
@@ -134,6 +138,7 @@ impl Place for Page {
             (Self::Album { album, .. }, Self::Album { album: other, .. }) => album == other,
             (Self::Artist { artist, .. }, Self::Artist { artist: other, .. }) => artist == other,
             (Self::History(_), Self::History(_)) => true,
+            (Self::Devices(_), Self::Devices(_)) => true,
             (Self::NotBuilt(tab), Self::NotBuilt(other)) => tab == other,
             _ => false,
         }
@@ -147,6 +152,7 @@ enum Shown {
     Album(Entity<Album>),
     Artist(Entity<Artist>),
     History(Entity<HistoryPage>),
+    Devices(Entity<DevicesPage>),
     NotBuilt(Tab),
 }
 
@@ -157,6 +163,7 @@ impl Shown {
             Page::Album { album, .. } => Self::Album(album.clone()),
             Page::Artist { artist, .. } => Self::Artist(artist.clone()),
             Page::History(history) => Self::History(history.clone()),
+            Page::Devices(devices) => Self::Devices(devices.clone()),
             Page::NotBuilt(tab) => Self::NotBuilt(*tab),
         }
     }
@@ -172,6 +179,7 @@ impl Shown {
             Self::Album(album) => album.read(cx).top,
             Self::Artist(artist) => artist.read(cx).top,
             Self::History(history) => history.read(cx).top,
+            Self::Devices(devices) => devices.read(cx).top,
             _ => 0.,
         }
     }
@@ -182,6 +190,7 @@ impl Shown {
             Self::Album(album) => album.read(cx).ready(),
             Self::Artist(artist) => artist.read(cx).ready(),
             Self::History(history) => history.read(cx).ready(),
+            Self::Devices(devices) => devices.read(cx).ready(),
             Self::Wall | Self::NotBuilt(_) => true,
         }
     }
@@ -208,6 +217,7 @@ impl Shown {
             Self::Album(album) => album.update(cx, |album, cx| album.seen(seen, cx)),
             Self::Artist(artist) => artist.update(cx, |artist, cx| artist.seen(seen, cx)),
             Self::History(history) => history.update(cx, |history, cx| history.seen(seen, cx)),
+            Self::Devices(devices) => devices.update(cx, |devices, cx| devices.seen(seen, cx)),
             _ => {}
         }
     }
@@ -227,6 +237,7 @@ impl Shown {
             Self::Album(album) => album.clone().into_any_element(),
             Self::Artist(artist) => artist.clone().into_any_element(),
             Self::History(history) => history.clone().into_any_element(),
+            Self::Devices(devices) => devices.clone().into_any_element(),
             Self::NotBuilt(tab) => crate::blank::not_built(*tab, height - TITLE_BAR - PLAYER_BAR),
         }
     }
@@ -457,6 +468,14 @@ impl Shell {
         }
     }
 
+    /// The Devices page open, if it is.
+    pub(crate) fn devices_page(&self) -> Option<Entity<DevicesPage>> {
+        match self.pages.current() {
+            Page::Devices(devices) => Some(devices.clone()),
+            _ => None,
+        }
+    }
+
     /// Whether Up next's card is open and moves the page over: with room
     /// for it, at 1180 points wide or more.
     fn pushed(&self, cx: &gpui::App) -> bool {
@@ -533,7 +552,9 @@ impl Shell {
     /// Goes to a tab, as clicking it does. The lit tab's own page opens nothing.
     pub(crate) fn go(&mut self, tab: Tab, cx: &mut Context<Self>) {
         let open = match (tab, self.pages.current()) {
-            (Tab::Library, Page::Library) | (Tab::History, Page::History(_)) => true,
+            (Tab::Library, Page::Library)
+            | (Tab::History, Page::History(_))
+            | (Tab::Devices, Page::Devices(_)) => true,
             (_, Page::NotBuilt(open)) => *open == tab,
             _ => false,
         };
@@ -545,6 +566,10 @@ impl Shell {
             Tab::History => {
                 let link = self.link.clone();
                 Page::History(cx.new(|cx| HistoryPage::new(&link, cx)))
+            }
+            Tab::Devices => {
+                let (link, home) = (self.link.clone(), self.focus.clone());
+                Page::Devices(cx.new(|cx| DevicesPage::new(&link, home, cx)))
             }
             _ => Page::NotBuilt(tab),
         };
@@ -1043,7 +1068,7 @@ impl Shell {
                     Target::Nowhere
                 }
             }
-            Page::History(_) | Page::NotBuilt(_) => Target::Nowhere,
+            Page::History(_) | Page::Devices(_) | Page::NotBuilt(_) => Target::Nowhere,
         };
         self.carry = Some(carry);
     }
@@ -1144,6 +1169,7 @@ impl Shell {
             Page::Album { album, .. } => format!("album “{}”", album.read(cx).row.title),
             Page::Artist { artist, .. } => format!("artist {}", artist.read(cx).artist_id),
             Page::History(_) => "History".to_owned(),
+            Page::Devices(_) => "Devices".to_owned(),
             Page::NotBuilt(tab) => format!("{} (not built)", tab.label()),
         };
         crate::debug(format_args!(

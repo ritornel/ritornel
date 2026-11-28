@@ -18,6 +18,12 @@
 //!   `album next <n>` (its +) or `album rate <n> <stars>`: on the album page open
 //! - `point <across> <down>`: hold the pointer over History's picture there,
 //!   as shares of the window; `hold <n>`: click its nth layer (newest first)
+//! - `devices choose <n>`: go to the nth device of the Devices tab's column;
+//!   `devices view sync|music|plays`; `devices filter all|add|replace|remove|
+//!   conflict|blocked`; `devices open <n>`: open the nth row's tracks;
+//!   `devices sync`: press Sync, or Set up and sync; `devices add <path>`:
+//!   add that folder, as the folder chooser does; `devices forget`: ask to
+//!   forget the device shown
 //! - `size <w>x<h>`: resize the window
 //! - `menu <index>`: open that tile's context menu; `dismiss` puts it away;
 //!   `do <index> <item>`: what an item of it does, as `do 3 Play Next`
@@ -140,6 +146,13 @@ pub(crate) fn run(script: String, window: AnyWindowHandle, cx: &mut AsyncApp) ->
                                     });
                                     return;
                                 }
+                                if let Some(devices) = shell.devices_page() {
+                                    devices.update(cx, |devices, cx| {
+                                        devices.jump(by, viewport);
+                                        cx.notify();
+                                    });
+                                    return;
+                                }
                                 if let Some(artist) = shell.artist_page() {
                                     artist.update(cx, |artist, cx| {
                                         artist.jump(by, viewport);
@@ -244,6 +257,53 @@ pub(crate) fn run(script: String, window: AnyWindowHandle, cx: &mut AsyncApp) ->
                         if let (Ok(shell), Some(tab)) = (root.downcast::<Shell>(), tab) {
                             shell.update(cx, |shell, cx| shell.go(tab, cx));
                         }
+                    });
+                }
+                "devices" => {
+                    let (what, value) = rest.trim().split_once(' ').unwrap_or((rest.trim(), ""));
+                    let (what, value) = (what.to_owned(), value.trim().to_owned());
+                    let _ = window.update(cx, |root, _, cx| {
+                        let Ok(shell) = root.downcast::<Shell>() else {
+                            return;
+                        };
+                        let Some(devices) = shell.read(cx).devices_page() else {
+                            return;
+                        };
+                        devices.update(cx, |page, cx| {
+                            use crate::devices::View;
+                            use ritornel_contract::SyncActionKind as Kind;
+                            match what.as_str() {
+                                "choose" => {
+                                    let nth = value.parse::<usize>().ok();
+                                    if let Some(device) =
+                                        nth.and_then(|nth| page.listed().get(nth).copied())
+                                    {
+                                        page.go_to(device, cx);
+                                    }
+                                }
+                                "view" => match value.as_str() {
+                                    "music" => page.show(View::Music, cx),
+                                    "plays" => page.show(View::Plays, cx),
+                                    _ => page.show(View::Sync, cx),
+                                },
+                                "filter" => page.filter_by(
+                                    match value.as_str() {
+                                        "add" => Some(Kind::Add),
+                                        "replace" => Some(Kind::Replace),
+                                        "remove" => Some(Kind::Remove),
+                                        "conflict" => Some(Kind::Conflict),
+                                        "blocked" => Some(Kind::Blocked),
+                                        _ => None,
+                                    },
+                                    cx,
+                                ),
+                                "open" => page.open_row(value.parse().unwrap_or(0), cx),
+                                "sync" => page.sync(true, cx),
+                                "add" => page.add_folder(value.clone(), cx),
+                                "forget" => page.ask_forget(cx),
+                                _ => {}
+                            }
+                        });
                     });
                 }
                 "album" => {

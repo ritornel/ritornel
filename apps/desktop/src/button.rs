@@ -4,8 +4,8 @@
 //! so what a page is for wears the accent instead, and a button is never
 //! drawn in a status's colour but to take something away.
 //!
-//! A blank page's button is the one drawn with it so far, as `Secondary`;
-//! the other roles are here for the pages that need them. The Settings
+//! A blank page's button is `Secondary`, and the Devices tab uses every
+//! role but Play. The Settings
 //! window's push buttons are AppKit's (`settings/controls.rs`), and the
 //! banner's Play and Shuffle are drawn over its picture (`banner.rs`).
 
@@ -18,7 +18,10 @@ use crate::theme;
 
 /// What a button is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code, reason = "only `Secondary` has a caller yet")]
+#[allow(
+    dead_code,
+    reason = "`Play` has no caller yet: the banner draws its own"
+)]
 pub(crate) enum Role {
     /// Starts music on a record, an artist or a playlist: the ink.
     Play,

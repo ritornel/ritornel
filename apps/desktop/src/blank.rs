@@ -118,12 +118,8 @@ pub(crate) fn not_built(tab: crate::stage::Tab, height: f32) -> AnyElement {
             "Playlists are not built yet.",
             "Your playlists will be here.",
         ),
-        Tab::Devices => (
-            "Devices are not built yet.",
-            "The players you sync music to will be here.",
-        ),
         // These have pages of their own.
-        Tab::Library | Tab::History => ("", ""),
+        Tab::Library | Tab::History | Tab::Devices => ("", ""),
     };
     div()
         .relative()

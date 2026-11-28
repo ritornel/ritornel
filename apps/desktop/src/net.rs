@@ -113,6 +113,10 @@ impl Net {
         if players {
             topics.push(Topic::Players);
         }
+        // What the library syncs to, on a server that plans syncs.
+        if descriptor.server.has(capability::DEVICES) {
+            topics.push(Topic::Devices);
+        }
         client.subscribe(&topics).await?;
         let token = client.media_token().await?.token;
         // A session of the local owner is `full`, and may read the status.
