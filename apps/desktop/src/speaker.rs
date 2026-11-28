@@ -6,8 +6,9 @@
 //! On this computer it is the icon alone, or under `always` a slider led
 //! by a volume icon. Playing elsewhere it lights up: an accent tint from
 //! end to end, the place's name, faded at its end rather than cut short,
-//! and that place's volume under it. A place in trouble wears the warning
-//! colour, and its slider dims and stops answering.
+//! and that place's volume under it. A place in trouble wears its
+//! trouble's colour, amber out of reach and red when its output failed, and
+//! its slider dims and stops answering.
 //!
 //! The slider sends about ten times a second while it is dragged and once
 //! more when let go, and holds its own level against the place's reports
@@ -31,6 +32,10 @@ use crate::icons::icon;
 use crate::places::{Look, Places, line, plays, waves};
 use crate::player::Player;
 use crate::theme;
+use crate::theme::Status;
+
+/// How big a place's mark is beside its line in the picker.
+const PICKER_MARK: f32 = 8.;
 
 /// The widget's width, in every state.
 pub(crate) const WIDTH: f32 = 164.;
@@ -259,10 +264,10 @@ fn name_width(name: &str, window: &Window) -> f32 {
 }
 
 /// What hovering the widget shows: the whole name, and in trouble the
-/// whole sentence.
+/// whole sentence, in the trouble's colour.
 struct HoverCard {
     name: SharedString,
-    more: Option<SharedString>,
+    more: Option<(SharedString, Status)>,
 }
 
 impl Render for HoverCard {
@@ -285,7 +290,7 @@ impl Render for HoverCard {
             .children(
                 self.more
                     .clone()
-                    .map(|more| div().text_color(theme::warn()).child(more)),
+                    .map(|(more, status)| div().text_color(status.text()).child(more)),
             )
     }
 }
@@ -310,6 +315,8 @@ pub(crate) struct Speaker {
     scroll_ends: Option<Task<()>>,
     gate: ScrollGate,
     light: Light,
+    /// The status of the trouble last shown, kept while its colour fades.
+    trouble: Status,
     /// The name last lit, kept while it goes out.
     lit_name: Option<SharedString>,
     slider: Rc<Cell<Option<Bounds<Pixels>>>>,
@@ -345,6 +352,7 @@ impl Speaker {
             scroll_ends: None,
             gate: ScrollGate::default(),
             light: Light::default(),
+            trouble: Status::Need,
             lit_name: None,
             slider: Rc::default(),
             icon_bounds: Rc::default(),
@@ -629,6 +637,15 @@ impl Speaker {
                 let playing = plays(row);
                 let at = picker.at == Some(id);
                 let choosable = row.reachable;
+                let trouble = crate::places::trouble(row, None);
+                // A place whose output failed is lit in red, on which its
+                // red line still reads; one out of reach is never lit.
+                let lit = match trouble.as_ref().map(|trouble| trouble.status()) {
+                    Some(Status::Fail) => theme::fail_hover(),
+                    _ => theme::fill(),
+                };
+                // What cannot be chosen fades, but its trouble is said whole.
+                let faded = |part: gpui::Div| part.when(!choosable, |part| part.opacity(0.45));
                 div()
                     .id(SharedString::from(format!("place-{id}")))
                     .h(px(46.))
@@ -637,10 +654,9 @@ impl Speaker {
                     .flex()
                     .items_center()
                     .gap(px(10.))
-                    .when(at, |row| row.bg(theme::fill()))
-                    .when(!choosable, |row| row.opacity(0.45))
+                    .when(at, |row| row.bg(lit))
                     .when(choosable, |row| {
-                        row.hover(theme::hovered)
+                        row.hover(move |style| style.bg(lit))
                             .active(theme::pressed)
                             .on_hover(cx.listener(move |speaker, over: &bool, _, cx| {
                                 if *over {
@@ -658,14 +674,18 @@ impl Speaker {
                                     .update(cx, |places, cx| places.choose(id, cx));
                             }))
                     })
-                    .child(icon("speaker", 16., theme::dim()))
+                    .child(faded(div().flex_none().child(icon(
+                        "speaker",
+                        16.,
+                        theme::dim(),
+                    ))))
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .flex()
                             .flex_col()
-                            .child(
+                            .child(faded(
                                 div()
                                     .truncate()
                                     .text_size(px(13.5))
@@ -673,15 +693,29 @@ impl Speaker {
                                     .font_weight(FontWeight(500.))
                                     .text_color(theme::ink())
                                     .child(name),
-                            )
-                            .child(
+                            ))
+                            .child({
+                                // A place in trouble says so in its colour,
+                                // after its mark.
                                 div()
-                                    .truncate()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(5.))
+                                    .min_w_0()
                                     .text_size(px(12.))
                                     .line_height(px(15.))
-                                    .text_color(theme::dim())
-                                    .child(line(row, &clock)),
-                            ),
+                                    .text_color(
+                                        trouble.as_ref().map_or(theme::dim(), |trouble| {
+                                            trouble.status().text()
+                                        }),
+                                    )
+                                    .children(
+                                        trouble
+                                            .as_ref()
+                                            .map(|trouble| trouble.mark().draw(PICKER_MARK)),
+                                    )
+                                    .child(div().min_w_0().truncate().child(line(row, &clock)))
+                            }),
                     )
                     .when(playing, |row| {
                         row.child(
@@ -690,7 +724,11 @@ impl Speaker {
                         )
                     })
                     .when(chosen == Some(id), |row| {
-                        row.child(icon("check", 14., theme::acc()))
+                        row.child(faded(div().flex_none().child(icon(
+                            "check",
+                            14.,
+                            theme::acc(),
+                        ))))
                     })
             })
             .collect();
@@ -775,6 +813,9 @@ impl Render for Speaker {
         let (lit, warn) = match &look {
             Look::There { name, trouble, .. } => {
                 self.lit_name = Some(name.clone().into());
+                if let Some(trouble) = trouble {
+                    self.trouble = trouble.status();
+                }
                 (true, trouble.is_some())
             }
             _ => (false, false),
@@ -787,7 +828,8 @@ impl Render for Speaker {
         if !lit && shown.tint <= 0. {
             self.lit_name = None;
         }
-        let color = theme::mix(theme::acc(), theme::warn(), shown.warn);
+        // The trouble's text form, since the speaker icon is drawn in it.
+        let color = theme::mix(theme::acc(), self.trouble.text(), shown.warn);
         // The tint's colour over the bar, for the name's fade to end in.
         let ground = theme::mix(theme::bar_bg(), color, theme::LIT_TINT);
         let (icon_shown, slider, answers, trouble, name) = match &look {
@@ -917,9 +959,12 @@ impl Render for Speaker {
             .map(|name| {
                 (
                     name.clone(),
-                    trouble
-                        .as_ref()
-                        .map(|trouble| SharedString::from(trouble.sentence(&clock))),
+                    trouble.as_ref().map(|trouble| {
+                        (
+                            SharedString::from(trouble.sentence(&clock)),
+                            trouble.status(),
+                        )
+                    }),
                 )
             });
         let body = match (&name, slider) {

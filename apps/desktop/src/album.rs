@@ -1250,7 +1250,7 @@ impl Render for Album {
             if let Some(problem) = &self.problem {
                 body = body.child(
                     div()
-                        .text_color(theme::faint())
+                        .text_color(theme::fail_text())
                         .text_size(px(13.5))
                         .child(format!("This album could not be read: {problem}")),
                 );

@@ -15,7 +15,8 @@ use gpui::{
 };
 
 use crate::icons::icon;
-use crate::theme;
+use crate::marks::Mark;
+use crate::theme::{self, Status};
 
 /// The token for this appearance: dark first, light second.
 fn pick(dark: u32, light: u32) -> Rgba {
@@ -143,10 +144,24 @@ pub(crate) fn sub_wraps(text: impl Into<SharedString>) -> Div {
 
 /// A label and its value at the right.
 pub(crate) fn label_value(label: impl Into<SharedString>, value: impl Into<SharedString>) -> Div {
+    label_status(label, value, Status::Quiet)
+}
+
+/// A label and its value at the right, in the value's status's colour, and
+/// after the working arc while it is being done.
+pub(crate) fn label_status(
+    label: impl Into<SharedString>,
+    value: impl Into<SharedString>,
+    status: Status,
+) -> Div {
     row().child(div().flex_1().child(label.into())).child(
         div()
-            .text_color(theme::dim())
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .text_color(status.text())
             .text_right()
+            .when(status == Status::Working, |value| value.child(working()))
             .child(value.into()),
     )
 }
@@ -174,7 +189,7 @@ pub(crate) fn problem(text: impl Into<SharedString>) -> Div {
         .mx(px(2.))
         .text_size(px(11.))
         .line_height(px(SMALL_LINE))
-        .text_color(theme::warn())
+        .text_color(theme::fail_text())
         .child(text.into())
 }
 
@@ -370,39 +385,15 @@ pub(crate) fn progress(id: impl Into<ElementId>, of: Option<(u64, u64)>) -> impl
         )
 }
 
-/// A small spinner, for a wait with no end to show: a ring of
-/// `--fill2` with a quarter of `--dim` going round, once in 0.9 seconds, or
-/// in three when motion is reduced.
-pub(crate) fn spinner(id: impl Into<SharedString>) -> impl IntoElement {
-    let seconds = if crate::platform::reduce_motion() {
-        3.
-    } else {
-        0.9
-    };
-    div()
-        .relative()
-        .flex_none()
-        .size(px(14.))
-        .child(
-            gpui::svg()
-                .path("icons/settings/ring.svg")
-                .absolute()
-                .size(px(14.))
-                .text_color(theme::fill2()),
-        )
-        .child(
-            gpui::svg()
-                .path("icons/settings/arc.svg")
-                .absolute()
-                .size(px(14.))
-                .text_color(theme::dim())
-                .with_animation(
-                    ElementId::Name(id.into()),
-                    Animation::new(Duration::from_secs_f32(seconds)).repeat(),
-                    |arc, t| arc.with_transformation(Transformation::rotate(percentage(t))),
-                ),
-        )
+/// What is being done, for a wait with no end to show: the app's working
+/// arc (`marks::Mark`), as everywhere else. The scan's progress bar keeps
+/// the system's accent, as AppKit's does.
+pub(crate) fn working() -> gpui::AnyElement {
+    Mark::here(Status::Working).draw(WORKING)
 }
+
+/// How big the working arc is beside a line of the window's text.
+const WORKING: f32 = 12.;
 
 /// A pop-up button, as AppKit draws one: a push button's face with its
 /// choice at the left and the up and down chevrons at the right. The menu

@@ -41,11 +41,11 @@ use linux as system;
 use fallback as system;
 
 pub(crate) use system::{
-    CHROME, FEEL, FITTING_SHOWS, KEYS, SERVER_APART, SHOW_FOLDER, THIS_COMPUTER, accents,
-    bring_forward_quietly, choose_folder, dismiss_menu, fit_window, footprint, forget_main_window,
-    give_back, hold_appearance, keep_out_of_the_dock, key_text, locale, main_window, memory_line,
-    pop_up_menu, screenshot, scroll_details, settings_dir, start, start_server, started_here,
-    stop_server, swiped_back,
+    CHROME, CONTROL_ACCENT, FEEL, FITTING_SHOWS, KEYS, SERVER_APART, SHOW_FOLDER, THIS_COMPUTER,
+    accents, bring_forward_quietly, choose_folder, dismiss_menu, fit_window, footprint,
+    forget_main_window, give_back, hold_appearance, keep_out_of_the_dock, key_text, locale,
+    main_window, memory_line, pop_up_menu, screenshot, scroll_details, settings_dir, start,
+    start_server, started_here, stop_server, swiped_back,
 };
 
 /// One line of the system's context menu. Its actions are numbered in
@@ -330,6 +330,12 @@ mod fallback {
 
     /// What a button that shows a folder in the system's file manager says.
     pub(crate) const SHOW_FOLDER: &str = "Show in File Manager";
+
+    /// The accent the Settings window's controls wear where the system names
+    /// none, as `0xrrggbbaa`: on Linux, where the portal reports no accent,
+    /// the app's fallback of GNOME's default blue, since nothing names the
+    /// desktop's own.
+    pub(crate) const CONTROL_ACCENT: u32 = 0x3584e4ff;
 
     /// What the picker calls the computer the app runs on.
     pub(crate) const THIS_COMPUTER: &str = "This computer";

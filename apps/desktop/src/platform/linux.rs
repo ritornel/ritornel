@@ -21,10 +21,10 @@ use std::time::{Duration, Instant};
 use ritornel_client::launch::Program;
 
 pub(crate) use super::fallback::{
-    CHROME, FEEL, FITTING_SHOWS, KEYS, SHOW_FOLDER, THIS_COMPUTER, bring_forward_quietly,
-    choose_folder, dismiss_menu, fit_window, footprint, forget_main_window, give_back,
-    hold_appearance, keep_out_of_the_dock, key_text, locale, main_window, memory_line, pop_up_menu,
-    reduce_motion, screenshot, scroll_details, settings_dir, start, swiped_back,
+    CHROME, CONTROL_ACCENT, FEEL, FITTING_SHOWS, KEYS, SHOW_FOLDER, THIS_COMPUTER,
+    bring_forward_quietly, choose_folder, dismiss_menu, fit_window, footprint, forget_main_window,
+    give_back, hold_appearance, keep_out_of_the_dock, key_text, locale, main_window, memory_line,
+    pop_up_menu, reduce_motion, screenshot, scroll_details, settings_dir, start, swiped_back,
 };
 
 /// The server outlives the app.

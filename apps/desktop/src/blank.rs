@@ -3,24 +3,27 @@
 //! points wide at most, 14% of the window down.
 
 use gpui::{
-    AnyElement, App, ClickEvent, FontWeight, HighlightStyle, InteractiveElement, IntoElement,
-    ParentElement, SharedString, StatefulInteractiveElement, Styled, StyledText, Window, div,
+    AnyElement, App, ClickEvent, FontWeight, HighlightStyle, IntoElement, ParentElement,
+    SharedString, StatefulInteractiveElement, Styled, StyledText, Window, div,
     prelude::FluentBuilder, px,
 };
 
+use crate::button::Role;
 use crate::theme;
 
 /// What a button on a blank page does.
 pub(crate) type OnClick = Box<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
 
 /// What a blank page says. `bold` is a part of `text` set in the ink (for
-/// example a server's name).
+/// example a server's name). A page that is blank because something failed
+/// sets its title in the failure's colour (`failed`).
 pub(crate) struct Blank {
     pub title: SharedString,
     pub text: SharedString,
     pub bold: Option<SharedString>,
     pub button: Option<(SharedString, OnClick)>,
     pub facts: Option<SharedString>,
+    pub failed: bool,
 }
 
 impl Blank {
@@ -31,6 +34,7 @@ impl Blank {
             bold: None,
             button: None,
             facts: None,
+            failed: false,
         }
     }
 
@@ -70,6 +74,7 @@ impl Blank {
                             .text_size(px(30.))
                             .line_height(px(36.))
                             .font_weight(FontWeight::BOLD)
+                            .when(self.failed, |title| title.text_color(theme::fail_text()))
                             .child(self.title),
                     )
                     .child(
@@ -82,20 +87,8 @@ impl Blank {
                     .when_some(self.button, |blank, (label, on_click)| {
                         blank.child(
                             div().mt(px(22.)).flex().justify_center().child(
-                                div()
-                                    .id("blank-button")
-                                    .h(px(36.))
-                                    .px(px(18.))
-                                    .rounded_full()
-                                    .flex()
-                                    .items_center()
-                                    .bg(theme::fill())
-                                    .hover(theme::hovered_on_fill)
-                                    .active(theme::pressed)
-                                    .text_size(px(14.))
-                                    .font_weight(FontWeight(600.))
-                                    .on_click(on_click)
-                                    .child(label),
+                                crate::button::button("blank-button", label, Role::Secondary)
+                                    .on_click(on_click),
                             ),
                         )
                     })

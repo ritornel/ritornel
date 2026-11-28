@@ -1635,7 +1635,7 @@ impl Render for Artist {
                 div()
                     .my(px(8.))
                     .text_size(px(13.5))
-                    .text_color(theme::faint())
+                    .text_color(theme::fail_text())
                     .child("This artist could not be read."),
             );
         } else if self.page.is_some() {

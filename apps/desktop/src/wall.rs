@@ -2632,6 +2632,7 @@ impl Wall {
                 "The library could not be read.",
                 "The server is there, but it did not answer with the albums.",
             );
+            blank.failed = true;
             let wall = cx.entity().downgrade();
             blank.button = Some((
                 "Try again".into(),

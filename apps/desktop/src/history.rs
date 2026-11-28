@@ -792,7 +792,7 @@ impl Render for HistoryPage {
                     .my(px(8.))
                     .text_size(px(13.5))
                     .line_height(line(13.5, 1.4))
-                    .text_color(theme::faint())
+                    .text_color(theme::fail_text())
                     .child("Your history could not be read."),
             );
         } else if empty {
