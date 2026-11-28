@@ -166,12 +166,6 @@ impl Server {
                 steps.say(step)
             })?;
         let store = ServerStore::open(&dir.server_db(), clock.clone(), entropy.clone())?;
-        crate::dispatch::record_backup(
-            &store,
-            started_ms,
-            before.taken.as_ref(),
-            before.failed.as_deref(),
-        );
         info!(
             sqlite = SQLITE_VERSION,
             schema_version = store.schema_version(),
@@ -216,6 +210,14 @@ impl Server {
         }
 
         let (identity, library) = library::open(dir, &store, identity, &clock, &entropy)?;
+        store.prune_receipts()?;
+        crate::dispatch::record_backup(
+            &store,
+            started_ms,
+            before.taken.as_ref(),
+            before.failed.as_deref(),
+        );
+        crate::backup::migrations_finished(dir);
         // A hub renamed at start, as after its computer's name, keeps the
         // library's registry of servers in step, and one a crash or a
         // failed write left behind catches up.

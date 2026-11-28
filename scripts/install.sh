@@ -78,6 +78,15 @@ exec_quoted() {
     printf '"%s"' "$path"
 }
 
+# A newer client can refuse the old server's contract. Ask the OS first.
+server_running() {
+    if command -v pgrep >/dev/null; then
+        pgrep -u "$(id -u)" -x ritornel-server >/dev/null 2>&1
+    else
+        "$bin_dir/ritornelctl" status >/dev/null 2>&1
+    fi
+}
+
 main() {
     bin_dir="${RITORNEL_BIN_DIR:-$HOME/.local/bin}"
     system=$(uname -s)
@@ -147,8 +156,8 @@ main() {
         fi
     fi
 
-    if "$bin_dir/ritornelctl" status >/dev/null 2>&1; then
-        echo "A server is running on the old build. To use this one: quit Ritornel if it started the server, or run ritornel-server service install again if it is the background service, or stop one started by hand"
+    if server_running; then
+        echo "Warning: ritornel-server is running. Restart it to use the installed build. Quit and reopen Ritornel if it started the server, reinstall the background service with ritornel-server service install, or restart a server started by hand." >&2
     fi
 }
 

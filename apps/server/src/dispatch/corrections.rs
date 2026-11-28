@@ -411,6 +411,18 @@ impl Core {
         stored(LibrarySetSettings::NAME, &written.result_json)
     }
 
+    fn lookup_library<T>(
+        &self,
+        work: impl FnOnce(&ritornel_engine::LibraryStore) -> Result<T, RpcError>,
+    ) -> Result<T, RpcError> {
+        let stopping = || RpcError::new(ErrorCode::Unavailable, "the server is stopping");
+        if super::lock(&self.sessions).closed {
+            return Err(stopping());
+        }
+        self.with_stores(|stores| Self::library(stores, work))
+            .ok_or_else(stopping)?
+    }
+
     /// `corrections.lookup`: asks the catalogue about the discs of one
     /// album, and keeps each reply. One lookup runs at a time, from its
     /// receipt's check to its commit, so the same question is never sent
@@ -418,11 +430,7 @@ impl Core {
     /// request, so a lookup turned off on the way stops there. The replies
     /// and the receipt are kept in one write: a call sent again with its
     /// key is answered from the receipt and asks nothing.
-    pub(super) fn corrections_lookup(
-        &self,
-        stores: &Stores,
-        params: &LookupParams,
-    ) -> Result<LookupDone, RpcError> {
+    pub(super) fn corrections_lookup(&self, params: &LookupParams) -> Result<LookupDone, RpcError> {
         let key = params.idempotency_key;
         let command = Command {
             id: key,
@@ -430,7 +438,7 @@ impl Core {
         };
         let _one_at_a_time = self.lookup.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(done) =
-            Self::library(stores, |library| library.replay(&command).map_err(refused))?
+            self.lookup_library(|library| library.replay(&command).map_err(refused))?
         {
             return stored(CorrectionsLookup::NAME, &done.result_json);
         }
@@ -454,16 +462,13 @@ impl Core {
             )
             .with_detail("reason", "lookups_off")
         };
-        let enabled = |stores: &Stores| {
-            Self::library(stores, |library| library.lookups_enabled().map_err(refused))
-        };
-        if !enabled(stores)? {
+        let enabled = || self.lookup_library(|library| library.lookups_enabled().map_err(refused));
+        if !enabled()? {
             return Err(off());
         }
         let (album, root, folder) = (params.album, params.root.clone(), params.folder.clone());
-        let discs = Self::library(stores, |library| {
-            library.discs_of(album, root, folder).map_err(refused)
-        })?;
+        let discs =
+            self.lookup_library(|library| library.discs_of(album, root, folder).map_err(refused))?;
         let Some(first) = discs.first() else {
             return Err(RpcError::new(
                 ErrorCode::NotFound,
@@ -480,14 +485,13 @@ impl Core {
         let mut outcomes: Vec<(LookupOutcome, Option<String>)> = Vec::new();
         let mut replies = Vec::new();
         for disc in &discs {
-            let had = Self::library(stores, |library| {
-                library.replied(asked, disc).map_err(refused)
-            })?;
+            let had =
+                self.lookup_library(|library| library.replied(asked, disc).map_err(refused))?;
             if had && !params.again {
                 outcomes.push((LookupOutcome::Kept, None));
                 continue;
             }
-            if !enabled(stores)? {
+            if !enabled()? {
                 return Err(off());
             }
             let reply = catalogue.ask(&catalogue.disc(disc)).and_then(|reply| {
@@ -523,7 +527,7 @@ impl Core {
             client: self.client(),
         };
         let keys = discs.clone();
-        let written = Self::library(stores, |library| {
+        let written = self.lookup_library(|library| {
             library
                 .keep_replies(request, asked, replies, keys, move |rev, mut albums| {
                     let done = LookupDone {
@@ -578,6 +582,7 @@ mod tests {
         replies: Mutex<HashMap<String, (u16, String)>>,
         asked: Mutex<Vec<String>>,
         failing: Mutex<bool>,
+        gate: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
     }
 
     impl Catalogue for Recorded {
@@ -595,6 +600,12 @@ mod tests {
 
         fn ask(&self, question: &Question) -> Result<Reply, Error> {
             self.asked.lock().unwrap().push(question.key.clone());
+            if let Some((entered, release)) = self.gate.lock().unwrap().take() {
+                entered.send(()).unwrap();
+                release
+                    .recv_timeout(std::time::Duration::from_secs(60))
+                    .expect("catalogue was never released");
+            }
             if *self.failing.lock().unwrap() {
                 return Err(Error::source("MusicBrainz is busy (503): ask again later"));
             }
@@ -796,6 +807,29 @@ mod tests {
             set["settings"]["lookups"],
             json!({ "value": enabled, "setBy": "call" })
         );
+    }
+
+    #[test]
+    fn shutdown_can_close_the_stores_while_a_lookup_waits_for_the_catalogue() {
+        let catalogue = Arc::new(Recorded::default());
+        let (entered, waiting) = std::sync::mpsc::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        *catalogue.gate.lock().unwrap() = Some((entered, gate));
+        let (core, _scratch, session) = hub(Some(catalogue));
+        switch(&core, &session, 1, true);
+        std::thread::scope(|threads| {
+            let request = threads.spawn(|| lookup(&core, &session, 2, false));
+            waiting
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .expect("lookup never reached the catalogue");
+            core.close_sessions();
+            core.close_store().unwrap();
+            release.send(()).unwrap();
+            assert_eq!(
+                request.join().unwrap().unwrap_err().0,
+                ErrorCode::Unavailable
+            );
+        });
     }
 
     #[test]

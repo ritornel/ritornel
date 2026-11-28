@@ -18,10 +18,13 @@ ritornel-source.workspace = true
 reqwest = { version = "=0.13.5", default-features = false, features = ["rustls"] }
 # reqwest's client is async. This crate runs it on a runtime of its own,
 # so that its callers stay synchronous.
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "time"] }
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 # A test's address is parsed to be sure it is on loopback. reqwest builds
 # this version.
 url = "2.5.8"
+
+[dev-dependencies]
+tokio = { version = "1.54.1", features = ["net"] }
 
 [lints]
 workspace = true

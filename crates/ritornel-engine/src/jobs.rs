@@ -261,6 +261,36 @@ pub(crate) fn receipt(connection: &Connection, command: &Command) -> Result<Opti
     }
 }
 
+const RECEIPT_LIFE_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
+const RECEIPT_SWEEP_INTERVAL: i64 = 256;
+
+fn prune_receipts(connection: &Connection, now_ms: i64) -> Result<(), Error> {
+    // A hub persists move.<key> until it releases the source. The destination
+    // may be offline when the hub probes a lost load reply. Only the latest
+    // load needs this protection: the hub resolves it before it can send
+    // another load to the same destination.
+    connection.execute(
+        "WITH latest_load AS (
+             SELECT command_id FROM command_receipt WHERE method = 'link.handoff.load'
+             ORDER BY id DESC LIMIT 1
+         ), handoff(command_id) AS (
+             SELECT command_id FROM latest_load
+             UNION ALL SELECT unhex(substr(key, length('move.') + 1), '-')
+                 FROM server_setting WHERE key GLOB 'move.*'
+             UNION ALL SELECT unhex(substr(key, length('handoff.take.') + 1), '-')
+                 FROM server_setting WHERE key GLOB 'handoff.take.*'
+         )
+         DELETE FROM command_receipt WHERE created_at_ms < ?1
+           AND command_id NOT IN (SELECT command_id FROM handoff WHERE command_id IS NOT NULL)
+           AND NOT EXISTS (
+               SELECT 1 FROM job WHERE public_id = unhex(command_receipt.result_json, '-')
+                 AND state IN ('queued', 'running', 'cancelling')
+           )",
+        [now_ms.saturating_sub(RECEIPT_LIFE_MS)],
+    )?;
+    Ok(())
+}
+
 pub(crate) fn record_receipt(
     transaction: &Transaction<'_>,
     command: &Command,
@@ -273,6 +303,10 @@ pub(crate) fn record_receipt(
          VALUES (?1, ?2, ?3, ?4, ?5)",
         (command.id.as_bytes(), command.fingerprint.bytes(), method, result, now_ms),
     )?;
+    // There is no timestamp index. Amortize the scan across new receipts.
+    if transaction.last_insert_rowid() % RECEIPT_SWEEP_INTERVAL == 0 {
+        prune_receipts(transaction, now_ms)?;
+    }
     Ok(())
 }
 
@@ -293,6 +327,11 @@ pub fn step_command(job: Id, step: i64) -> Id {
 }
 
 impl ServerStore {
+    /// Removes expired server-local command receipts after startup migrations finish.
+    pub fn prune_receipts(&self) -> Result<(), Error> {
+        self.transact(|tx, now_ms, _| prune_receipts(tx, now_ms))
+    }
+
     /// Records where a named root is on this machine. Naming the same path
     /// again changes nothing, and a name that is at another path is
     /// refused: a root is re-pointed by a call of its own.
@@ -748,6 +787,97 @@ mod tests {
                 ("other".to_owned(), "/srv/elsewhere".to_owned())
             ]
         );
+    }
+
+    #[test]
+    fn a_receipt_sweep_keeps_recent_commands_and_jobs_still_in_progress() {
+        let clock = Arc::new(FixedClock::at(T0));
+        let store = store(&clock);
+        let start = |key, root| {
+            store
+                .start_job(command(key, "a"), "scan.start", scan(root))
+                .unwrap()
+                .0
+        };
+        let old = start(1, "old");
+        store.finish_job(old.id, JobState::Succeeded, None).unwrap();
+        let active = start(2, "active");
+        clock.set(T0 + 1);
+        let recent = start(3, "recent");
+        store
+            .finish_job(recent.id, JobState::Succeeded, None)
+            .unwrap();
+        clock.set(T0 + RECEIPT_LIFE_MS + 1);
+        // Reach the normal insertion that triggers the sweep.
+        for byte in 4..=255 {
+            start(byte, "active");
+        }
+        start(0, "active");
+        assert!(store.job_of_command(command(1, "a")).unwrap().is_none());
+        assert_eq!(
+            store
+                .job_of_command(command(2, "a"))
+                .unwrap()
+                .map(|job| job.public_id),
+            Some(active.public_id)
+        );
+        assert_eq!(start(3, "recent").public_id, recent.public_id);
+        assert!(matches!(
+            store.job_of_command(command(3, "different")),
+            Err(Error::CommandMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn handoff_recovery_keeps_its_evidence_past_the_retry_window() {
+        let clock = Arc::new(FixedClock::at(T0));
+        let store = store(&clock);
+        let movement = ritornel_contract::PlaybackMoveParams {
+            idempotency_key: id(1),
+            from: id(20),
+            to: id(21),
+            entry_id: id(22),
+        };
+        let pending = crate::playback::PendingMove {
+            movement,
+            attempt: id(10),
+        };
+        store.begin_move(command(1, "move")).unwrap();
+        store.expect_load(pending).unwrap();
+        for (byte, method) in [
+            (2, "link.handoff.load"),
+            (3, "link.handoff.load"),
+            (4, "link.handoff.take"),
+        ] {
+            store
+                .record_command(command(byte, method), method, "null".to_owned(), None)
+                .unwrap();
+        }
+        clock.set(T0 + RECEIPT_LIFE_MS + 1);
+        let kept = |byte, method| {
+            store
+                .stored_result(command(byte, method))
+                .unwrap()
+                .is_some()
+        };
+        store.prune_receipts().unwrap();
+        assert!(kept(1, "move"));
+        assert!(!kept(2, "link.handoff.load"));
+        assert!(kept(3, "link.handoff.load"));
+        assert!(kept(4, "link.handoff.take"));
+
+        store.forget_move(pending).unwrap();
+        store
+            .record_command(
+                command(5, "queue.clear"),
+                "queue.clear",
+                "null".to_owned(),
+                None,
+            )
+            .unwrap();
+        store.prune_receipts().unwrap();
+        assert!(!kept(1, "move"));
+        assert!(!kept(4, "link.handoff.take"));
     }
 
     #[test]

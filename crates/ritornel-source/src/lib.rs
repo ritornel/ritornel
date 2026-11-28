@@ -210,6 +210,9 @@ pub trait Catalogue: fmt::Debug + Send + Sync {
     /// Asks a question and returns the reply. A failure is an error of the
     /// source: the catalogue could not be reached, was busy, or refused.
     fn ask(&self, question: &Question) -> Result<Reply, Error>;
+
+    /// Called at shutdown to interrupt network waits and refuse future requests.
+    fn stop(&self) {}
 }
 
 /// Why a sync or a question failed. `Display` is one line that is safe to
