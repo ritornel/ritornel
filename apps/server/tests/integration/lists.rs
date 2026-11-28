@@ -506,7 +506,8 @@ async fn a_write_tells_each_view_and_each_subscriber_once_for_what_was_not_yet_r
             | Event::Playback(_)
             | Event::Progress(_)
             | Event::Players
-            | Event::Queue(_) => {}
+            | Event::Queue(_)
+            | Event::Devices(_) => {}
         }
     }
     // One of each, at the second write's revision, saying to reorder.

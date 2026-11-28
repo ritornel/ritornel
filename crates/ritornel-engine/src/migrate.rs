@@ -60,6 +60,11 @@ pub(crate) const SERVER: &[Migration] = &[
         name: "0004_session_permissions",
         sql: include_str!("../migrations/server/0004_session_permissions.sql"),
     },
+    Migration {
+        version: 5,
+        name: "0005_encode_cache_and_sync_roots",
+        sql: include_str!("../migrations/server/0005_encode_cache_and_sync_roots.sql"),
+    },
 ];
 
 /// The migrations of `library.db`.
@@ -108,6 +113,11 @@ pub(crate) const LIBRARY: &[Migration] = &[
         version: 9,
         name: "0009_corrections",
         sql: include_str!("../migrations/library/0009_corrections.sql"),
+    },
+    Migration {
+        version: 10,
+        name: "0010_device_sync",
+        sql: include_str!("../migrations/library/0010_device_sync.sql"),
     },
 ];
 

@@ -10,7 +10,7 @@
 // Every integer fits in 53 bits, so each is a `number`.
 
 /** The version of the contract these types are. */
-export const CONTRACT_VERSION = 8;
+export const CONTRACT_VERSION = 9;
 
 /** The HTTP routes. Each is a `GET` but `ticket` and `link`, which are `POST`s. */
 export const ROUTES = {
@@ -22,7 +22,6 @@ export const ROUTES = {
   link: "/v1/link",
   audio: "/v1/audio",
   cacheDerivative: "/v1/cache/derivative",
-  cachePackaged: "/v1/cache/packaged",
 } as const;
 
 /**
@@ -39,6 +38,7 @@ export const CAPABILITIES = {
   mediaArt: "media.art",
   playback: "playback",
   players: "players",
+  devices: "devices",
 } as const;
 
 /** The method of every event notification. */
@@ -185,10 +185,21 @@ export const METHODS = {
   "inspect.play": { kind: "query", needs: ["library:read"], linkOnly: false },
   "inspect.conflicts": { kind: "query", needs: ["status:read", "library:read"], linkOnly: false },
   "library.revisions": { kind: "query", needs: ["status:read"], linkOnly: false },
+  "devices.list": { kind: "query", needs: ["library:read"], linkOnly: false },
+  "devices.get": { kind: "query", needs: ["library:read"], linkOnly: false },
+  "devices.formats": { kind: "query", needs: ["library:read"], linkOnly: false },
+  "devices.actions": { kind: "query", needs: ["library:read"], linkOnly: false },
+  "devices.unmanaged": { kind: "query", needs: ["library:read"], linkOnly: false },
+  "devices.plays": { kind: "query", needs: ["library:read"], linkOnly: false },
+  "devices.set": { kind: "command", needs: ["library:write"], linkOnly: false },
+  "devices.addFolder": { kind: "command", needs: ["library:write", "folders:manage"], linkOnly: false },
+  "devices.sync": { kind: "command", needs: ["library:write"], linkOnly: false },
+  "devices.eject": { kind: "command", needs: ["library:write"], linkOnly: false },
+  "devices.forget": { kind: "command", needs: ["library:write"], linkOnly: false },
 } as const;
 
 /** Every topic a client can subscribe to. */
-export const TOPICS = ["servers", "players", "jobs", "library", "list", "playback", "progress", "queue"] as const;
+export const TOPICS = ["servers", "players", "jobs", "library", "list", "playback", "progress", "queue", "devices"] as const;
 
 /** The params and the result of each method. */
 export type MethodMap = {
@@ -298,6 +309,17 @@ export type MethodMap = {
   "inspect.play": { params: InspectPlayParams; result: PlayProvenance };
   "inspect.conflicts": { params: InspectConflictsParams; result: ConflictsReport };
   "library.revisions": { params: LibraryRevisionsParams; result: LibraryRevisionsPage };
+  "devices.list": { params: NoParams; result: SyncDevicesList };
+  "devices.get": { params: SyncDeviceParams; result: SyncDeviceDetail };
+  "devices.formats": { params: SyncDeviceParams; result: SyncFormats };
+  "devices.actions": { params: SyncActionsParams; result: SyncActions };
+  "devices.unmanaged": { params: SyncPageParams; result: SyncUnmanaged };
+  "devices.plays": { params: SyncPageParams; result: SyncPlays };
+  "devices.set": { params: SyncSetParams; result: SyncDeviceChanged };
+  "devices.addFolder": { params: SyncAddFolderParams; result: SyncDeviceChanged };
+  "devices.sync": { params: SyncStartParams; result: SyncStarted };
+  "devices.eject": { params: SyncDeviceCommandParams; result: SyncDeviceChanged };
+  "devices.forget": { params: SyncDeviceCommandParams; result: SyncDeviceChanged };
 };
 
 /** The name of a method. */
@@ -316,6 +338,7 @@ export type EventMap = {
   "playback": Extract<Event, { topic: "playback" }>;
   "progress": Extract<Event, { topic: "progress" }>;
   "queue": Extract<Event, { topic: "queue" }>;
+  "devices": Extract<Event, { topic: "devices" }>;
 };
 
 /**
@@ -884,11 +907,6 @@ export type ArtColor = {
    */
   saturation: number,
 };
-
-/**
- * The cache layer that holds the requested file.
- */
-export type ArtifactLayer = "derivative" | "packaged";
 
 /**
  * The params of `artist.get`.
@@ -1992,7 +2010,7 @@ export type ErrorData = {
 /**
  * The params of an event notification: the topic, and what it carries.
  */
-export type Event = { "topic": "servers" } & ServersEvent | { "topic": "players" } | { "topic": "jobs" } & JobsEvent | { "topic": "library" } & LibraryEvent | { "topic": "list" } & ListEvent | { "topic": "playback" } & PlaybackEvent | { "topic": "progress" } & ProgressEvent | { "topic": "queue" } & QueueEvent;
+export type Event = { "topic": "servers" } & ServersEvent | { "topic": "players" } | { "topic": "jobs" } & JobsEvent | { "topic": "library" } & LibraryEvent | { "topic": "list" } & ListEvent | { "topic": "playback" } & PlaybackEvent | { "topic": "progress" } & ProgressEvent | { "topic": "queue" } & QueueEvent | { "topic": "devices" } & SyncDevicesEvent;
 
 /**
  * One thing worth saying about what is playing, as Lean back sets it: a
@@ -3915,9 +3933,9 @@ export type JobCancelled = {
  */
 export type JobDetail = {
   /**
-   * Outputs from a successful materialization in request order. Job history does not pin them.
+   * What became of each appearance of a transcode, in request order. Job history does not pin them.
    */
-  artifacts: Array<TranscodeArtifact>,
+  outcomes: Array<TranscodeOutcome>,
   /**
    * The job.
    */
@@ -3998,6 +4016,10 @@ export type JobTarget = { "type": "server",
   id: string, } | { "type": "import_run",
   /**
    * The run's ID.
+   */
+  id: string, } | { "type": "device",
+  /**
+   * The device's ID.
    */
   id: string,
 };
@@ -8171,6 +8193,1388 @@ export type Subscriptions = {
 };
 
 /**
+ * Why a row failed.
+ */
+export type SyncActionError = {
+  /**
+   * A word for it, such as `write_failed` or `master_unavailable`.
+   */
+  code: string,
+  /**
+   * The whole reason. It never holds a path on a host.
+   */
+  detail: string,
+};
+
+/**
+ * What kind of row a plan or a run has.
+ */
+export type SyncActionKind = "add" | "replace" | "remove" | "conflict" | "blocked";
+
+/**
+ * One row of a plan or a run: a group, or a track.
+ */
+export type SyncActionRow = {
+  /**
+   * A track's action, the same for as long as its plan or run is.
+   */
+  actionId: string | null,
+  /**
+   * A group's ID, to read its tracks with as `parentId`.
+   */
+  groupId: string | null,
+  /**
+   * What is done.
+   */
+  kind: SyncActionKind,
+  /**
+   * Why, as a word: `wanted`, `tags`, `cover`, `audio`, `format`,
+   * `not_wanted`, `missing`, `changed_on_device`, `path_taken`,
+   * `no_source`, `no_format` or `master_unavailable`.
+   */
+  reason: string,
+  /**
+   * The source that wants it.
+   */
+  sourceId: string | null,
+  /**
+   * The track's title, or the album's for a group.
+   */
+  title: string,
+  /**
+   * The artist.
+   */
+  artist: string,
+  /**
+   * The cover.
+   */
+  artId: string | null,
+  /**
+   * For a group, how many tracks it holds.
+   */
+  tracks: number | null,
+  /**
+   * For a group, how many tracks the album has in the library, so that
+   * "3 of 12 tracks" needs no second call.
+   */
+  albumTracks: number | null,
+  /**
+   * The file's codec on the target, such as `flac` or `mp3`.
+   */
+  codec: string | null,
+  /**
+   * How it is made.
+   */
+  how: SyncHow | null,
+  /**
+   * Its bytes: what it copies, or for a removal what it frees.
+   */
+  bytes: number,
+  /**
+   * Whether that size is an estimate.
+   */
+  estimated: boolean,
+  /**
+   * Where it stands. A plan's rows are all waiting.
+   */
+  state: SyncActionState,
+  /**
+   * Bytes sent so far.
+   */
+  bytesDone: number,
+  /**
+   * Why it failed.
+   */
+  error: SyncActionError | null,
+  /**
+   * For a track, its path under the target's root.
+   */
+  path: string | null,
+};
+
+/**
+ * Where a row of a run stands.
+ */
+export type SyncActionState = "waiting" | "preparing" | "copying" | "done" | "in_doubt" | "failed" | "skipped";
+
+/**
+ * The result of `devices.actions`.
+ */
+export type SyncActions = {
+  /**
+   * How many rows the filter has in all.
+   */
+  total: number,
+  /**
+   * The first row's index.
+   */
+  offset: number,
+  /**
+   * The rows.
+   */
+  rows: Array<SyncActionRow>,
+};
+
+/**
+ * The params of `devices.actions`.
+ */
+export type SyncActionsParams = {
+  /**
+   * The target.
+   */
+  deviceId: string,
+  /**
+   * The plan whose preview to read. A revision that is no longer the
+   * plan's is refused with `plan_stale`.
+   */
+  planRevision?: string,
+  /**
+   * The run whose records to read, instead of a plan.
+   */
+  runId?: string,
+  /**
+   * Only rows of this kind.
+   */
+  kind?: SyncActionKind,
+  /**
+   * Only rows in this state.
+   */
+  state?: SyncActionState,
+  /**
+   * How rows are grouped.
+   */
+  groupBy: SyncGroupBy,
+  /**
+   * The group whose tracks to read, in place of the groups.
+   */
+  parentId?: string,
+  /**
+   * The first row.
+   */
+  offset: number,
+  /**
+   * How many rows, 500 at most.
+   */
+  limit: number,
+};
+
+/**
+ * What Ritornel is doing with a target now.
+ */
+export type SyncActivity = "idle" | "reading" | "syncing" | "ejecting";
+
+/**
+ * The params of `devices.addFolder`. The folder is on the server called.
+ */
+export type SyncAddFolderParams = {
+  /**
+   * The command's ID, made by the client.
+   */
+  idempotencyKey: string,
+  /**
+   * The folder's absolute path. It must exist, and be neither one of
+   * the library's folders nor the data directory nor another target,
+   * nor hold or lie inside one.
+   */
+  path: string,
+  /**
+   * What to call the target.
+   */
+  name: string,
+  /**
+   * The most it may hold, for one that is always here: none is its
+   * volume's size.
+   */
+  limitBytes?: number,
+  /**
+   * What it is made for: a plain copy where none is said.
+   */
+  madeFor?: SyncMadeFor,
+  /**
+   * Whether it comes and goes: always here where none is said.
+   */
+  kind?: SyncFolderKind,
+};
+
+/**
+ * How much of something: tracks and their bytes.
+ */
+export type SyncAmount = {
+  /**
+   * How many tracks.
+   */
+  tracks: number,
+  /**
+   * Their bytes on the target, in its format.
+   */
+  bytes: number,
+};
+
+/**
+ * What a target needs, and why.
+ */
+export type SyncAttention = {
+  /**
+   * The worst of its reasons.
+   */
+  level: SyncAttentionLevel,
+  /**
+   * Each reason as a word a client has text for, such as `does_not_fit`,
+   * `conflicts`, `files_failed`, `cut_off` or `root_unbound`.
+   */
+  reasons: Array<string>,
+};
+
+/**
+ * Whether a target waits on the person, or something went wrong.
+ */
+export type SyncAttentionLevel = "none" | "needs_you" | "failed";
+
+/**
+ * Whether room was measured on the target now or is what was last seen.
+ */
+export type SyncBasis = "live" | "last_seen";
+
+/**
+ * What a target can do.
+ */
+export type SyncCapabilities = {
+  /**
+   * What plays it gives back.
+   */
+  plays: SyncPlaysKind,
+  /**
+   * Whether it is made safe to unplug with `devices.eject`.
+   */
+  ejectable: boolean,
+  /**
+   * The cover sizes it is offered, in pixels on the longest side.
+   */
+  coverSizes: Array<number>,
+  /**
+   * The codecs it plays, such as `flac`, `mp3` and `opus`. A folder's
+   * come from what it is made for, and can be set.
+   */
+  codecs: Array<string>,
+};
+
+/**
+ * Whether a target is here.
+ */
+export type SyncConnection = {
+  /**
+   * Whether it can be read and written now.
+   */
+  attached: boolean,
+  /**
+   * The server it is attached to, or was last.
+   */
+  hostServerId: string | null,
+  /**
+   * Since when it has been attached, or away.
+   */
+  sinceMs: number | null,
+  /**
+   * Why it cannot be used though it is known, as a word: `root_missing`
+   * for a folder that is gone, `root_unbound` for one this hub has no
+   * path for, `not_mounted` for a volume that never mounted.
+   */
+  problem: string | null,
+};
+
+/**
+ * The counts a plan is filtered by.
+ */
+export type SyncCounts = {
+  /**
+   * Files to add.
+   */
+  add: SyncAmount,
+  /**
+   * Files to remove.
+   */
+  remove: SyncAmount,
+  /**
+   * Files to send again because their tags, cover, audio or format
+   * changed.
+   */
+  replace: SyncAmount,
+  /**
+   * Of those, the ones whose only reason is tags or cover, which
+   * `skipRetags` leaves for another day.
+   */
+  retag: SyncAmount,
+  /**
+   * Files changed on the target, left alone until a choice is made.
+   */
+  conflict: SyncAmount,
+  /**
+   * Tracks wanted that cannot be sent, each with its reason.
+   */
+  blocked: SyncAmount,
+};
+
+/**
+ * One target, as the column of device tabs shows it.
+ */
+export type SyncDevice = {
+  /**
+   * The target.
+   */
+  deviceId: string,
+  /**
+   * A player or a folder.
+   */
+  kind: SyncDeviceKind,
+  /**
+   * The driver family that knows it: `folder`, and later `rockbox` and
+   * `zune`.
+   */
+  family: string,
+  /**
+   * How its storage is reached.
+   */
+  transport: SyncTransport,
+  /**
+   * What the person calls it.
+   */
+  name: string,
+  /**
+   * Its drawing.
+   */
+  icon: SyncDeviceIcon,
+  /**
+   * Whether it is Ritornel's yet.
+   */
+  setup: SyncSetup,
+  /**
+   * Whether it is here.
+   */
+  connection: SyncConnection,
+  /**
+   * What Ritornel is doing with it.
+   */
+  activity: SyncActivity,
+  /**
+   * Whether it waits on the person or something went wrong.
+   */
+  attention: SyncAttention,
+  /**
+   * What its next sync would copy, where a plan is known.
+   */
+  toCopyBytes: number | null,
+  /**
+   * Its last sync.
+   */
+  lastSync: SyncLastSync | null,
+  /**
+   * For a player whose plays age out of a scrobbling service: the day
+   * to plug it in by.
+   */
+  connectByMs: number | null,
+  /**
+   * Moves with anything about the target, a run's progress included.
+   */
+  deviceRevision: number,
+};
+
+/**
+ * What about a target changed.
+ */
+export type SyncDeviceChange = "state" | "settings" | "plan" | "actions" | "plays";
+
+/**
+ * The result of a command that changes a target.
+ */
+export type SyncDeviceChanged = {
+  /**
+   * The target.
+   */
+  deviceId: string,
+  /**
+   * The command's ID: the idempotency key it was sent with.
+   */
+  commandId: string,
+  /**
+   * How far the command has got.
+   */
+  status: ReceiptStatus,
+  /**
+   * The library revision the command was committed at. It is left out
+   * for a command that changes no library.
+   */
+  revision?: number,
+};
+
+/**
+ * The params of `devices.eject` and `devices.forget`.
+ */
+export type SyncDeviceCommandParams = {
+  /**
+   * The command's ID, made by the client.
+   */
+  idempotencyKey: string,
+  /**
+   * The target.
+   */
+  deviceId: string,
+};
+
+/**
+ * The result of `devices.get`: a target's page.
+ */
+export type SyncDeviceDetail = {
+  /**
+   * The target, as `devices.list` gives it.
+   */
+  device: SyncDevice,
+  /**
+   * For a folder, its path on the server it is on, for a session that
+   * holds `folders:manage`.
+   */
+  path: string | null,
+  /**
+   * For a folder, what it is made for and whether it comes and goes.
+   */
+  folder: SyncFolder | null,
+  /**
+   * What the probe read.
+   */
+  facts: SyncFacts,
+  /**
+   * What it can do.
+   */
+  capabilities: SyncCapabilities,
+  /**
+   * Its room, or none while it has never been read.
+   */
+  room: SyncRoom | null,
+  /**
+   * Its settings.
+   */
+  settings: SyncSettings,
+  /**
+   * What goes on, in order.
+   */
+  sources: Array<SyncSource>,
+  /**
+   * The files on it that are not Ritornel's.
+   */
+  unmanaged: SyncUnmanagedSummary,
+  /**
+   * The plan of its next sync, or none while it cannot be planned: an
+   * ignored target, or one never read.
+   */
+  plan: SyncPlan | null,
+  /**
+   * The run under way, or the last.
+   */
+  run: SyncRun | null,
+  /**
+   * Its plays.
+   */
+  plays: SyncPlaysSummary,
+};
+
+/**
+ * The drawing a client shows for a target.
+ */
+export type SyncDeviceIcon = {
+  /**
+   * The key chosen for this target, or none for its family's.
+   */
+  key: string | null,
+  /**
+   * The family's own key for this model: a short lowercase word path
+   * such as `folder` or `player.ipod_video.white`. The drawings ship
+   * with each client, and a key a client does not know falls back to
+   * one it does.
+   */
+  default: string,
+};
+
+/**
+ * What a target is.
+ */
+export type SyncDeviceKind = "player" | "folder";
+
+/**
+ * The params of a call about one target.
+ */
+export type SyncDeviceParams = {
+  /**
+   * The target.
+   */
+  deviceId: string,
+};
+
+/**
+ * What an event on the `devices` topic carries: a hint to read the
+ * target again. Events not yet sent are merged by target.
+ */
+export type SyncDevicesEvent = {
+  /**
+   * The target.
+   */
+  deviceId: string,
+  /**
+   * Its revision after the change.
+   */
+  deviceRevision: number,
+  /**
+   * What changed, in order and each once.
+   */
+  changed: Array<SyncDeviceChange>,
+  /**
+   * While a run is under way, the run whole.
+   */
+  run: SyncRun | null,
+};
+
+/**
+ * The result of `devices.list`.
+ */
+export type SyncDevicesList = {
+  /**
+   * Every target that is not forgotten, in the order they were first
+   * seen.
+   */
+  devices: Array<SyncDevice>,
+};
+
+/**
+ * What a probe read of a target. Technical terms are as the device gives
+ * them.
+ */
+export type SyncFacts = {
+  /**
+   * The model, such as `iPod Video`.
+   */
+  model: string | null,
+  /**
+   * Its firmware, such as `Rockbox 4.0`.
+   */
+  firmware: string | null,
+  /**
+   * Its file system, such as `FAT32`.
+   */
+  filesystem: string | null,
+  /**
+   * Tracks Ritornel manages on it.
+   */
+  tracks: number,
+  /**
+   * Albums those tracks are of.
+   */
+  albums: number,
+  /**
+   * The folder under its root that music is written in.
+   */
+  musicRoot: string,
+  /**
+   * How files are laid out under that folder.
+   */
+  layout: string,
+};
+
+/**
+ * The three figures of a sync.
+ */
+export type SyncFigures = {
+  /**
+   * What it would copy.
+   */
+  toCopyBytes: number,
+  /**
+   * What would be free after it.
+   */
+  freeAfterBytes: number,
+  /**
+   * How long it would take.
+   */
+  estimatedMs: number,
+  /**
+   * Whether every size is known, with none estimated.
+   */
+  exact: boolean,
+  /**
+   * The share of the bytes to copy that is estimated, in thousandths.
+   */
+  estimatedPermille: number,
+};
+
+/**
+ * What is particular to a folder target.
+ */
+export type SyncFolder = {
+  /**
+   * What it is made for.
+   */
+  madeFor: SyncMadeFor,
+  /**
+   * Whether it comes and goes.
+   */
+  kind: SyncFolderKind,
+  /**
+   * The kind of playlist it is written.
+   */
+  playlists: SyncPlaylistKind,
+};
+
+/**
+ * Whether a folder target comes and goes.
+ */
+export type SyncFolderKind = "removable" | "always_here";
+
+/**
+ * A target's format policy. A lossy master is always sent as it is, since
+ * lossy is never encoded to lossy.
+ */
+export type SyncFormat = {
+  /**
+   * What a lossless master is sent as.
+   */
+  lossless: SyncLossless,
+};
+
+/**
+ * One format on offer for a target.
+ */
+export type SyncFormatOption = {
+  /**
+   * The format.
+   */
+  format: SyncFormat,
+  /**
+   * Whether it is the target's now.
+   */
+  current: boolean,
+  /**
+   * The encoder that makes it, where it has one.
+   */
+  encoder: EncoderCapability | null,
+  /**
+   * Whether the hub can make it and the target plays it. One that
+   * cannot be chosen is still listed.
+   */
+  available: boolean,
+  /**
+   * What the target's content would take in it.
+   */
+  estimatedBytes: number,
+  /**
+   * Whether that fits.
+   */
+  fits: boolean,
+  /**
+   * By how much it does not.
+   */
+  overBytes: number,
+  /**
+   * How long a first sync in it would take.
+   */
+  estimatedMs: number,
+};
+
+/**
+ * The result of `devices.formats`: the format menu, which is also the
+ * way out of a plan that does not fit.
+ */
+export type SyncFormats = {
+  /**
+   * Each format on offer, lossless first.
+   */
+  formats: Array<SyncFormatOption>,
+};
+
+/**
+ * How the rows of a plan or a run are grouped.
+ */
+export type SyncGroupBy = "album" | "track";
+
+/**
+ * How a file is made from its master.
+ */
+export type SyncHow = "as_is" | "encode";
+
+/**
+ * When a target last synced, and how that ended.
+ */
+export type SyncLastSync = {
+  /**
+   * When it ended.
+   */
+  atMs: number,
+  /**
+   * How.
+   */
+  outcome: SyncOutcome,
+  /**
+   * How many files it copied.
+   */
+  copied: number,
+  /**
+   * How many it removed.
+   */
+  removed: number,
+  /**
+   * How many failed.
+   */
+  failed: number,
+};
+
+/**
+ * What a lossless master is sent as.
+ */
+export type SyncLossless = { "as": "as_is" } | { "as": "encode",
+  /**
+   * The codec and its options.
+   */
+  target: Target,
+};
+
+/**
+ * What a folder target is made for. It supplies the formats the folder is
+ * taken to play, the cover's size and the kind of playlist, each of which
+ * can then be changed.
+ */
+export type SyncMadeFor = "car_stereo" | "phone" | "other_player" | "plain_copy";
+
+/**
+ * What happens when a target is attached.
+ */
+export type SyncOnConnect = "nothing" | "sync";
+
+/**
+ * How a sync ended.
+ */
+export type SyncOutcome = "complete" | "cut_off" | "failed_in_part" | "failed" | "stopped";
+
+/**
+ * The params of `devices.unmanaged` and `devices.plays`.
+ */
+export type SyncPageParams = {
+  /**
+   * The target.
+   */
+  deviceId: string,
+  /**
+   * The first row.
+   */
+  offset: number,
+  /**
+   * How many rows, 500 at most.
+   */
+  limit: number,
+};
+
+/**
+ * The plan of a target's next sync: a preview, made again whenever its
+ * inputs change, and never the record of anything.
+ */
+export type SyncPlan = {
+  /**
+   * Names this plan. It moves only when the plan's own inputs do: the
+   * library, the settings, what is on the target. `devices.sync` names
+   * the revision the person saw.
+   */
+  planRevision: string,
+  /**
+   * Whether it stands on the target as read now or as last seen.
+   */
+  basis: SyncBasis,
+  /**
+   * To copy, free after and how long.
+   */
+  figures: SyncFigures,
+  /**
+   * The same with retags skipped.
+   */
+  figuresSkippingRetags: SyncFigures,
+  /**
+   * Whether everything wanted fits.
+   */
+  fits: boolean,
+  /**
+   * What the capacity cut left off.
+   */
+  cut: SyncAmount,
+  /**
+   * Counts by kind.
+   */
+  counts: SyncCounts,
+  /**
+   * What it does for each source, in the sources' order.
+   */
+  bySource: Array<SyncPlanSource>,
+  /**
+   * Tracks that must be encoded first, and how many of those encodes
+   * are cached already.
+   */
+  encodesNeeded: number,
+  /**
+   * Of those, the ones cached already.
+   */
+  encodesCached: number,
+  /**
+   * Why a sync would wait on the person, as words: `does_not_fit`,
+   * `conflicts`.
+   */
+  needsYou: Array<string>,
+};
+
+/**
+ * What a plan does for one source.
+ */
+export type SyncPlanSource = {
+  /**
+   * The source, or none for what no source wants any more.
+   */
+  sourceId: string | null,
+  /**
+   * What is added for it.
+   */
+  add: SyncAmount,
+  /**
+   * What is sent again for it.
+   */
+  replace: SyncAmount,
+  /**
+   * What is removed.
+   */
+  remove: SyncAmount,
+};
+
+/**
+ * One play read from a target.
+ */
+export type SyncPlay = {
+  /**
+   * The track it matched, or none.
+   */
+  appearanceId: string | null,
+  /**
+   * The track's title, or the path a line named where it matched
+   * nothing.
+   */
+  title: string,
+  /**
+   * The artist.
+   */
+  artist: string | null,
+  /**
+   * The cover.
+   */
+  artId: string | null,
+  /**
+   * When it was played, as the device had it, or none for an undated
+   * play.
+   */
+  playedAtMs: number | null,
+  /**
+   * What became of it, as a word: a delivery state such as `accepted`
+   * or `pending`, or why it was not sent, such as `too_old`,
+   * `undated`, `scrobbling_off` or `unmatched`.
+   */
+  delivery: string,
+};
+
+/**
+ * The kind of playlist a folder target is written.
+ */
+export type SyncPlaylistKind = "m3u" | "m3u8";
+
+/**
+ * The result of `devices.plays`.
+ */
+export type SyncPlays = {
+  /**
+   * How many there are in all.
+   */
+  total: number,
+  /**
+   * The first row's index.
+   */
+  offset: number,
+  /**
+   * The plays, newest first.
+   */
+  plays: Array<SyncPlay>,
+};
+
+/**
+ * What kind of plays a target gives back.
+ */
+export type SyncPlaysKind = "none" | "play_log" | "counters";
+
+/**
+ * What came back from a player's plays.
+ */
+export type SyncPlaysSummary = {
+  /**
+   * When they were last read.
+   */
+  lastReadAtMs: number | null,
+  /**
+   * How many were read in all.
+   */
+  plays: number,
+  /**
+   * How many were scrobbled.
+   */
+  scrobbled: number,
+  /**
+   * How many were too old to scrobble and went to the history alone.
+   */
+  tooOld: number,
+};
+
+/**
+ * The room on a target, now and after the plan.
+ */
+export type SyncRoom = {
+  /**
+   * All of it: the volume's size, or a folder's limit where it has one.
+   */
+  capacityBytes: number,
+  /**
+   * What is always kept free.
+   */
+  reserveBytes: number,
+  /**
+   * The files Ritornel wrote and manages.
+   */
+  managedBytes: number,
+  /**
+   * Everything else on it, which is never reclaimed.
+   */
+  unmanagedBytes: number,
+  /**
+   * What is free now.
+   */
+  freeBytes: number,
+  /**
+   * Managed bytes after the plan.
+   */
+  managedAfterBytes: number,
+  /**
+   * Free bytes after the plan.
+   */
+  freeAfterBytes: number,
+  /**
+   * How far the wanted content is over what fits, before the cut.
+   */
+  overBytes: number,
+  /**
+   * Whether it was measured now.
+   */
+  basis: SyncBasis,
+};
+
+/**
+ * A run: the one under way, or the last.
+ */
+export type SyncRun = {
+  /**
+   * The run.
+   */
+  runId: string,
+  /**
+   * Its job, which `jobs.cancel` stops.
+   */
+  jobId: string | null,
+  /**
+   * Whether it is still under way.
+   */
+  running: boolean,
+  /**
+   * Whether it has been asked to stop.
+   */
+  stopping: boolean,
+  /**
+   * Its steps in order.
+   */
+  steps: Array<SyncRunStep>,
+  /**
+   * How it ended.
+   */
+  outcome: SyncOutcome | null,
+  /**
+   * Why it could not run or was cut off, in words.
+   */
+  error: string | null,
+  /**
+   * Actions finished, done or failed.
+   */
+  actionsDone: number,
+  /**
+   * Actions in all.
+   */
+  actionsTotal: number,
+  /**
+   * Actions that failed.
+   */
+  failed: number,
+  /**
+   * Bytes written.
+   */
+  bytesDone: number,
+  /**
+   * Bytes to write in all.
+   */
+  bytesTotal: number,
+  /**
+   * The write speed measured so far.
+   */
+  rateBytesPerSec: number | null,
+  /**
+   * How long is left at that speed.
+   */
+  etaMs: number | null,
+  /**
+   * When it started.
+   */
+  startedAtMs: number,
+  /**
+   * When it ended.
+   */
+  endedAtMs: number | null,
+  /**
+   * The files being worked on now.
+   */
+  current: Array<SyncRunFile>,
+};
+
+/**
+ * A file a run is working on.
+ */
+export type SyncRunFile = {
+  /**
+   * Its action.
+   */
+  actionId: string,
+  /**
+   * The track's title.
+   */
+  title: string,
+  /**
+   * Its artist.
+   */
+  artist: string,
+  /**
+   * Where it stands.
+   */
+  state: SyncActionState,
+  /**
+   * Bytes sent so far.
+   */
+  bytesDone: number,
+  /**
+   * Its bytes in all.
+   */
+  bytes: number,
+};
+
+/**
+ * One step of a run and where it stands.
+ */
+export type SyncRunStep = {
+  /**
+   * The step.
+   */
+  step: SyncStep,
+  /**
+   * Where it stands.
+   */
+  state: SyncStepState,
+};
+
+/**
+ * What a source selects.
+ */
+export type SyncSelector = { "kind": "everything" } | { "kind": "artist",
+  /**
+   * The artist.
+   */
+  artistId: string, } | { "kind": "album",
+  /**
+   * The record, as `list` rows name it.
+   */
+  albumId: string, } | { "kind": "added_within",
+  /**
+   * How many days.
+   */
+  days: number,
+};
+
+/**
+ * The params of `devices.set`. Each field left out stays as it is.
+ */
+export type SyncSetParams = {
+  /**
+   * The command's ID, made by the client.
+   */
+  idempotencyKey: string,
+  /**
+   * The target.
+   */
+  deviceId: string,
+  /**
+   * A new name.
+   */
+  name?: string,
+  /**
+   * A drawing by its key. An empty key goes back to the family's.
+   */
+  iconKey?: string,
+  /**
+   * Whether Ritornel leaves it alone.
+   */
+  ignored?: boolean,
+  /**
+   * The whole list of sources, in order.
+   */
+  sources?: Array<SyncSourceSpec>,
+  /**
+   * The format policy.
+   */
+  format?: SyncFormat,
+  /**
+   * The cover's longest side in pixels: 0 embeds none.
+   */
+  coverPx?: number,
+  /**
+   * Whether an MP3 also gets an ID3v1 trailer.
+   */
+  id3v1?: boolean,
+  /**
+   * What is always kept free: 0 goes back to the default.
+   */
+  reserveBytes?: number,
+  /**
+   * For a folder, the most it may hold: 0 takes the limit away.
+   */
+  limitBytes?: number,
+  /**
+   * What a sync does with a plan that does not fit.
+   */
+  whenFull?: SyncWhenFull,
+  /**
+   * What happens when it is attached.
+   */
+  onConnect?: SyncOnConnect,
+  /**
+   * For a folder, what it is made for. It sets the codecs, the cover's
+   * size and the kind of playlist to that purpose's own, and the format
+   * too where the folder no longer plays the one it had; any of them
+   * given in the same call stands.
+   */
+  madeFor?: SyncMadeFor,
+  /**
+   * For a folder, whether it comes and goes.
+   */
+  folderKind?: SyncFolderKind,
+  /**
+   * For a folder, the codecs it plays: `flac`, `mp3`, `opus`.
+   */
+  codecs?: Array<string>,
+  /**
+   * For a folder, the kind of playlist it is written.
+   */
+  playlists?: SyncPlaylistKind,
+};
+
+/**
+ * A target's settings, each carried by value.
+ */
+export type SyncSettings = {
+  /**
+   * What masters are sent as.
+   */
+  format: SyncFormat,
+  /**
+   * The embedded cover's longest side in pixels: a baseline JPEG, never
+   * progressive. 0 embeds none.
+   */
+  coverPx: number,
+  /**
+   * Whether an MP3 also gets an ID3v1 trailer, for older players.
+   */
+  id3v1: boolean,
+  /**
+   * What is always kept free, or none for the larger of 1% and 256 MB.
+   */
+  reserveBytes: number | null,
+  /**
+   * For a folder that is always here, the most it may hold, or none
+   * for its volume's size. A removable one's room is its drive's.
+   */
+  limitBytes: number | null,
+  /**
+   * What a sync does with a plan that does not fit.
+   */
+  whenFull: SyncWhenFull,
+  /**
+   * What happens when it is attached.
+   */
+  onConnect: SyncOnConnect,
+  /**
+   * Whether its plays are read.
+   */
+  readPlays: boolean,
+  /**
+   * Whether the plays read are scrobbled.
+   */
+  scrobblePlays: boolean,
+  /**
+   * After how many days away a reminder to plug it in is shown.
+   */
+  remindAfterDays: number,
+};
+
+/**
+ * Whether a target is Ritornel's yet.
+ */
+export type SyncSetup = "new" | "ignored" | "ready";
+
+/**
+ * One source of a target, with what it comes to.
+ */
+export type SyncSource = {
+  /**
+   * The source. It is new whenever the list of sources is set.
+   */
+  sourceId: string,
+  /**
+   * What it selects, in words: an artist's name, a record's title.
+   * Empty where the selector says it all.
+   */
+  label: string,
+  /**
+   * A second line for the label: a record's artist.
+   */
+  detail: string | null,
+  /**
+   * The cover to show beside it.
+   */
+  artId: string | null,
+  /**
+   * The albums it claims: what no earlier source claimed and nothing
+   * leaves out. For a source that leaves out, what it vetoes.
+   */
+  albums: number,
+  /**
+   * The tracks it claims, and their bytes in the target's format.
+   */
+  claimed: SyncAmount,
+  /**
+   * What of it the capacity cut left off.
+   */
+  cut: SyncAmount,
+  /**
+   * What it does.
+   */
+  role: SyncSourceRole,
+  /**
+   * What it selects.
+   */
+  selector: SyncSelector,
+  /**
+   * Whether it is taken an album or a track at a time.
+   */
+  unit: SyncUnit,
+};
+
+/**
+ * What a source does in the subset.
+ */
+export type SyncSourceRole = "rule" | "always" | "leave_out";
+
+/**
+ * One source as `devices.set` takes it.
+ */
+export type SyncSourceSpec = {
+  /**
+   * What it does.
+   */
+  role: SyncSourceRole,
+  /**
+   * What it selects.
+   */
+  selector: SyncSelector,
+  /**
+   * Whether it is taken an album or a track at a time.
+   */
+  unit: SyncUnit,
+};
+
+/**
+ * The params of `devices.sync`.
+ */
+export type SyncStartParams = {
+  /**
+   * The command's ID, made by the client.
+   */
+  idempotencyKey: string,
+  /**
+   * The target.
+   */
+  deviceId: string,
+  /**
+   * The plan the person saw. If the plan is no longer that one the run
+   * ends with `plan_stale` and writes nothing.
+   */
+  planRevision: string,
+  /**
+   * Makes a new target Ritornel's. It is required, and true, for one
+   * not yet set up, so that first contact is explicit.
+   */
+  adopt: boolean,
+  /**
+   * Agrees to the capacity cut. It is required, and true, when the plan
+   * does not fit and the target asks.
+   */
+  acceptCut: boolean,
+  /**
+   * Leaves replaces whose only reason is tags or cover for another day.
+   */
+  skipRetags: boolean,
+};
+
+/**
+ * The result of `devices.sync`.
+ */
+export type SyncStarted = {
+  /**
+   * The run's job: `jobs.cancel` stops the sync.
+   */
+  job: Job,
+  /**
+   * The command's ID: the idempotency key it was sent with.
+   */
+  commandId: string,
+  /**
+   * How far the command has got.
+   */
+  status: ReceiptStatus,
+  /**
+   * The library revision the command was committed at. It is left out
+   * for a command that changes no library.
+   */
+  revision?: number,
+};
+
+/**
+ * A step of a run.
+ */
+export type SyncStep = "read" | "plan" | "adopt" | "copy" | "finish";
+
+/**
+ * Where a step of a run stands.
+ */
+export type SyncStepState = "done" | "running" | "to_come";
+
+/**
  * What a sync of an account's history read and stored.
  */
 export type SyncSummary = {
@@ -8204,6 +9608,75 @@ export type SyncSummary = {
    */
   matchedAfter: number,
 };
+
+/**
+ * How a target's storage is reached, which decides what names a file on
+ * it.
+ */
+export type SyncTransport = "folder" | "mass_storage" | "mtp";
+
+/**
+ * Whether a source is taken an album or a track at a time: a source cut
+ * short stops at a whole unit.
+ */
+export type SyncUnit = "albums" | "tracks";
+
+/**
+ * The result of `devices.unmanaged`.
+ */
+export type SyncUnmanaged = {
+  /**
+   * How many there are in all.
+   */
+  total: number,
+  /**
+   * The first row's index.
+   */
+  offset: number,
+  /**
+   * The files, by path.
+   */
+  files: Array<SyncUnmanagedFile>,
+};
+
+/**
+ * A file on a target that Ritornel did not write.
+ */
+export type SyncUnmanagedFile = {
+  /**
+   * Its path under the target's root. A path on the device is no
+   * secret.
+   */
+  path: string,
+  /**
+   * Its size.
+   */
+  sizeBytes: number,
+  /**
+   * When it was last changed, as the target says.
+   */
+  modifiedMs: number | null,
+};
+
+/**
+ * The files on a target that Ritornel did not write: left alone, and
+ * counted as used.
+ */
+export type SyncUnmanagedSummary = {
+  /**
+   * How many files.
+   */
+  files: number,
+  /**
+   * Their bytes.
+   */
+  bytes: number,
+};
+
+/**
+ * What a sync does with a plan that does not fit.
+ */
+export type SyncWhenFull = "ask" | "fill";
 
 /**
  * The durability and architectural role of a database table or view.
@@ -8346,7 +9819,7 @@ export type TokenRole = "owner" | "personal" | "player" | "guest" | "monitor";
 /**
  * What a client can subscribe to.
  */
-export type Topic = "servers" | "players" | "jobs" | "library" | "list" | "playback" | "progress" | "queue";
+export type Topic = "servers" | "players" | "jobs" | "library" | "list" | "playback" | "progress" | "queue" | "devices";
 
 /**
  * The params of `events.subscribe` and `events.unsubscribe`.
@@ -8549,23 +10022,20 @@ export type TrackSummary = {
 };
 
 /**
- * One completed output. Its job retains the key after eviction, so a later download can return 404.
+ * What became of one requested appearance. A job answers one for each, in
+ * request order, so one blocked or failed track never hides the others.
  */
-export type TranscodeArtifact = {
+export type TranscodeOutcome = {
   /**
    * Appearance requested by the caller.
    */
-  appearanceId: string,
-  /**
-   * Which cache route serves the output.
-   */
-  layer: ArtifactLayer,
+  appearanceId: string, } & ({ "outcome": "encoded",
   /**
    * BLAKE3 cache key, encoded as 64 hexadecimal digits.
    */
   key: string,
   /**
-   * Exact length of the published file.
+   * Exact length of the cached file.
    */
   sizeBytes: number,
   /**
@@ -8575,11 +10045,22 @@ export type TranscodeArtifact = {
   /**
    * BLAKE3 of the first and last MiB, counting overlapping bytes once.
    */
-  sampledHash: string,
-};
+  sampledHash: string, } | { "outcome": "passed_through",
+  /**
+   * The master's codec, such as `flac` or `mp3`.
+   */
+  codec: string, } | { "outcome": "blocked",
+  /**
+   * Why, as a word: `no_source`, `no_format` or `master_unavailable`.
+   */
+  reason: string, } | { "outcome": "failed",
+  /**
+   * What went wrong.
+   */
+  reason: string, });
 
 /**
- * Materialize a batch on the library hub.
+ * Warm the encode cache for a batch on the library hub.
  */
 export type TranscodeParams = {
   /**
@@ -8594,10 +10075,6 @@ export type TranscodeParams = {
    * Name of the configured profile.
    */
   profile: string,
-  /**
-   * Which cache route serves the output.
-   */
-  layer: ArtifactLayer,
 };
 
 /**
@@ -8623,7 +10100,7 @@ export type TranscodeStatus = {
    */
   profiles: Setting<{ [key in string]: Profile }>,
   /**
-   * Maximum number of simultaneous encode or package tasks.
+   * Maximum number of simultaneous encodes.
    */
   workers: Setting<number>,
   /**
@@ -8631,17 +10108,13 @@ export type TranscodeStatus = {
    */
   budgetBytes: Setting<number>,
   /**
-   * Bytes occupied by indexed files across both layers.
+   * Bytes occupied by cached encodes.
    */
   usedBytes: number,
   /**
-   * Number of encoded audio entries.
+   * Number of cached encodes.
    */
   derivatives: number,
-  /**
-   * Number of tagged artifact entries.
-   */
-  packages: number,
 };
 
 /**

@@ -35,6 +35,7 @@ pub(crate) const SERVER_ALLOWLIST: &[&str] = &[
     "transcode_entry",
     "transcode_pin",
     "transcode_size_hint",
+    "sync_root",
 ];
 
 /// Tables in `server.db` that hold private keys, session hashes, or service
@@ -119,6 +120,14 @@ pub(crate) const LIBRARY_ALLOWLIST: &[&str] = &[
     "answer_dependency",
     "answer_rule",
     "answer_rule_item",
+    "sync_target",
+    "sync_target_identity",
+    "sync_target_epoch",
+    "sync_source",
+    "sync_object",
+    "sync_unmanaged",
+    "sync_run",
+    "sync_action",
 ];
 
 /// Virtual tables in `library.db` excluded from `inspect.table` (FTS5 index and its
@@ -314,11 +323,28 @@ fn library_table_layer(name: &str) -> TableLayer {
         | "release_group"
         | "release"
         | "track_appearance"
-        | "picture_folder" => TableLayer::Decision,
-        "schema_migration" | "server" | "library_meta" | "library_revision" | "library_command"
-        | "library_setting" | "metadata_source" | "library_root" | "source_instance"
-        | "listener" | "history_endpoint" | "service_account" | "history_cursor"
-        | "history_delivery" => TableLayer::Bookkeeping,
+        | "picture_folder"
+        | "sync_target"
+        | "sync_source" => TableLayer::Decision,
+        "schema_migration"
+        | "server"
+        | "library_meta"
+        | "library_revision"
+        | "library_command"
+        | "library_setting"
+        | "metadata_source"
+        | "library_root"
+        | "source_instance"
+        | "listener"
+        | "history_endpoint"
+        | "service_account"
+        | "history_cursor"
+        | "history_delivery"
+        | "sync_target_identity"
+        | "sync_target_epoch"
+        | "sync_object"
+        | "sync_run"
+        | "sync_action" => TableLayer::Bookkeeping,
         _ => TableLayer::Rebuildable,
     }
 }

@@ -16,7 +16,7 @@ fn fixture(name: &str) -> PathBuf {
 }
 
 struct Setup {
-    pool: TranscodePool,
+    pool: Arc<TranscodePool>,
     store: Arc<ServerStore>,
     dir: tempfile::TempDir,
 }
@@ -33,8 +33,9 @@ impl Setup {
         );
         let cache =
             TranscodeCache::open(&store, dir.path(), Id::from_bytes([1; 16]), budget).unwrap();
-        let pool =
-            TranscodePool::new(store.clone(), cache, NonZeroUsize::new(workers).unwrap()).unwrap();
+        let pool = Arc::new(
+            TranscodePool::new(store.clone(), cache, NonZeroUsize::new(workers).unwrap()).unwrap(),
+        );
         Self { pool, store, dir }
     }
 
@@ -65,10 +66,50 @@ fn encoding(backend: Arc<dyn Encoder>) -> Encoding {
 }
 
 fn item(n: u8, backend: &Arc<dyn Encoder>) -> BatchItem {
-    BatchItem::Derivative {
+    BatchItem {
         master: master(n),
         encoding: encoding(backend.clone()),
     }
+}
+
+/// A batch's encodes, none of which failed.
+fn entries<'a>(batch: &'a Batch<'_>) -> Vec<&'a CacheEntry> {
+    batch.results().map(Result::unwrap).collect()
+}
+
+/// A transfer of the master as it is, tagged with `title`.
+fn as_it_is(n: u8, title: &str) -> TransferRequest {
+    TransferRequest {
+        master: master(n),
+        audio: TransferAudio::PassThrough(Codec::Flac),
+        tagging: Arc::new(Tagging {
+            tags: Tags {
+                title: Some(title.into()),
+                ..Tags::default()
+            },
+            cover: None,
+            id3v1: false,
+        }),
+    }
+}
+
+/// The scratch files prepared transfers hold now.
+fn scratch(setup: &Setup) -> usize {
+    setup
+        .dir
+        .path()
+        .join("tmp")
+        .read_dir()
+        .unwrap()
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("transfer-")
+        })
+        .count()
 }
 
 struct Started {
@@ -166,8 +207,8 @@ async fn two_workers_encode_together_and_a_third_item_waits() {
         .await
         .unwrap();
     let batch = batch.unwrap();
-    assert_eq!(batch.entries().len(), 3);
-    for (n, entry) in batch.entries().enumerate() {
+    assert_eq!(batch.results().len(), 3);
+    for (n, entry) in entries(&batch).into_iter().enumerate() {
         let e = encoding(encoder.clone());
         assert_eq!(
             entry.key(),
@@ -200,7 +241,7 @@ async fn cancelling_one_job_leaves_its_shared_encode_and_surviving_pin_intact() 
     assert!(matches!(&*e, Error::JobStopped(JobStop::Cancelled)));
     only.finish.send(Ok(())).unwrap();
     let survivor = tokio::time::timeout(WAIT, second).await.unwrap().unwrap();
-    let path = survivor.entries().next().unwrap().path().to_owned();
+    let path = entries(&survivor)[0].path().to_owned();
     assert!(path.exists());
     assert!(started.try_recv().is_err());
     // The second batch independently pins a hit, even under a zero-byte budget.
@@ -217,7 +258,7 @@ async fn cancelling_one_job_leaves_its_shared_encode_and_surviving_pin_intact() 
         .await
         .unwrap();
     let pressure = pressure.unwrap();
-    let other_path = pressure.entries().next().unwrap().path().to_owned();
+    let other_path = entries(&pressure)[0].path().to_owned();
     drop(pressure);
     tokio::time::timeout(WAIT, async {
         while other_path.exists() {
@@ -255,7 +296,9 @@ async fn a_shared_error_reaches_both_callers_and_the_next_attempt_can_retry() {
         once.finish
             .send(Err(io::Error::other("codec failure")))
             .unwrap();
-        let a = a.await.unwrap_err();
+        // One item's failure is its own result, and not its batch's.
+        let a = a.await.unwrap();
+        let a = a.results().next().unwrap().unwrap_err();
         assert!(a.to_string().contains("codec failure"));
         let retry = setup
             .pool
@@ -265,64 +308,99 @@ async fn a_shared_error_reaches_both_callers_and_the_next_attempt_can_retry() {
         };
         tokio::join!(retry, control).0.unwrap();
         // This waiter still receives the original error after the retry succeeded.
-        assert!(Arc::ptr_eq(&a, &b.await.unwrap_err()));
+        let b = b.await.unwrap();
+        assert!(std::ptr::eq(a, b.results().next().unwrap().unwrap_err()));
     };
     tokio::time::timeout(WAIT, run).await.unwrap();
 }
 
 #[tokio::test]
-async fn concurrent_packages_share_a_pin_and_edits_reuse_the_derivative() {
-    let setup = Setup::new(2, u64::MAX);
+async fn a_prepared_transfer_is_the_same_bytes_each_time_and_holds_its_encode_until_it_ends() {
+    // No budget at all: an encode is kept only while something holds it.
+    let setup = Setup::new(2, 0);
     let (encoder, mut started) = held();
-    let job = setup.job(1);
-    let make = |title: &str, cover: Option<Cover>| BatchItem::Package {
+    let request = |title: &str| TransferRequest {
         master: master(0),
-        audio: PackageAudio::Encode(encoding(encoder.clone())),
-        packaging: Arc::new(Packaging {
+        audio: TransferAudio::Encode(encoding(encoder.clone())),
+        tagging: Arc::new(Tagging {
             tags: Tags {
                 title: Some(title.into()),
+                ritornel_id: Some("1:a:b:c".into()),
                 ..Tags::default()
             },
-            cover,
+            cover: None,
             id3v1: true,
         }),
     };
-    let png = |color| {
-        let pixels = image::RgbImage::from_pixel(8, 4, image::Rgb([color, 2, 3]));
-        let mut bytes = io::Cursor::new(Vec::new());
-        pixels
-            .write_to(&mut bytes, image::ImageFormat::Png)
-            .unwrap();
-        Cover::new(bytes.into_inner().into(), 4)
-    };
     let work = async {
-        let first = setup
-            .pool
-            .ensure_batch(vec![make("One", None)], &job, |_| {});
-        let other =
-            setup
-                .pool
-                .ensure_batch(vec![make("One", None), make("Two", None)], &job, |_| {});
+        // Two transfers of one track are one encode, tagged twice.
+        let one = setup.pool.prepare(request("One"));
+        let two = setup.pool.prepare(request("One"));
         let control = async {
             started.recv().await.unwrap().finish.send(Ok(())).unwrap();
         };
-        let (a, b, ()) = tokio::join!(first, other, control);
-        let (a, b) = (a.unwrap(), b.unwrap());
-        assert!(Arc::ptr_eq(&a.entries[0], &b.entries[0]));
-        assert_ne!(b.entries[0].entry.key(), b.entries[1].entry.key());
-        let edits = setup
-            .pool
-            .ensure_batch(
-                vec![make("Two", Some(png(9))), make("Two", Some(png(10)))],
-                &job,
-                |_| {},
-            )
-            .await
-            .unwrap();
-        assert_ne!(edits.entries[0].entry.key(), edits.entries[1].entry.key());
+        let (one, two, ()) = tokio::join!(one, two, control);
+        let (one, two) = (one.unwrap(), two.unwrap());
         assert!(started.try_recv().is_err());
+        assert_ne!(one.id(), two.id());
+        assert_eq!(
+            (one.len(), one.digest(), one.sampled_hash()),
+            (two.len(), two.digest(), two.sampled_hash())
+        );
+        // A caller gets a reader of exactly the bytes it was told of.
+        let mut bytes = Vec::new();
+        io::Read::read_to_end(&mut one.reader().unwrap(), &mut bytes).unwrap();
+        assert_eq!(bytes.len() as u64, one.len());
+        assert_eq!(blake3::hash(&bytes), one.digest());
+        assert_eq!(one.codec(), Codec::Mp3);
+        // Other tags are other bytes, from the same encode.
+        let other = setup.pool.prepare(request("Two")).await.unwrap();
+        assert_ne!(other.digest(), one.digest());
+        assert!(started.try_recv().is_err());
+        // Each transfer owns one scratch file, which goes when it ends, and
+        // the encode they were tagged from goes with the last of them.
+        assert_eq!(scratch(&setup), 3);
+        let encodes = || -> i64 {
+            setup
+                .store
+                .read(|db| {
+                    Ok(db.query_row("SELECT count(*) FROM transcode_entry", [], |r| r.get(0))?)
+                })
+                .unwrap()
+        };
+        assert_eq!(encodes(), 1);
+        drop((one, two));
+        assert_eq!(scratch(&setup), 1);
+        assert_eq!(encodes(), 1, "a transfer still holds its encode");
+        drop(other);
+        assert_eq!(scratch(&setup), 0);
+        while encodes() != 0 {
+            // sleep: eviction runs on a worker after the last pin drops.
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     };
     tokio::time::timeout(WAIT, work).await.unwrap();
+}
+
+#[tokio::test]
+async fn one_failed_item_is_its_own_result_and_the_rest_of_its_batch_is_made() {
+    let setup = Setup::new(2, u64::MAX);
+    let job = setup.job(1);
+    let fast: Arc<dyn Encoder> = Arc::new(FakeEncoder);
+    let mut offline = item(1, &fast);
+    offline.master.path = setup.dir.path().join("offline.flac");
+    let batch = setup
+        .pool
+        .ensure_batch(vec![item(0, &fast), offline, item(2, &fast)], &job, |_| {})
+        .await
+        .unwrap();
+    let results: Vec<bool> = batch.results().map(|result| result.is_ok()).collect();
+    assert_eq!(results, [true, false, true]);
+    // A transfer whose master is gone fails alone too.
+    let mut gone = as_it_is(3, "Gone");
+    gone.master.path = setup.dir.path().join("offline.flac");
+    assert!(setup.pool.prepare(gone).await.is_err());
+    assert_eq!(scratch(&setup), 0);
 }
 
 #[cfg(unix)]
@@ -453,66 +531,6 @@ async fn dropping_an_incomplete_batch_releases_earlier_results_and_stops_the_las
 }
 
 #[tokio::test]
-async fn pinned_package_hits_survive_derivative_eviction_and_an_offline_master() {
-    let setup = Setup::new(1, 0);
-    let (backend, mut started) = held();
-    let job = setup.job(1);
-    let package = |master, audio| BatchItem::Package {
-        master,
-        audio,
-        packaging: Arc::default(),
-    };
-    let mut absent = master(0);
-    absent.path = setup.dir.path().join("offline.flac");
-    let encode = || PackageAudio::Encode(encoding(backend.clone()));
-    let run = setup.pool.ensure_batch(
-        vec![
-            package(master(0), encode()),
-            package(master(1), PackageAudio::PassThrough(Codec::Flac)),
-        ],
-        &job,
-        |_| {},
-    );
-    let control = async { started.recv().await.unwrap().finish.send(Ok(())).unwrap() };
-    let (run, ()) = tokio::time::timeout(WAIT, async { tokio::join!(run, control) })
-        .await
-        .unwrap();
-    let pinned = run.unwrap();
-    tokio::time::timeout(WAIT, async {
-        loop {
-            let count: i64 = setup
-                .store
-                .read(|db| {
-                    Ok(db.query_row(
-                        "SELECT count(*) FROM transcode_entry WHERE layer='derivative'",
-                        [],
-                        |r| r.get(0),
-                    )?)
-                })
-                .unwrap();
-            if count == 0 {
-                break;
-            }
-            // sleep: wait until the worker has released and evicted the package's input.
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .unwrap();
-    let hit = setup
-        .pool
-        .ensure_batch(vec![package(absent, encode())], &job, |_| {})
-        .await
-        .unwrap();
-    assert_eq!(
-        hit.entries().next().unwrap().key(),
-        pinned.entries().next().unwrap().key()
-    );
-    assert!(pinned.entries().all(|entry| entry.path().is_file()));
-    assert!(started.try_recv().is_err());
-}
-
-#[tokio::test]
 async fn closing_the_pool_reports_a_failed_deferred_eviction() {
     let setup = Setup::new(1, 0);
     let fast: Arc<dyn Encoder> = Arc::new(FakeEncoder);
@@ -522,11 +540,12 @@ async fn closing_the_pool_reports_a_failed_deferred_eviction() {
         .ensure_batch(vec![item(0, &fast)], &job, |_| {})
         .await
         .unwrap();
-    let path = batch.entries().next().unwrap().path().to_owned();
+    let path = entries(&batch)[0].path().to_owned();
     fs::remove_file(&path).unwrap();
     fs::create_dir(path).unwrap();
     drop(batch);
-    assert!(matches!(setup.pool.close(), Err(Error::Io(_))));
+    let pool = Arc::try_unwrap(setup.pool).unwrap();
+    assert!(matches!(pool.close(), Err(Error::Io(_))));
     let indexed: i64 = setup
         .store
         .read(|db| Ok(db.query_row("SELECT count(*) FROM transcode_entry", [], |row| row.get(0))?))
@@ -534,20 +553,12 @@ async fn closing_the_pool_reports_a_failed_deferred_eviction() {
     assert_eq!(indexed, 1, "an unsuccessful unlink must be retryable");
 }
 
-fn flac(n: u8) -> BatchItem {
-    BatchItem::Package {
-        master: master(n),
-        audio: PackageAudio::PassThrough(Codec::Flac),
-        packaging: Arc::default(),
-    }
-}
-
 #[tokio::test]
-async fn cached_audio_and_packages_are_available_with_every_encoder_busy() {
+async fn cached_audio_is_available_with_every_encoder_busy() {
     let setup = Setup::new(1, u64::MAX);
     let job = setup.job(1);
     let fast: Arc<dyn Encoder> = Arc::new(FakeEncoder);
-    let cached = vec![item(0, &fast), flac(1)];
+    let cached = vec![item(0, &fast)];
     let first = setup
         .pool
         .ensure_batch(cached.clone(), &job, |_| {})
@@ -564,17 +575,13 @@ async fn cached_audio_and_packages_are_available_with_every_encoder_busy() {
         .await
         .unwrap()
         .unwrap();
-    assert!(
-        hit.entries()
-            .map(CacheEntry::key)
-            .eq(first.entries().map(CacheEntry::key))
-    );
+    assert_eq!(entries(&hit)[0].key(), entries(&first)[0].key());
     active.finish.send(Ok(())).unwrap();
     busy.await.unwrap();
 }
 
 #[tokio::test]
-async fn a_retry_waits_for_cleanup_while_another_track_can_package() {
+async fn a_retry_waits_for_cleanup_while_another_track_can_be_made() {
     struct Unwind {
         encoder: Held,
         unwinding: tokio::sync::mpsc::UnboundedSender<mpsc::Sender<()>>,
@@ -628,13 +635,13 @@ async fn a_retry_waits_for_cleanup_while_another_track_can_package() {
             .ensure_batch(vec![item(0, &encoder)], &job, |_| {}),
     );
     assert!(retry.as_mut().now_or_never().is_none());
-    let other = setup.pool.ensure_batch(vec![flac(1)], &job, |_| {});
+    let other = setup.pool.prepare(as_it_is(1, "Other"));
     tokio::time::timeout(WAIT, other).await.unwrap().unwrap();
     assert!(started.try_recv().is_err());
     release.send(()).unwrap();
     let active = wait_for_encoder(&mut retry, &mut started).await;
-    // Package a cache miss while the second encode is still consuming its worker.
-    tokio::time::timeout(WAIT, setup.pool.ensure_batch(vec![flac(2)], &job, |_| {}))
+    // Tag another master while the second encode is still consuming its worker.
+    tokio::time::timeout(WAIT, setup.pool.prepare(as_it_is(2, "Another")))
         .await
         .unwrap()
         .unwrap();

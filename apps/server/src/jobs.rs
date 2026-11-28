@@ -229,6 +229,9 @@ fn run(core: &Core, job: ritornel_engine::Job, settings: ScanSettings, shutdown:
     if matches!(job.kind.as_str(), "transcode.start" | "transcode.prune") {
         return core.run_transcode(job, shutdown);
     }
+    if job.kind == crate::dispatch::devices::SYNC_JOB {
+        return core.run_device_sync(job, shutdown);
+    }
     if job.kind == crate::lastfm::SYNC_JOB {
         return sync(core, job, shutdown);
     }

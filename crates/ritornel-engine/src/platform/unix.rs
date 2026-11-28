@@ -200,3 +200,13 @@ pub(crate) fn seal(root: &Path, sealed: bool) {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(folder)).unwrap();
     }
 }
+
+/// The size of the disk that holds `path`, and the bytes an unprivileged
+/// process may still write on it.
+pub(crate) fn disk_bytes(path: &Path) -> Option<(u64, u64)> {
+    let disk = rustix::fs::statvfs(path).ok()?;
+    Some((
+        disk.f_blocks.checked_mul(disk.f_frsize)?,
+        disk.f_bavail.checked_mul(disk.f_frsize)?,
+    ))
+}

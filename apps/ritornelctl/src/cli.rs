@@ -83,7 +83,13 @@ Usage:
   ritornelctl status [--dismiss] [--data-dir <dir>] [--json]
   ritornelctl server stop [--data-dir <dir>] [--json]
   ritornelctl transcode encoders | stats | prune [--data-dir <dir>] [--json]
-  ritornelctl transcode run --profile <name> [--derivative] <appearance>... [--data-dir <dir>] [--json]
+  ritornelctl transcode run --profile <name> <appearance>... [--data-dir <dir>] [--json]
+  ritornelctl devices list [--data-dir <dir>] [--json]
+  ritornelctl devices show | plan | formats | plays | sync | stop | set | rename
+                      | ignore | forget | eject <device> [--data-dir <dir>] [--json]
+  ritornelctl devices add-folder <folder> [--name <name>] [--for <purpose>]
+                                 [--removable] [--limit <size>]
+                                 [--data-dir <dir>] [--json]
   ritornelctl backup [--data-dir <dir>] [--json]
   ritornelctl export <folder> [--data-dir <dir>] [--json]
   ritornelctl library create [--data-dir <dir>] [--json]
@@ -188,9 +194,38 @@ Commands:
                    no longer chooses is dropped
   transcode encoders, transcode stats
                    Show detected encoders or cache usage, workers and profiles
-  transcode run    Build a package for each appearance ID with --profile.
-                   Use --derivative for encoded audio without tags or a cover
-  transcode prune  Remove unpinned derivatives and packages
+  transcode run    Encode each appearance ID with --profile into the cache,
+                   and say what became of each: encoded, as it is, blocked
+                   or failed
+  transcode prune  Remove the cached encodes nothing holds
+  devices list     List the players and folders the library syncs to. In
+                   every other devices command a device is named by its ID
+                   or by its name
+  devices add-folder <folder>
+                   Add a folder, a drive or a card on this server to sync
+                   to. --for says what it is made for (car, phone, player
+                   or copy), which sets the formats it plays; --removable
+                   says it comes and goes, and is ejected. Nothing is
+                   written there until its first sync
+  devices show, plan, formats, plays <device>
+                   Show a device's page, the rows of its next sync
+                   (--tracks for one a track, --kind to filter), what its
+                   music would take in each format, or its plays
+  devices sync <device>
+                   Sync it at the plan as it stands, and wait. --setup sets
+                   a new device up first, --accept-cut agrees to what does
+                   not fit, --skip-retags leaves tag changes for another day
+  devices stop <device>
+                   Stop the sync under way after the file in hand
+  devices set <device>
+                   Change what goes on it and in what form: --source,
+                   --always and --leave-out take everything, artist:<id>,
+                   album:<id> or added:<days>; --format takes as-is, mp3-v0,
+                   mp3-v2, mp3-320 or opus-160; --cover <px>, --id3v1 on|off,
+                   --limit <size>, --for <purpose>, --plays <codecs>
+  devices rename, ignore, forget, eject <device>
+                   Rename it, leave it alone (--off to stop), end it, or
+                   make it safe to unplug
   jobs [<job>]     List the server's jobs, newest first, or show one with
                    what its scan found and what could not be read
   identity re-resolve --dry-run
@@ -563,6 +598,8 @@ enum Command {
     Backup(ServerArgs),
     #[command(subcommand)]
     Transcode(crate::transcode::TranscodeCommand),
+    #[command(subcommand)]
+    Devices(crate::devices::DevicesCommand),
     Export(ExportArgs),
     #[command(subcommand)]
     Library(LibraryCommand),
@@ -1250,6 +1287,7 @@ fn try_run(
         Command::Status(args) => status::status(&args, env, out),
         Command::Server(ServerCommand::Stop(args)) => crate::server::stop(&args, env, out),
         Command::Transcode(command) => crate::transcode::run(command, env, out),
+        Command::Devices(command) => crate::devices::run(command, env, out),
         Command::Backup(args) => backup::backup(&args, env, out),
         Command::Export(args) => export::export(&args, env, out),
         Command::Library(LibraryCommand::Create(args)) => library::create(&args, env, out),

@@ -38,6 +38,10 @@ ritornel-build.workspace = true
 ritornel-client.workspace = true
 ritornel-contract.workspace = true
 ritornel-engine = { workspace = true, default-features = false }
+# What a sync reads and writes a player or a folder through.
+ritornel-device.workspace = true
+# The digests of a transfer and the keys of the encodes a plan asks after.
+blake3 = "=1.8.7"
 ritornel-lastfm = { workspace = true, optional = true }
 ritornel-musicbrainz = { workspace = true, optional = true }
 ritornel-source.workspace = true

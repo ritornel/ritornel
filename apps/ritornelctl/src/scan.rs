@@ -78,7 +78,7 @@ pub(crate) fn scan(args: &ScanArgs, env: local::Env<'_>, out: &mut dyn Write) ->
         async |client| {
             let job = start(client, path, &name).await?;
             let mut detail = JobDetail {
-                artifacts: Vec::new(),
+                outcomes: Vec::new(),
                 job,
                 failed_items: Vec::new(),
             };

@@ -72,6 +72,7 @@ pub(super) fn classify_on_satellite(method: &str) -> Option<Route> {
     const FOLDERS: &str = "the library's folders are on its hub's machine: do this on the hub";
     const TRANSCODES: &str = "manage the transcode cache on the library hub";
     const LASTFM: &str = "connect or configure Last.fm on the library hub";
+    const DEVICE_FOLDER: &str = "add a folder to sync to on the library hub";
     Some(match method {
         // The satellite's own: its session, status, settings, backups,
         // player, queue and link.
@@ -138,7 +139,22 @@ pub(super) fn classify_on_satellite(method: &str) -> Option<Route> {
         | "inspect.entity"
         | "inspect.play"
         | "inspect.conflicts"
-        | "library.revisions" => Route::Hub,
+        | "library.revisions"
+        // The hub plans a sync and keeps its records, so its page is the
+        // same on every desk.
+        | "devices.list"
+        | "devices.get"
+        | "devices.formats"
+        | "devices.actions"
+        | "devices.unmanaged"
+        | "devices.plays"
+        | "devices.set"
+        | "devices.sync"
+        | "devices.eject"
+        | "devices.forget" => Route::Hub,
+        // A folder is on the server called, and a satellite's link never
+        // holds `folders:manage`, so this one call cannot be forwarded.
+        "devices.addFolder" => Route::Refused(DEVICE_FOLDER),
         "transcode.start" | "transcode.prune" => Route::Refused(TRANSCODES),
         "lastfm.signInStart"
         | "lastfm.signInFinish"

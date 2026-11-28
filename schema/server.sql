@@ -8,6 +8,7 @@
 --   0002_hub_link  dd4608c7904bfdcf0e97bd4fef1a83f0f77051bb90189b6a7e9dccd467984cdb
 --   0003_transcode_cache  6d3ebee8a3899432d24eb529c7e10fa14a0945e4a3259a65d030c64443a44dab
 --   0004_session_permissions  932cbd123e4d7bba619aa88c22613c5d6b3170ae62fdbdafe80cf253b7efc523
+--   0005_encode_cache_and_sync_roots  de2855023962ebd519abcaeab04c2a317545fc04febc2a40cfa0d59d1a173f3f
 
 CREATE TABLE schema_migration (
   version        INTEGER PRIMARY KEY,
@@ -210,37 +211,40 @@ CREATE TABLE hub_link (
   linked_at_ms       INTEGER NOT NULL
 ) STRICT;
 
-CREATE TABLE transcode_entry (
+CREATE TABLE transcode_size_hint (
   id INTEGER PRIMARY KEY,
   cache_key TEXT NOT NULL UNIQUE CHECK (length(cache_key) = 64 AND cache_key NOT GLOB '*[^0-9a-f]*'),
-  layer TEXT NOT NULL CHECK (layer IN ('derivative', 'packaged')),
+  size_bytes INTEGER NOT NULL CHECK (size_bytes > 0)
+) STRICT;
+
+CREATE TABLE "transcode_entry" (
+  id INTEGER PRIMARY KEY,
+  cache_key TEXT NOT NULL UNIQUE CHECK (length(cache_key) = 64 AND cache_key NOT GLOB '*[^0-9a-f]*'),
   codec TEXT NOT NULL CHECK (codec IN ('mp3', 'opus', 'flac')),
-  master_scheme INTEGER CHECK (master_scheme IS NULL OR (source_key IS NOT NULL AND master_scheme >= 0)),
-  source_key TEXT CHECK (source_key IS NULL OR (length(source_key) = 64 AND source_key NOT GLOB '*[^0-9a-f]*')), -- derivative key or master audio hash used to package the file
   size_bytes INTEGER NOT NULL CHECK (size_bytes > 0),
   file_hash BLOB NOT NULL CHECK (length(file_hash) = 32),
   sampled_hash BLOB NOT NULL CHECK (length(sampled_hash) = 32),
   created_at_ms INTEGER NOT NULL,
-  last_used_at_ms INTEGER NOT NULL,
-  CHECK ((source_key IS NULL) = (layer = 'derivative'))
+  last_used_at_ms INTEGER NOT NULL
 ) STRICT;
 
-CREATE INDEX transcode_lru ON transcode_entry(layer DESC, last_used_at_ms, id);
+CREATE INDEX transcode_lru ON transcode_entry(last_used_at_ms, id);
 
 CREATE TABLE transcode_pin (
   id INTEGER PRIMARY KEY,
   entry_id INTEGER NOT NULL REFERENCES transcode_entry(id) ON DELETE CASCADE,
   pin_id BLOB NOT NULL CHECK (length(pin_id) = 16),
   boot_id BLOB NOT NULL CHECK (length(boot_id) = 16),
-  owner_kind TEXT NOT NULL CHECK (owner_kind IN ('sync_batch', 'http_transfer', 'ab_session')),
+  owner_kind TEXT NOT NULL CHECK (owner_kind IN ('batch', 'transfer', 'http_transfer', 'ab_session')),
   created_at_ms INTEGER NOT NULL,
   UNIQUE(entry_id, pin_id)
 ) STRICT;
 
 CREATE INDEX transcode_pin_owner ON transcode_pin(pin_id);
 
-CREATE TABLE transcode_size_hint (
-  id INTEGER PRIMARY KEY,
-  cache_key TEXT NOT NULL UNIQUE CHECK (length(cache_key) = 64 AND cache_key NOT GLOB '*[^0-9a-f]*'),
-  size_bytes INTEGER NOT NULL CHECK (size_bytes > 0)
+CREATE TABLE sync_root (
+  id             INTEGER PRIMARY KEY,
+  root_id        BLOB NOT NULL UNIQUE CHECK (length(root_id) = 16),
+  abs_path       TEXT NOT NULL,
+  created_at_ms  INTEGER NOT NULL
 ) STRICT;

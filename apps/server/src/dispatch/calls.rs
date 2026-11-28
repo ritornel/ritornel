@@ -60,6 +60,8 @@ pub(crate) fn job_for(job: &ritornel_engine::Job, show_paths: bool) -> Job {
                 JobTarget::Account { id }
             } else if job.target_kind.as_deref() == Some("server") {
                 JobTarget::Server { id }
+            } else if job.target_kind.as_deref() == Some("device") {
+                JobTarget::Device { id }
             } else if job.target_kind.as_deref() == Some("import_run")
                 || [
                     crate::imports::DRY_RUN_JOB,
@@ -107,6 +109,7 @@ fn needed_to_cancel(kind: &str) -> &'static [ritornel_contract::Permission] {
         crate::imports::APPLY_JOB => ImportsApply::NEEDS,
         crate::imports::UNDO_JOB => ImportsUndo::NEEDS,
         crate::lastfm::SYNC_JOB => LastfmSync::NEEDS,
+        super::devices::SYNC_JOB => ritornel_contract::methods::DevicesSync::NEEDS,
         TranscodeStart::NAME => TranscodeStart::NEEDS,
         TranscodePrune::NAME => TranscodePrune::NEEDS,
         _ => ritornel_contract::Permission::ALL,
@@ -585,17 +588,15 @@ impl Core {
             .failed_job_items(found.id, LISTED)
             .map_err(stored)?;
         Ok(JobDetail {
-            artifacts: if found.kind == "transcode.start"
+            // A transcode that finished before the cache kept encodes alone
+            // stored a list that no longer reads: it answers with none.
+            outcomes: if found.kind == "transcode.start"
                 && found.state == ritornel_engine::JobState::Succeeded
             {
                 found
                     .checkpoint_json
                     .as_deref()
-                    .map(serde_json::from_str)
-                    .transpose()
-                    .map_err(|_| {
-                        RpcError::new(ErrorCode::Internal, "invalid transcode job result")
-                    })?
+                    .and_then(|stored| serde_json::from_str(stored).ok())
                     .unwrap_or_default()
             } else {
                 Vec::new()

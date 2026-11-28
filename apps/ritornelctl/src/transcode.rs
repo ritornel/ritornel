@@ -1,9 +1,9 @@
-//! Inspect this server's transcode settings and verify cached outputs.
+//! Inspect this server's transcode settings, and warm and check its encode cache.
 use crate::cli::{Error, ServerArgs};
 use crate::server;
 use clap::Subcommand;
 use ritornel_client::contract::methods::{TranscodePrune, TranscodeStart};
-use ritornel_client::contract::transcode::ArtifactLayer;
+use ritornel_client::contract::transcode::TranscodeResult;
 use ritornel_client::contract::{Id, JobState, TranscodeParams, TranscodePruneParams};
 use ritornel_client::local;
 use std::io::Write;
@@ -16,8 +16,6 @@ pub(crate) enum TranscodeCommand {
     Run {
         #[arg(long)]
         profile: String,
-        #[arg(long)]
-        derivative: bool,
         #[arg(required = true)]
         appearances: Vec<Id>,
         #[command(flatten)]
@@ -55,11 +53,10 @@ pub(crate) fn run(
             }
             return server::print(args, out, &status, serde_json::to_string_pretty, |s| {
                 format!(
-                    "{} of {} used, {} derivatives, {} packages\n{} workers\nProfiles: {}\n",
+                    "{} of {} used, {} encodes\n{} workers\nProfiles: {}\n",
                     crate::status::size(s.used_bytes),
                     crate::status::size(s.budget_bytes.value),
                     s.derivatives,
-                    s.packages,
                     s.workers.value,
                     s.profiles
                         .value
@@ -74,7 +71,6 @@ pub(crate) fn run(
         TranscodeCommand::Run {
             server,
             profile,
-            derivative,
             appearances,
         } => (
             server,
@@ -82,11 +78,6 @@ pub(crate) fn run(
                 idempotency_key: ritornel_client::idempotency_key()?,
                 profile,
                 appearances,
-                layer: if derivative {
-                    ArtifactLayer::Derivative
-                } else {
-                    ArtifactLayer::Packaged
-                },
             }),
         ),
     };
@@ -115,16 +106,32 @@ pub(crate) fn run(
             text.push_str(e);
             text.push('\n')
         }
-        for a in &d.artifacts {
-            text.push_str(&format!(
-                "{}  {}  {} bytes\n",
-                a.appearance_id, a.key, a.size_bytes
-            ));
+        for outcome in &d.outcomes {
+            let said = match &outcome.result {
+                TranscodeResult::Encoded {
+                    key, size_bytes, ..
+                } => format!("encoded  {key}  {size_bytes} bytes"),
+                TranscodeResult::PassedThrough { codec } => {
+                    format!("as it is ({codec}): nothing to encode")
+                }
+                TranscodeResult::Blocked { reason } => format!("blocked: {reason}"),
+                TranscodeResult::Failed { reason } => format!("failed: {reason}"),
+            };
+            text.push_str(&format!("{}  {said}\n", outcome.appearance_id));
         }
         text
     })?;
     if detail.job.state != JobState::Succeeded {
         return Err(Error::Job(detail.job.state.as_str()));
+    }
+    // One track that could not be made fails the command, and not the rest.
+    if detail.outcomes.iter().any(|outcome| {
+        matches!(
+            outcome.result,
+            TranscodeResult::Blocked { .. } | TranscodeResult::Failed { .. }
+        )
+    }) {
+        return Err(Error::Job("left some tracks unmade"));
     }
     Ok(())
 }

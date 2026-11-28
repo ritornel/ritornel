@@ -60,8 +60,7 @@ def only(package: str, *allowed: str) -> None:
     forbid(package, *(member for member in members if member != package and member not in allowed))
 
 
-# No client links the engine or SQLite. ritornel-device gets a line here
-# when it arrives.
+# No client links the engine or SQLite.
 forbid("ritornelctl", "ritornel-engine", "rusqlite")
 forbid("ritornel-client", "ritornel-engine", "rusqlite")
 forbid("ritornel-desktop-gpui", "ritornel-engine", "rusqlite", manifest="apps/desktop/Cargo.toml")
@@ -72,8 +71,10 @@ only("ritornel-domain", "ritornel-contract")
 forbid("ritornel-domain", "rusqlite")
 
 # A plugin builds on the traits and on nothing of the core's, and the core
-# builds on no plugin.
+# builds on no plugin. A device family builds on the device trait the same
+# way.
 only("ritornel-source")
+only("ritornel-device")
 only("ritornel-lastfm", "ritornel-source")
 forbid("ritornel-lastfm", "rusqlite")
 forbid("ritornel-engine", "ritornel-lastfm", "scrobl")

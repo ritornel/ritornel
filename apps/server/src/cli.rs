@@ -79,7 +79,7 @@ Options:
                         as the room its speakers are in. Given, it replaces
                         the name the server has stored at every start; the
                         stored name is kept when none is given
-  --transcode-workers <n>       Maximum simultaneous encodes or packages (1 to 1024).
+  --transcode-workers <n>       Maximum simultaneous encodes (1 to 1024).
                         Defaults to available cores minus one, minimum one
   --transcode-cache-size <size> Budget for cached transcodes, in MiB or GiB (default 10 GiB)
   --transcode-profiles <json>   JSON object adding to or overriding the built-in profiles

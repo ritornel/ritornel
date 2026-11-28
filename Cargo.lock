@@ -2130,6 +2130,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ritornel-device"
+version = "0.1.0"
+
+[[package]]
 name = "ritornel-domain"
 version = "0.1.0"
 dependencies = [
@@ -2155,6 +2159,7 @@ dependencies = [
  "jiff",
  "lofty",
  "ritornel-contract",
+ "ritornel-device",
  "ritornel-domain",
  "ritornel-source",
  "ritornel-windows",
@@ -2198,6 +2203,7 @@ name = "ritornel-server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "blake3",
  "clap",
  "futures-util",
  "hyper",
@@ -2208,6 +2214,7 @@ dependencies = [
  "ritornel-build",
  "ritornel-client",
  "ritornel-contract",
+ "ritornel-device",
  "ritornel-engine",
  "ritornel-lastfm",
  "ritornel-musicbrainz",

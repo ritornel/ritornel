@@ -19,7 +19,7 @@ The server can also be built without its default features but MusicBrainz (`--no
 
 ## Workspace and dependency direction
 
-The main Cargo workspace (`Cargo.toml`) holds nine library crates and two binaries. The desktop app (`apps/desktop`) is an excluded Cargo workspace of its own so the server and headless hub build without GPUI or any desktop library.
+The main Cargo workspace (`Cargo.toml`) holds ten library crates and two binaries. The desktop app (`apps/desktop`) is an excluded Cargo workspace of its own so the server and headless hub build without GPUI or any desktop library.
 
 | Path | Role |
 |---|---|
@@ -29,6 +29,7 @@ The main Cargo workspace (`Cargo.toml`) holds nine library crates and two binari
 | `crates/ritornel-engine` | SQLite stores, migrations, library scanning, cover art, audio pipeline, backups, record health, and export. No networking. |
 | `crates/ritornel-client` | Shared Rust client: server discovery/launch and typed contract calls. |
 | `crates/ritornel-source` | Traits and wire-independent types for optional external-source plugins (`HistorySource`, `Sink`, `Catalogue`). |
+| `crates/ritornel-device` | The trait a device family implements for syncing to a player or a folder (`Session`), and its wire-independent types. Depends on no workspace crate. |
 | `crates/ritornel-lastfm` | Last.fm plugin implementing `ritornel-source` behind the server's `lastfm` feature. |
 | `crates/ritornel-musicbrainz` | MusicBrainz plugin implementing `ritornel-source`'s `Catalogue` behind the server's `musicbrainz` feature. |
 | `crates/ritornel-windows` | Safe wrappers around the few Win32 calls the standard library cannot make (byte-range locks, owner-only ACLs, file identity, interrupt clock, hidden shutdown window, and, with its `media` feature, the system media transport controls). Empty on non-Windows. |
@@ -44,6 +45,7 @@ ritornel-contract ◄── ritornel-client ◄── ritornelctl, ritornel-desk
 ritornel-source   ◄── ritornel-engine
 ritornel-source   ◄── ritornel-lastfm ◄── ritornel-server (optional feature)
 ritornel-source   ◄── ritornel-musicbrainz ◄── ritornel-server (optional feature)
+ritornel-device   ◄── ritornel-engine
 ```
 
 Key boundary rules:
@@ -60,7 +62,7 @@ Key boundary rules:
 - **Two SQLite databases.** `library.db` holds the library (catalog, evidence, file locations, listening history, ratings); `server.db` holds server-local state (server identity, sessions, persisted playback queue, jobs, listen staging, outbox). Keeping them separate lets a library move cleanly between machines.
 - **Durable vs. rebuildable.** Raw source payloads, identity decisions/exclusions/assignments, user edits, raw history observations, ratings, and corrections are durable and never overwritten in place. Extracted claims, displayed metadata, FTS search indexes, and derived play events are rebuildable projections.
 - **Insert-only bindings and append-only history.** A file's binding to a recording is superseded by a new `assignment` row rather than updated in place, and durable history rows point at a `source_item` rather than directly at a `recording`, so identity fixes re-bind history cleanly on rebuild.
-- **Hands-off files.** Ritornel reads music files and never modifies, renames, or deletes them.
+- **Hands-off files.** Ritornel reads music files and never modifies, renames, or deletes them. What it writes to a sync target is a copy, inside that target's music folder and its own `.ritornel/` folder.
 - **Migrations are immutable.** Once a numbered migration lands on `main`, it is never edited; schema changes add a new migration file and regenerate `schema/*.sql` (`mise run schema`).
 - **Generated snapshots stay in sync.** `schema/library.sql`, `schema/server.sql`, and `contract/contract.ts` are generated from code and verified by tests in `mise run check`.
 
@@ -95,6 +97,7 @@ Detailed guides for shipped subsystems live under `docs/internals/`:
 - [`docs/internals/history.md`](docs/internals/history.md) — immutable observations, play derivation, monotonic timekeeping, indexed queries, Last.fm sync/scrobbling, and portable export.
 - [`docs/internals/corrections.md`](docs/internals/corrections.md) — sidecars kept with the audio, CD layouts and disc IDs read from them, MusicBrainz lookups behind the library's switch, the album and edition proposals worked out from them, and the answers that say yes or no to one, keep two albums apart, or undo another.
 - [`docs/internals/identity.md`](docs/internals/identity.md) — read-only scanning, audio-only hashing, folder watching, normalization, recording resolution, catalog projection, and scrobble matching.
-- [`docs/internals/transcoding.md`](docs/internals/transcoding.md) — encoder profiles, cached derivatives and packages, verification commands and link-session downloads.
+- [`docs/internals/transcoding.md`](docs/internals/transcoding.md) — encoder profiles, the encode cache, tagged copies and prepared transfers, verification commands and link-session downloads.
+- [`docs/internals/device-sync.md`](docs/internals/device-sync.md) — syncing part of the library to a player or a folder: the driver trait, the planner, the run, storage, and what is never touched.
 - [`docs/internals/linking.md`](docs/internals/linking.md) — server identity, hub write guard, local owner credentials, sessions, tickets, media tokens, and listener transport bounds.
 - [`docs/internals/desktop.md`](docs/internals/desktop.md) — GPUI desktop workspace, server discovery, frame and whole-page navigation, virtualized walls and cover loading, History/Lean back views, queue, Settings, and offscreen testing.

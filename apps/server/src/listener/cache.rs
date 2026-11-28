@@ -1,7 +1,6 @@
 //! Link-session downloads. Only decoded digests enter the cache lookup.
 
 use super::*;
-use ritornel_contract::transcode::ArtifactLayer;
 use ritornel_engine::transcode::Codec;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
@@ -9,7 +8,6 @@ pub(super) async fn cached(
     State(core): State<Arc<Core>>,
     Extension(grant): Extension<SessionGrant>,
     Extension(peer): Extension<Option<Peer>>,
-    Extension(layer): Extension<ArtifactLayer>,
     Path(key): Path<String>,
     method: Method,
     headers: HeaderMap,
@@ -23,7 +21,7 @@ pub(super) async fn cached(
     let Some(service) = core.transcodes() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let transfer = match service.pool.transfer(key.into(), layer).await {
+    let transfer = match service.pool.transfer(key.into()).await {
         Ok(Some(transfer)) => transfer,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(error) => {

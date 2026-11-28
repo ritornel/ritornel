@@ -1,6 +1,6 @@
 # Transcoding
 
-The hub produces audio derivatives and tagged files for linked clients. The engine owns the encoders, packaging and disk cache in `ritornel-engine::transcode`. The server selects library copies, queues jobs and serves completed files. The [playback guide](playback.md#audio-pipeline) describes the shared PCM decoder, and the [server guide](server.md#transcode-cache) covers worker scheduling, pin lifetimes and crash recovery.
+The hub encodes audio for linked clients and for what it syncs to, and tags each copy it sends. The engine owns the encoders, the encode cache and tagged copies in `ritornel-engine::transcode`. The server selects library copies, queues jobs and serves cached encodes. The [playback guide](playback.md#audio-pipeline) describes the shared PCM decoder, and the [server guide](server.md#transcode-cache) covers worker scheduling, pin lifetimes and crash recovery.
 
 ## Profiles and capabilities
 
@@ -35,27 +35,32 @@ An explicit worker count can range from 1 to 1024. The profile flag and environm
 
 MP3 accepts `mode = "v0"`, `mode = "v2"` or a CBR setting such as `mode = { cbr = 192 }` in kbps. Opus accepts 6–256 kbps, complexity 0–10, and `variable`, `constrained` or `hard_cbr` VBR mode. DSP defaults to unchanged gain and no sample-rate ceiling. FLAC pass-through requires unchanged audio.
 
-## Materialization and inspection
+## Encodes and inspection
 
-`ritornelctl transcode encoders` lists the detected programs. `ritornelctl transcode stats` reports the effective profiles, worker count, used bytes, budget and entry counts. With `--json`, settings include the source of each value.
+`ritornelctl transcode encoders` lists the detected programs. `ritornelctl transcode stats` reports the effective profiles, worker count, used bytes, budget and how many encodes are cached. With `--json`, settings include the source of each value.
 
 ```text
-ritornelctl transcode run --profile mp3-v2 <appearance-id>
-ritornelctl transcode run --profile opus-160 --derivative <appearance-id> <appearance-id>
+ritornelctl transcode run --profile mp3-v2 <appearance-id> <appearance-id>
 ritornelctl transcode prune
 ```
 
-A full session on the hub submits one to 128 track appearance IDs to `transcode.start`. The durable job records the resolved profile and selects a local, present lossless copy of each appearance. MP3 and Opus stream decoded PCM to the selected encoder. The FLAC profile packages a copy of an existing FLAC master. A missing lossless copy or unavailable encoder fails the job with a reason. The CLI waits for the terminal job and returns a failing exit status on error. Interrupting the CLI leaves the durable job on the hub. A client can cancel it with `jobs.cancel`.
+A full session on the hub submits one to 128 track appearance IDs to `transcode.start`, which warms the encode cache. The durable job records the resolved profile and chooses a copy of each appearance by the source policy (`choose_source`): a lossless master is encoded, or passed through for native FLAC; a lossy master is passed through where its codec is the profile's, and is never encoded again. The CLI waits for the job and returns a failing exit status if the job failed or any track was blocked or failed. Interrupting the CLI leaves the durable job on the hub. A client can cancel it with `jobs.cancel`.
 
-A derivative contains encoded audio. A package adds the catalog title, artist, album, disc and track numbers when available, and, when its source is available, embeds the selected cover as a baseline JPEG up to 500 pixels on its longest side. MP3 packages use ID3v2 and an ID3v1 trailer. Opus and FLAC use Vorbis comments and embedded pictures. Changing tags or artwork creates a new package key and can reuse the derivative. Pass-through FLAC has only a packaged result.
+`jobs.get` answers one outcome for each appearance, in request order, so one blocked or failed track never hides the others: `encoded` with its key, exact byte length, full BLAKE3 digest and sampled digest over the first and last MiB; `passed_through` with the master's codec; `blocked` with a reason; or `failed` with what went wrong. `transcode.prune` removes the encodes nothing holds. The server leaves the masters in place.
 
-`jobs.get` returns completed artifacts in request order. Each identifies its layer, key, exact byte length, full BLAKE3 digest and sampled digest over the first and last MiB. `transcode.prune` removes unpinned entries from both layers. The server leaves the masters in place.
+## Tagged copies and prepared transfers
+
+The cache keeps encodes and nothing else. A tagged copy (`TaggedCopy`) is the audio, a master's own or its encode, with the projected tags and cover written onto it: the catalog title, artist, album, album artist, year, disc and track numbers, the master's ReplayGain figures, and Ritornel's own identifier. MP3 uses ID3v2.3, with ReplayGain and the identifier as `TXXX` frames ordered by frame ID and then description, and an ID3v1 trailer only where asked. Opus and FLAC use Vorbis comments and embedded pictures. The cover is a baseline JPEG up to the asked size on its longest side. The same inputs make the same bytes every time.
+
+A tagged copy is made for one transfer and never cached. `TranscodePool::prepare` answers a `PreparedTransfer`: an ID, an exact length, a BLAKE3 digest of the bytes, the sampled hash and a reader. The copy behind it is a scratch file under `cache/tmp/` that the transfer owns and deletes; a start clears what a dead run left. The encode it was tagged from stays held until the transfer ends. Scratch files are no part of the budget: they are bounded by how many transfers a sync prepares ahead of its writer. See the [devices guide](device-sync.md) for how a sync uses them.
 
 ## Downloads
 
-Materialization and pruning require a full session on the hub. Once the caller supplies a published key, a linked client can download it with its link-session bearer token. A completed job retains the key but releases its pin, so eviction or pruning can cause a subsequent download to return 404. `GET /v1/cache/derivative/{key}` streams audio and `GET /v1/cache/packaged/{key}` streams the tagged file. The hub pins the entry for the lifetime of the response. It serves the file directly with its exact `Content-Length`. A client can use `HEAD` to inspect headers or request one byte range to resume a transfer. The strong `ETag` is the full file digest. A matching `If-Range` resumes the selected bytes and a stale validator returns the entire current file. See the [contract](contract.md#transport-routes-and-authentication) for response codes.
+Encoding and pruning require a full session on the hub. Once the caller supplies a cached key, a linked client can download it with its link-session bearer token. A completed job retains the key but releases its hold, so eviction or pruning can cause a subsequent download to return 404. `GET /v1/cache/derivative/{key}` streams the encode. The hub holds the entry for the lifetime of the response. It serves the file directly with its exact `Content-Length`. A client can use `HEAD` to inspect headers or request one byte range to resume a transfer. The strong `ETag` is the full file digest. A matching `If-Range` resumes the selected bytes and a stale validator returns the entire current file. See the [contract](contract.md#transport-routes-and-authentication) for response codes.
 
 ## Decisions
 
-- **Split audio from presentation.** The derivative key includes the scanned audio hash scheme and digest, encoder version, compatibility epoch, profile and DSP inputs. The package key adds the projected tags, artwork, resize and packaging options. An artwork edit therefore costs a packaging pass while a change to the encoder can require a new encode.
-- **Serve published files by digest.** The hub decodes the key into 32 bytes and looks up the requested layer in its index. Only a completed entry has a downloadable size and hashes. An evicted file yields a cache miss, which lets clients distinguish a missing artifact from an incomplete transfer.
+- **Encodes are cached and tagged copies are not.** An encode costs seconds and is worth keeping; a tagged copy costs milliseconds. Kept in the cache, tagged copies pushed the encodes they were made from out of it, so the budget now caps encodes alone and a copy lives only as long as its transfer.
+- **The encode key is the audio and the settings.** It includes the scanned audio hash scheme and digest, encoder version, compatibility epoch, profile and DSP inputs, and nothing of the tags or cover: a retag or an artwork edit costs a tagging pass, and a change to the encoder can require a new encode.
+- **A caller gets a stream by key, never a path.** A prepared transfer has a length and a digest of its own and hands out readers, so where a tagged copy sits between being made and being sent can change without touching what sends it.
+- **Serve cached encodes by digest.** The hub decodes the key into 32 bytes and looks it up in its index. Only a completed entry has a downloadable size and hashes. An evicted file yields a cache miss, which lets clients distinguish a missing encode from an incomplete transfer.

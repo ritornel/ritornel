@@ -414,15 +414,7 @@ fn router(core: Arc<Core>, tickets: Arc<Tickets>) -> Router {
         .route(route::WS, get(socket))
         .route(
             &format!("{}/{{key}}", route::CACHE_DERIVATIVE),
-            get(cache::cached).layer(Extension(
-                ritornel_contract::transcode::ArtifactLayer::Derivative,
-            )),
-        )
-        .route(
-            &format!("{}/{{key}}", route::CACHE_PACKAGED),
-            get(cache::cached).layer(Extension(
-                ritornel_contract::transcode::ArtifactLayer::Packaged,
-            )),
+            get(cache::cached),
         )
         .route(&format!("{}/{{art}}/{{size}}", route::ART), get(art))
         .route(

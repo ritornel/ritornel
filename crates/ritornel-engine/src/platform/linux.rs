@@ -15,3 +15,8 @@ pub(crate) fn mono_ms() -> i64 {
 pub(crate) fn read_boot() -> Option<Id> {
     super::boot_id(&std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?)
 }
+
+/// Ejecting the drive a folder is on is not built for Linux yet.
+pub(crate) fn eject(_folder: &std::path::Path) -> std::io::Result<()> {
+    Err(super::no_eject())
+}

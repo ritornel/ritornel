@@ -1,4 +1,4 @@
-//! Encoder capabilities, reported profiles, materialization jobs and download keys.
+//! Encoder capabilities, reported profiles, encode jobs and download keys.
 
 use serde::{Deserialize, Serialize};
 
@@ -66,7 +66,7 @@ pub enum Target {
         /// Bitrate control mode.
         vbr: Vbr,
     },
-    /// Package a FLAC master with unchanged audio packets.
+    /// A FLAC master with unchanged audio packets: nothing is encoded.
     Flac {},
 }
 
@@ -102,30 +102,17 @@ pub struct TranscodeStatus {
     pub encoders: Vec<EncoderCapability>,
     /// Built-ins overlaid by the winning profile table. The source identifies the overlay.
     pub profiles: crate::Setting<std::collections::BTreeMap<String, Profile>>,
-    /// Maximum number of simultaneous encode or package tasks.
+    /// Maximum number of simultaneous encodes.
     pub workers: crate::Setting<u32>,
     /// Maximum cache size in bytes, subject to active pins.
     pub budget_bytes: crate::Setting<u64>,
-    /// Bytes occupied by indexed files across both layers.
+    /// Bytes occupied by cached encodes.
     pub used_bytes: u64,
-    /// Number of encoded audio entries.
+    /// Number of cached encodes.
     pub derivatives: u64,
-    /// Number of tagged artifact entries.
-    pub packages: u64,
 }
 
-/// The cache layer that holds the requested file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(test, derive(ts_rs::TS))]
-#[serde(rename_all = "lowercase")]
-pub enum ArtifactLayer {
-    /// Encoded audio without catalog tags or cover art.
-    Derivative,
-    /// A file with the projected metadata and available artwork.
-    Packaged,
-}
-
-/// Materialize a batch on the library hub.
+/// Warm the encode cache for a batch on the library hub.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
@@ -136,8 +123,6 @@ pub struct TranscodeParams {
     pub appearances: Vec<crate::Id>,
     /// Name of the configured profile.
     pub profile: String,
-    /// Which cache route serves the output.
-    pub layer: ArtifactLayer,
 }
 
 /// Evict all currently unpinned entries on the hub.
@@ -161,21 +146,50 @@ pub struct JobStarted {
     pub job: crate::Job,
 }
 
-/// One completed output. Its job retains the key after eviction, so a later download can return 404.
+/// What became of one requested appearance. A job answers one for each, in
+/// request order, so one blocked or failed track never hides the others.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
-pub struct TranscodeArtifact {
+pub struct TranscodeOutcome {
     /// Appearance requested by the caller.
     pub appearance_id: crate::Id,
-    /// Which cache route serves the output.
-    pub layer: ArtifactLayer,
-    /// BLAKE3 cache key, encoded as 64 hexadecimal digits.
-    pub key: String,
-    /// Exact length of the published file.
-    pub size_bytes: u64,
-    /// BLAKE3 digest of the entire file.
-    pub file_hash: String,
-    /// BLAKE3 of the first and last MiB, counting overlapping bytes once.
-    pub sampled_hash: String,
+    /// What was made of it, or why nothing was.
+    #[serde(flatten)]
+    pub result: TranscodeResult,
+}
+
+/// One appearance's result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum TranscodeResult {
+    /// The encode is cached. The job retains the key after eviction, so a
+    /// later download can return 404.
+    #[serde(rename_all = "camelCase")]
+    Encoded {
+        /// BLAKE3 cache key, encoded as 64 hexadecimal digits.
+        key: String,
+        /// Exact length of the cached file.
+        size_bytes: u64,
+        /// BLAKE3 digest of the entire file.
+        file_hash: String,
+        /// BLAKE3 of the first and last MiB, counting overlapping bytes once.
+        sampled_hash: String,
+    },
+    /// The master's own audio serves this profile, so nothing was encoded.
+    PassedThrough {
+        /// The master's codec, such as `flac` or `mp3`.
+        codec: String,
+    },
+    /// The track has no copy this profile can be made from.
+    Blocked {
+        /// Why, as a word: `no_source`, `no_format` or `master_unavailable`.
+        reason: String,
+    },
+    /// Making it failed.
+    Failed {
+        /// What went wrong.
+        reason: String,
+    },
 }

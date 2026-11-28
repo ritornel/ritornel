@@ -146,6 +146,7 @@ fn key(event: &Event) -> String {
         | Event::Progress(_)
         | Event::Queue(_) => String::new(),
         Event::List(event) => event.view.clone(),
+        Event::Devices(event) => event.device_id.to_string(),
     }
 }
 
@@ -182,6 +183,17 @@ fn merge(unsent: &mut Event, newer: Event) {
         (Event::List(held), Event::List(new)) => {
             held.library_revision = held.library_revision.max(new.library_revision);
             held.reorder |= new.reorder;
+        }
+        // A hint, with the run whole: every kind of change either had,
+        // and the newer run.
+        (Event::Devices(held), Event::Devices(new)) => {
+            if new.device_revision >= held.device_revision {
+                held.device_revision = new.device_revision;
+                held.run = new.run;
+            }
+            held.changed.extend(new.changed);
+            held.changed.sort_unstable();
+            held.changed.dedup();
         }
         // The key is per topic, so the two are always of one topic.
         _ => {}

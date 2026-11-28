@@ -206,11 +206,12 @@ methods! {
     ScanStart: "scan.start", Command, needs: [LibraryWrite],
     ScanStartParams => ScanStarted;
 
-    /// Materialize local lossless tracks with a named profile on the hub.
+    /// `transcode.start`: warms the encode cache for tracks with a named
+    /// profile on the hub, and answers one outcome for each.
     TranscodeStart: "transcode.start", Command, needs: [ServerManage],
     TranscodeParams => JobStarted;
 
-    /// Remove unpinned audio derivatives and packages on the hub.
+    /// `transcode.prune`: removes the cached encodes nothing holds, on the hub.
     TranscodePrune: "transcode.prune", Command, needs: [ServerManage],
     TranscodePruneParams => JobStarted;
 
@@ -724,6 +725,67 @@ methods! {
     /// `library.revisions`: paged `library_revision` write log, newest first.
     LibraryRevisions: "library.revisions", Query, needs: [StatusRead],
     LibraryRevisionsParams => LibraryRevisionsPage;
+
+    /// `devices.list`: every player and folder the library syncs to.
+    DevicesList: "devices.list", Query, needs: [LibraryRead],
+    NoParams => SyncDevicesList;
+
+    /// `devices.get`: one target's page, with the plan of its next sync
+    /// and the run under way or last finished. A folder's path is left out
+    /// unless the session also holds `folders:manage`.
+    DevicesGet: "devices.get", Query, needs: [LibraryRead],
+    SyncDeviceParams => SyncDeviceDetail;
+
+    /// `devices.formats`: each format on offer for a target, with what its
+    /// content would take in it.
+    DevicesFormats: "devices.formats", Query, needs: [LibraryRead],
+    SyncDeviceParams => SyncFormats;
+
+    /// `devices.actions`: the rows of a plan or of a run, paged, filtered
+    /// and grouped.
+    DevicesActions: "devices.actions", Query, needs: [LibraryRead],
+    SyncActionsParams => SyncActions;
+
+    /// `devices.unmanaged`: the files on a target that Ritornel did not
+    /// write.
+    DevicesUnmanaged: "devices.unmanaged", Query, needs: [LibraryRead],
+    SyncPageParams => SyncUnmanaged;
+
+    /// `devices.plays`: the plays read from a target, newest first.
+    DevicesPlays: "devices.plays", Query, needs: [LibraryRead],
+    SyncPageParams => SyncPlays;
+
+    /// `devices.set`: a target's name, drawing, sources, format and every
+    /// other setting, and whether it is ignored. A new target takes
+    /// settings before it is set up, so its first plan is the real one.
+    DevicesSet: "devices.set", Command, needs: [LibraryWrite],
+    SyncSetParams => SyncDeviceChanged;
+
+    /// `devices.addFolder`: a folder on the server called, as a target.
+    /// Nothing is written to it until its first sync. A folder that is,
+    /// holds or lies inside one of the library's folders, the data
+    /// directory or another target is refused as `invalid`.
+    DevicesAddFolder: "devices.addFolder", Command, needs: [LibraryWrite, FoldersManage],
+    SyncAddFolderParams => SyncDeviceChanged;
+
+    /// `devices.sync`: starts a sync at the plan the person saw, as a job,
+    /// and for a new target sets it up first. `jobs.cancel` stops it. A
+    /// target that is syncing already refuses with `conflict`.
+    DevicesSync: "devices.sync", Command, needs: [LibraryWrite],
+    SyncStartParams => SyncStarted;
+
+    /// `devices.eject`: makes a target safe to unplug. One that cannot be
+    /// ejected, as a folder on a fixed disk, refuses with `unsupported`,
+    /// and one that is syncing with `conflict`.
+    DevicesEject: "devices.eject", Command, needs: [LibraryWrite],
+    SyncDeviceCommandParams => SyncDeviceChanged;
+
+    /// `devices.forget`: ends a target. Its records of what it wrote are
+    /// closed, its runs stay as history, and the files on it are left as
+    /// they are, no longer Ritornel's. One that is syncing refuses with
+    /// `conflict`.
+    DevicesForget: "devices.forget", Command, needs: [LibraryWrite],
+    SyncDeviceCommandParams => SyncDeviceChanged;
 }
 
 /// The row of the table for the method named `name`, if there is one.
@@ -847,7 +909,18 @@ mod tests {
                 "inspect.entity",
                 "inspect.play",
                 "inspect.conflicts",
-                "library.revisions"
+                "library.revisions",
+                "devices.list",
+                "devices.get",
+                "devices.formats",
+                "devices.actions",
+                "devices.unmanaged",
+                "devices.plays",
+                "devices.set",
+                "devices.addFolder",
+                "devices.sync",
+                "devices.eject",
+                "devices.forget",
             ]
         );
         assert_eq!(method("server.status").unwrap().result, "ServerStatus");

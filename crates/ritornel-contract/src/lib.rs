@@ -40,6 +40,7 @@
 mod command;
 mod corrections;
 mod device;
+mod devices;
 mod error;
 mod event;
 mod frame;
@@ -85,6 +86,20 @@ pub use corrections::{
     ProposalList, UndoParams,
 };
 pub use device::{DeviceKind, Platform, PlayedVia};
+pub use devices::{
+    SyncActionError, SyncActionKind, SyncActionRow, SyncActionState, SyncActions,
+    SyncActionsParams, SyncActivity, SyncAddFolderParams, SyncAmount, SyncAttention,
+    SyncAttentionLevel, SyncBasis, SyncCapabilities, SyncConnection, SyncCounts, SyncDevice,
+    SyncDeviceChange, SyncDeviceChanged, SyncDeviceCommandParams, SyncDeviceDetail, SyncDeviceIcon,
+    SyncDeviceKind, SyncDeviceParams, SyncDevicesEvent, SyncDevicesList, SyncFacts, SyncFigures,
+    SyncFolder, SyncFolderKind, SyncFormat, SyncFormatOption, SyncFormats, SyncGroupBy, SyncHow,
+    SyncLastSync, SyncLossless, SyncMadeFor, SyncOnConnect, SyncOutcome, SyncPageParams, SyncPlan,
+    SyncPlanSource, SyncPlay, SyncPlaylistKind, SyncPlays, SyncPlaysKind, SyncPlaysSummary,
+    SyncRoom, SyncRun, SyncRunFile, SyncRunStep, SyncSelector, SyncSetParams, SyncSettings,
+    SyncSetup, SyncSource, SyncSourceRole, SyncSourceSpec, SyncStartParams, SyncStarted, SyncStep,
+    SyncStepState, SyncTransport, SyncUnit, SyncUnmanaged, SyncUnmanagedFile, SyncUnmanagedSummary,
+    SyncWhenFull,
+};
 pub use error::{ErrorCode, ErrorData, RpcError};
 pub use event::{
     EVENT_METHOD, Event, JobsEvent, LibraryChange, LibraryEvent, ListEvent, ServersEvent,
@@ -183,7 +198,7 @@ pub use ticket::{SocketTicket, TICKET_PARAM};
 /// one contract. A server refuses a client whose number is not its own,
 /// and a satellite refuses a hub of another ("Session and frames" in
 /// docs/internals/contract.md).
-pub const CONTRACT_VERSION: u32 = 8;
+pub const CONTRACT_VERSION: u32 = 9;
 
 /// The capability flags a server may list in its descriptor.
 pub mod capability {
@@ -213,6 +228,10 @@ pub mod capability {
     /// audio output has none, and refuses those calls as `unsupported`
     /// ("Audio pipeline" in docs/internals/playback.md).
     pub const PLAYBACK: &str = "playback";
+
+    /// The hub syncs part of the library to players and folders: the
+    /// `devices.*` calls and the `devices` topic (docs/internals/device-sync.md).
+    pub const DEVICES: &str = "devices";
 
     /// The server can ask MusicBrainz about the library:
     /// `corrections.lookup`. A server built without the catalogue refuses
@@ -252,9 +271,6 @@ pub mod route {
 
     /// An encoded audio derivative, addressed by key and read with a link session.
     pub const CACHE_DERIVATIVE: &str = "/v1/cache/derivative";
-
-    /// A packaged artifact, addressed by key and read with a link session.
-    pub const CACHE_PACKAGED: &str = "/v1/cache/packaged";
 
     /// Whether the server is up: a [`Health`]. It needs a credential.
     pub const HEALTH: &str = "/v1/health";

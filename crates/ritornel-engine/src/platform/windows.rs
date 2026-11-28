@@ -352,3 +352,14 @@ mod tests {
         assert!(met_a_link(&root.open_folder(&["a", "file"]).unwrap_err()));
     }
 }
+
+/// The size of the disk that holds `path`, and the bytes this user may
+/// still write on it.
+pub(crate) fn disk_bytes(path: &Path) -> Option<(u64, u64)> {
+    ritornel_windows::file::disk_bytes(path).ok()
+}
+
+/// Ejecting the drive a folder is on is not built for Windows yet.
+pub(crate) fn eject(_folder: &Path) -> std::io::Result<()> {
+    Err(super::no_eject())
+}

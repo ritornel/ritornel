@@ -1,6 +1,6 @@
 use super::*;
 use crate::testing::{CountingEntropy, FixedClock};
-use crate::transcode::{Artwork, Tags};
+use crate::transcode::{Artwork, CopySource, GainTag, TaggedCopy, Tags};
 use image::GenericImageView;
 use lofty::file::TaggedFileExt;
 use lofty::prelude::Accessor;
@@ -35,7 +35,7 @@ fn picture(color: u8) -> Vec<u8> {
 fn pin(n: u8) -> Pin {
     Pin {
         id: Id::from_bytes([n; 16]),
-        owner: PinOwner::SyncBatch,
+        owner: PinOwner::Batch,
     }
 }
 
@@ -50,8 +50,6 @@ fn store() -> ServerStore {
 #[test]
 fn all_three_formats_round_trip_projected_tags_and_baseline_front_cover() {
     let dir = tempfile::tempdir().unwrap();
-    let db = store();
-    let cache = TranscodeCache::open(&db, dir.path(), pin(1).id, 0).unwrap();
     let cover = picture(221);
     let tags = Tags {
         title: Some("Cloud Orchard 雪".into()),
@@ -62,12 +60,24 @@ fn all_three_formats_round_trip_projected_tags_and_baseline_front_cover() {
         disc: Some(2),
         year: Some(2024),
         genre: Some("Folk".into()),
+        gain: GainTags {
+            track: GainTag {
+                gain_db: Some(-6.25),
+                peak: Some(0.988),
+            },
+            album: GainTag {
+                gain_db: Some(-5.5),
+                peak: None,
+            },
+        },
+        ritornel_id: Some("1:library:item:appearance".into()),
     };
+    let cancel = AtomicBool::new(false);
     for codec in [Codec::Flac, Codec::Mp3, Codec::Opus] {
         let master = fixture(codec);
         let audio = audio_hash(&master);
         let hash = blake3::hash(&fs::read(&master).unwrap());
-        let source = PackageSource::Master {
+        let source = CopySource::Master {
             asset: AudioAsset {
                 scheme: 1,
                 hash: blake3::Hash::from_hex(&audio).unwrap(),
@@ -76,7 +86,7 @@ fn all_three_formats_round_trip_projected_tags_and_baseline_front_cover() {
             facts: crate::playback::FileFacts::of(&master.metadata().unwrap()),
             codec,
         };
-        let package = Package {
+        let copy = TaggedCopy {
             tags: &tags,
             artwork: Some(Artwork {
                 bytes: &cover,
@@ -84,8 +94,9 @@ fn all_three_formats_round_trip_projected_tags_and_baseline_front_cover() {
             }),
             id3v1: codec == Codec::Mp3,
         };
-        let entry = cache.package(&db, source, &package, pin(2)).unwrap();
-        let parsed = lofty::read_from_path(entry.path()).unwrap();
+        let made = dir.path().join(format!("made.{}", codec.extension()));
+        copy.write(source, &made, &cancel).unwrap();
+        let parsed = lofty::read_from_path(&made).unwrap();
         let tag = parsed.primary_tag().unwrap();
         assert_eq!(tag.title().as_deref(), Some("Cloud Orchard 雪"));
         assert_eq!(tag.artist().as_deref(), Some("Invented Trio"));
@@ -93,17 +104,27 @@ fn all_three_formats_round_trip_projected_tags_and_baseline_front_cover() {
         assert_eq!(tag.track(), Some(9));
         assert_eq!(tag.disk(), Some(2));
         assert_eq!(tag.genre().as_deref(), Some("Folk"));
-        assert_eq!(
-            tag.get_string(lofty::tag::ItemKey::AlbumArtist),
-            Some("Winter Trio")
-        );
-        assert_eq!(
-            tag.get_string(lofty::tag::ItemKey::RecordingDate),
-            Some("2024")
-        );
+        let text = |key| tag.get_string(key);
+        use lofty::tag::ItemKey;
+        assert_eq!(text(ItemKey::AlbumArtist), Some("Winter Trio"));
+        assert_eq!(text(ItemKey::RecordingDate), Some("2024"));
+        // ReplayGain as tags the player applies: Vorbis comments, or in an
+        // MP3 `TXXX` frames, which read back under the same keys. A peak
+        // the master had no figure for is not invented.
+        assert_eq!(text(ItemKey::ReplayGainTrackGain), Some("-6.25 dB"));
+        assert_eq!(text(ItemKey::ReplayGainTrackPeak), Some("0.988000"));
+        assert_eq!(text(ItemKey::ReplayGainAlbumGain), Some("-5.50 dB"));
+        assert_eq!(text(ItemKey::ReplayGainAlbumPeak), None);
+        // Ritornel's own identifier, under its own name in every format.
+        let bytes = fs::read(&made).unwrap();
+        let holds = |needle: &[u8]| bytes.windows(needle.len()).any(|at| at == needle);
+        assert!(holds(crate::transcode::RITORNEL_ID.as_bytes()), "{codec:?}");
+        assert!(holds(b"1:library:item:appearance"), "{codec:?}");
         assert_eq!(tag.pictures().len(), 1);
         let data = tag.pictures()[0].data();
+        // A baseline JPEG (SOF0), never a progressive one (SOF2).
         assert!(data.starts_with(&[0xff, 0xd8]) && data.windows(2).any(|m| m == [0xff, 0xc0]));
+        assert!(!data.windows(2).any(|m| m == [0xff, 0xc2]));
         assert_eq!(image::load_from_memory(data).unwrap().dimensions(), (10, 5));
         if codec == Codec::Mp3 {
             assert_eq!(
@@ -111,21 +132,15 @@ fn all_three_formats_round_trip_projected_tags_and_baseline_front_cover() {
                 Some("Cloud Orchard ?")
             );
         }
-        assert_eq!(audio_hash(entry.path()), audio);
+        assert_eq!(audio_hash(&made), audio);
         assert_eq!(hash, blake3::hash(&fs::read(&master).unwrap()));
-        let bytes = fs::read(entry.path()).unwrap();
-        assert_eq!(entry.size_bytes, bytes.len() as u64);
-        assert_eq!(entry.file_hash, blake3::hash(&bytes));
-        assert_eq!(entry.sampled_hash, entry.file_hash);
-        cache.release(&db, pin(2).id).unwrap();
-        assert!(!entry.path().exists());
-        let rebuilt = cache.package(&db, source, &package, pin(2)).unwrap();
-        assert_eq!(
-            fs::read(rebuilt.path()).unwrap(),
-            bytes,
-            "{codec:?} rebuild"
-        );
-        let bad_art = Package {
+        // A tagged copy is the same bytes every time it is made.
+        let again = dir.path().join(format!("again.{}", codec.extension()));
+        copy.write(source, &again, &cancel).unwrap();
+        assert_eq!(fs::read(&again).unwrap(), bytes, "{codec:?} rebuild");
+        // The writer never overwrites: a copy is made at a new name.
+        assert!(copy.write(source, &again, &cancel).is_err());
+        let bad_art = TaggedCopy {
             tags: &tags,
             artwork: Some(Artwork {
                 bytes: b"invalid",
@@ -133,19 +148,32 @@ fn all_three_formats_round_trip_projected_tags_and_baseline_front_cover() {
             }),
             id3v1: false,
         };
-        assert!(cache.package(&db, source, &bad_art, pin(3)).is_err());
-        let removed = Package {
+        let bad = dir.path().join(format!("bad.{}", codec.extension()));
+        assert!(bad_art.write(source, &bad, &cancel).is_err());
+        let removed = TaggedCopy {
             tags: &Tags::default(),
             artwork: None,
             id3v1: false,
         };
-        let bare = cache.package(&db, source, &removed, pin(3)).unwrap();
-        let parsed = lofty::read_from_path(bare.path()).unwrap();
+        let bare = dir.path().join(format!("bare.{}", codec.extension()));
+        removed.write(source, &bare, &cancel).unwrap();
+        let parsed = lofty::read_from_path(&bare).unwrap();
         assert!(
             parsed
                 .tags()
                 .iter()
                 .all(|t| t.title().is_none() && t.pictures().is_empty())
+        );
+        // An ID3v1 trailer is an MP3's alone.
+        let trailer = TaggedCopy {
+            tags: &tags,
+            artwork: None,
+            id3v1: true,
+        };
+        let trailed = dir.path().join(format!("trailed.{}", codec.extension()));
+        assert_eq!(
+            trailer.write(source, &trailed, &cancel).is_ok(),
+            codec == Codec::Mp3
         );
     }
 }
@@ -170,10 +198,10 @@ fn encoder() -> EncoderId {
 }
 
 #[test]
-fn retag_and_cover_changes_reuse_audio_and_hits_only_touch_the_index() {
+fn a_hit_only_touches_the_index_and_a_size_outlives_eviction() {
     let dir = tempfile::tempdir().unwrap();
     let db = store();
-    let cache = TranscodeCache::open(&db, dir.path(), pin(1).id, u64::MAX).unwrap();
+    let mut cache = TranscodeCache::open(&db, dir.path(), pin(1).id, u64::MAX).unwrap();
     let id = encoder();
     let original = cache
         .derivative(&db, spec(&id, 1), pin(2), |out, _| {
@@ -181,53 +209,35 @@ fn retag_and_cover_changes_reuse_audio_and_hits_only_touch_the_index() {
         })
         .unwrap();
     let mtime = original.path().metadata().unwrap().modified().unwrap();
-    let mut keys = HashSet::new();
-    for (title, color, size) in [
-        ("One", 9, 20),
-        ("Two", 9, 20),
-        ("Two", 10, 20),
-        ("Two", 10, 10),
-    ] {
-        let derivative = cache
-            .derivative(&db, spec(&id, 1), pin(3), |_, _| {
+    for n in [3, 4] {
+        let hit = cache
+            .derivative(&db, spec(&id, 1), pin(n), |_, _| {
                 panic!("cache hit encoded again")
             })
             .unwrap();
-        let tags = Tags {
-            title: Some(title.into()),
-            ..Tags::default()
-        };
-        let art = picture(color);
-        let package = Package {
-            tags: &tags,
-            artwork: Some(Artwork {
-                bytes: &art,
-                max_side: size,
-            }),
-            id3v1: false,
-        };
-        let entry = cache
-            .package(
-                &db,
-                PackageSource::Derivative(&derivative),
-                &package,
-                pin(3),
-            )
-            .unwrap();
-        assert!(keys.insert(entry.key()));
-        assert_eq!(
-            cache.size_hint(&db, entry.key()).unwrap(),
-            Some(entry.size_bytes)
-        );
+        assert_eq!(hit.file_hash, original.file_hash);
     }
     assert_eq!(
         mtime,
         original.path().metadata().unwrap().modified().unwrap()
     );
+    assert!(cache.holds(&db, original.key()).unwrap());
+    assert_eq!(cache.usage(&db).unwrap(), (original.size_bytes, 1));
+    // Let go and evicted, its exact size is still known, for an estimate.
+    cache.budget = 0;
+    for n in [2, 3, 4] {
+        cache.release(&db, pin(n).id).unwrap();
+    }
+    assert!(!original.path().exists());
+    assert!(!cache.holds(&db, original.key()).unwrap());
+    assert_eq!(
+        cache.size_hint(&db, original.key()).unwrap(),
+        Some(original.size_bytes)
+    );
 }
 
 #[test]
-fn eviction_favors_derivatives_over_packages_and_respects_every_pin() {
+fn the_budget_caps_kept_encodes_and_respects_every_pin() {
     let temp = tempfile::tempdir().unwrap();
     let db = store();
     let mut cache = TranscodeCache::open(&db, temp.path(), pin(1).id, u64::MAX).unwrap();
@@ -237,41 +247,24 @@ fn eviction_favors_derivatives_over_packages_and_respects_every_pin() {
             fs::copy(fixture(Codec::Mp3), p).map(|_| ())
         })
         .unwrap();
-    let tags = Tags {
-        title: Some("Alder".into()),
-        ..Tags::default()
-    };
-    let package = Package {
-        tags: &tags,
-        artwork: None,
-        id3v1: false,
-    };
-    let copy = cache
-        .package(&db, PackageSource::Derivative(&base), &package, pin(3))
-        .unwrap();
-    cache
-        .derivative(&db, spec(&id, 1), pin(4), |_, _| panic!())
-        .unwrap();
-    cache.release(&db, pin(2).id).unwrap();
-    cache.release(&db, pin(3).id).unwrap();
-    cache.budget = base.size_bytes;
-    cache.release(&db, pin(4).id).unwrap();
-    assert!(base.path().exists());
-    assert!(!copy.path().exists());
-    assert_eq!(
-        cache.size_hint(&db, copy.key()).unwrap(),
-        Some(copy.size_bytes)
-    );
+    // A tagged copy is a scratch file of its transfer's own: it is no row
+    // of the index and no part of the budget.
+    let scratch = cache.scratch().unwrap();
+    fs::write(&scratch, vec![0; 4096]).unwrap();
+    assert_eq!(cache.usage(&db).unwrap(), (base.size_bytes, 1));
     cache.budget = 0;
     for n in [5, 6] {
         cache
             .derivative(&db, spec(&id, 1), pin(n), |_, _| panic!())
             .unwrap();
     }
+    // Over its budget only by the encodes in use at that moment.
+    cache.release(&db, pin(2).id).unwrap();
     cache.release(&db, pin(5).id).unwrap();
     assert!(base.path().exists());
     cache.release(&db, pin(6).id).unwrap();
     assert!(!base.path().exists());
+    assert!(scratch.exists());
 }
 
 #[test]
@@ -307,8 +300,15 @@ fn failed_production_and_restart_clear_partials_orphans_missing_rows_and_old_pin
     fs::write(stale.join("audio.part"), b"part").unwrap();
     let loose = temp.path().join("tmp/lost.part");
     fs::write(&loose, b"part").unwrap();
+    // A tagged copy whose transfer a dead run held, and what an older
+    // cache kept as its packaged layer.
+    let scratch = cache.scratch().unwrap().keep().unwrap();
+    let packaged = temp.path().join("packaged/ab");
+    fs::create_dir_all(&packaged).unwrap();
+    fs::write(packaged.join("old.flac"), b"tagged").unwrap();
     TranscodeCache::open(&db, temp.path(), pin(3).id, 0).unwrap();
     assert!([entry.path(), &stale, &orphan].iter().all(|p| !p.exists()));
+    assert!(!scratch.exists() && !temp.path().join("packaged").exists());
     assert!(
         loose.exists(),
         "the cover cache owns its loose staging files"

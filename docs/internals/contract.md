@@ -27,7 +27,6 @@ The server exposes a single HTTP/1.1 listener (`apps/server/src/listener.rs`), o
 | `/v1/art/{artId}/{size}` | `GET` | Bearer (`library:read`) or `?token=` | Immutable JPEG cover art at a fixed size bucket. |
 | `/v1/audio/{appearanceId}/{sourceItemId}/{revision}` | `GET` | Bearer, link session only, over TLS | A master, for a satellite to play, as `link.copies` named it. |
 | `/v1/cache/derivative/{key}` | `GET`, `HEAD` | Bearer, link session only, over TLS | Encoded audio with its exact byte count. |
-| `/v1/cache/packaged/{key}` | `GET`, `HEAD` | Bearer, link session only, over TLS | Tagged audio with its cover and exact byte count. |
 | `/v1/link` | `POST` | Invite secret in the body, over TLS (no `Origin`) | A server joining this hub as a satellite: trades a `LinkRequest` for a `LinkGranted` link-session token. |
 
 Every route is served over plain HTTP or over TLS pinned to the server's identity key, which the connection's first byte chooses (see ["Listener and transport boundaries" in `docs/internals/linking.md`](linking.md#listener-and-transport-boundaries)). A link session's token is taken over TLS alone, and over plain HTTP gets the same `401` as an unknown one. `POST /v1/link` over plain HTTP is `409`, saying the joining server runs an older release, and withdraws the invite it names, since its secret has travelled where anyone could read it.
@@ -140,6 +139,7 @@ Sessions opt into server-pushed notifications via `events.subscribe` and `events
 | `playback` | Full `PlaybackState` snapshot | Player | Replace playback state (keep `revision >=` current). |
 | `progress` | `entryId`, `positionMs`, `playing` | Player | Anchor position and extrapolate locally between ~1 s ticks. |
 | `queue` | `queueRevision` | Player | Re-read visible queue windows. |
+| `devices` | `deviceId`, `deviceRevision`, `changed` (`state`, `settings`, `plan`, `actions`, `plays`), and the `run` whole while one is under way | `deviceId` | Read `devices.get` again, and the visible window of `devices.actions` when `actions` changed. |
 
 For `playback`, `progress` and `queue`, `events.subscribe` and `events.unsubscribe` accept a `player` ID from `players.list`. The reply echoes the requested player and lists the topics held for that player. Without a target the reply lists the local session topics. Remote player subscriptions coexist with local topics. A satellite restores its clients' remote subscriptions when their hub connections return, and drops them when the client disconnects. Delivered player events carry `player` only for another server's player.
 
@@ -153,6 +153,26 @@ Every mutating call (`MethodKind::Command`) carries a client-generated UUID `ide
 - **Optimistic concurrency:** Queue mutation calls (`queue.add`, `queue.remove`, `queue.move`, `queue.clear`) accept optional `expectedRevision` and return `conflict` with `details.currentRevision` if the queue moved.
 - **Retry-safe playback:** There is no play/pause toggle; `playback.set` takes absolute `volume` (0–1), `muted`, `shuffle`, and `repeat`; `playback.seek` and `playback.skip` name the target `entryId` / `fromEntryId` so late retries cannot seek or skip a different track; queue mutations address entries by `entryId`, never by index. `playback.play` and `queue.add` accept `PlaySource` (`tracks`, `release`, or `view`, copying IDs out of the view snapshot into the queue); `queue.add` supports `playIfEmpty`. A server without an audio output omits the `playback` capability and refuses calls for its own player with `unsupported` and reason `no_player`. See [Routing playback and queue calls](#routing-playback-and-queue-calls) for remote targets.
 - **Durable jobs:** Long-running work (`scan.start`, `transcode.start`, `transcode.prune`, `lastfm.sync`, `imports.dryRun`, `imports.apply`, `imports.undo`) creates or returns a durable `Job` in `server.db` (`queued`, `running`, `cancelling`, `succeeded`, `failed`, `cancelled`) with counters (`done`, `total`, `bytes`, `failed`, `skipped`), `label`, `error`, and kind-specific summaries (`scan`, `sync`). Starting a scan for a root already being scanned returns the running job. `jobs.list` returns up to 100 recent jobs; `jobs.get` returns a job, up to 100 failed `JobItem` rows and, for a successful materialization, its ordered artifact keys and hashes; `jobs.cancel` requests cooperative cancellation before the next library transaction begins, and once acknowledged the job never ends `succeeded` (ending `cancelled` even if a transaction already in flight committed, or `failed` if an in-flight step errored), so clients read what was applied from the library or import run rather than inferring it from the job's terminal state.
+
+## Devices
+
+The `devices.*` calls serve the Devices tab; the [devices guide](device-sync.md) covers what is behind them. Reads need `library:read` and commands `library:write`; `devices.addFolder` also needs `folders:manage`, since it names a folder on the server called. The wire types are `SyncDevice…`, since `DeviceKind` already names what a listen played on.
+
+| Call | Kind | Serves |
+|---|---|---|
+| `devices.list` | Query | Every target, for the column of device tabs: kind, family, transport, name, icon, `setup`, `connection`, `activity`, `attention`, what its next sync would copy, its last sync and `deviceRevision`. |
+| `devices.get` | Query | One target's page: facts, capabilities, room, settings, sources with what each comes to, the plan of its next sync, and the run under way or the last. A folder's path is left out without `folders:manage`. |
+| `devices.formats` | Query | Each format on offer, with what the target's content would take in it and whether it fits. |
+| `devices.actions` | Query | The rows of a plan (`planRevision`) or of a run (`runId`), filtered by `kind` and `state`, grouped by album or a row a track, at most 500 a call. `parentId` reads one group's tracks. A revision that is no longer the plan's answers `plan_stale`. |
+| `devices.unmanaged` | Query | The files in the music root that Ritornel did not write. |
+| `devices.plays` | Query | The plays read from a target. No family reads any yet. |
+| `devices.set` | Command | Name, icon, whether it is ignored, the whole list of sources, format, cover size, ID3v1, reserve, limit, and for a folder what it is made for, its kind and the codecs it plays. |
+| `devices.addFolder` | Command | A folder on the server called, as a target. Nothing is written until its first sync. |
+| `devices.sync` | Command | Starts the `devices.sync` job at the `planRevision` the person saw. `adopt` is required for a target not yet set up, and `acceptCut` when the plan does not fit and the target asks. `jobs.cancel` stops it. |
+| `devices.eject` | Command | Makes a removable target safe to unplug. It records nothing, so a resend ejects again. |
+| `devices.forget` | Command | Ends a target. Its files are left as they are. |
+
+A plan is a preview and its rows are all `waiting`; a run's rows are its stored actions, so after a run the done, skipped, failed and in-doubt rows are all still there to read until the next run replaces them, when a call for the older run answers `not_found` with `reason: "actions_expired"`. A target that is syncing refuses `devices.sync`, `devices.eject`, `devices.forget` and a change of what goes on it with `conflict` and `reason: "busy"`.
 
 ## Media
 
@@ -189,6 +209,7 @@ Clients gate optional behavior on `PublicDescriptor.capabilities` rather than ve
 - `media.art` — `media.token` and `GET /v1/art/{artId}/{size}` (supported sizes in `artSizes`).
 - `players` — player discovery, the `players` topic, and routing playback and queue calls on a hub or a linked satellite.
 - `playback` — `playback.*` and `queue.*` calls and `playback`, `progress`, `queue` topics (advertised only when the server has a player).
+- `devices` — `devices.*` calls and the `devices` topic (advertised by a hub).
 
 ## Database inspection
 
@@ -209,6 +230,7 @@ The methods registered in `crates/ritornel-contract/src/methods.rs`, by area (se
 |---|---|
 | Session & server | `server.hello`, `server.status`, `servers.list`, `players.list`, `events.subscribe`, `events.unsubscribe`, `server.backup`, `record.dismiss`, `server.settings`, `server.setSettings` |
 | Transcoding | `transcode.start`, `transcode.prune` |
+| Devices | `devices.list`, `devices.get`, `devices.formats`, `devices.actions`, `devices.unmanaged`, `devices.plays`, `devices.set`, `devices.addFolder`, `devices.sync`, `devices.eject`, `devices.forget` |
 | Linking | `link.invite`, `link.join`, `link.status`, `link.tracks`, `link.copies`, `link.listen`, `link.event`, `link.ping`, `link.handoff` |
 | Library & sources | `library.create`, `sources.list`, `sources.add`, `sources.tracks`, `scan.start`, `library.stats`, `library.setWatching`, `library.settings`, `library.setSettings`, `artists.importPictures`, `artists.pictureFolders` |
 | Jobs & identity | `jobs.list`, `jobs.get`, `jobs.cancel`, `identity.dryRun`, `identity.review` |

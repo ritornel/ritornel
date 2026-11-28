@@ -240,6 +240,11 @@ pub enum JobTarget {
         /// The run's ID.
         id: Id,
     },
+    /// A player or a folder the library syncs to.
+    Device {
+        /// The device's ID.
+        id: Id,
+    },
 }
 
 /// One job: a durable resource, readable after clients disconnect and
@@ -369,9 +374,9 @@ pub struct JobItem {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct JobDetail {
-    /// Outputs from a successful materialization in request order. Job history does not pin them.
+    /// What became of each appearance of a transcode, in request order. Job history does not pin them.
     #[serde(default)]
-    pub artifacts: Vec<crate::transcode::TranscodeArtifact>,
+    pub outcomes: Vec<crate::transcode::TranscodeOutcome>,
     /// The job.
     pub job: Job,
     /// The first of its items that failed.

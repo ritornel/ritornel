@@ -9,7 +9,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Id, Job, Permission, PlaybackEvent, ProgressEvent, QueueEvent, ServerInfo};
+use crate::{
+    Id, Job, Permission, PlaybackEvent, ProgressEvent, QueueEvent, ServerInfo, SyncDevicesEvent,
+};
 
 /// The method of every event notification.
 pub const EVENT_METHOD: &str = "event";
@@ -38,6 +40,9 @@ pub enum Topic {
     Progress,
     /// A hint that the queue changed, with its revision.
     Queue,
+    /// A player or folder the library syncs to changed: a hint to read it
+    /// again, at most four times a second for one target.
+    Devices,
 }
 
 impl Topic {
@@ -56,6 +61,7 @@ impl Topic {
         Self::Playback,
         Self::Progress,
         Self::Queue,
+        Self::Devices,
     ];
 
     /// Whether a session with `permissions` may subscribe to this topic.
@@ -68,7 +74,7 @@ impl Topic {
                 Permission::StatusRead,
             ],
             Self::Jobs => &[Permission::StatusRead],
-            Self::Library | Self::List => &[Permission::LibraryRead],
+            Self::Library | Self::List | Self::Devices => &[Permission::LibraryRead],
             Self::Playback | Self::Progress | Self::Queue => &[Permission::PlaybackControl],
         }
     }
@@ -84,6 +90,7 @@ impl Topic {
             Self::Playback => "playback",
             Self::Progress => "progress",
             Self::Queue => "queue",
+            Self::Devices => "devices",
         }
     }
 }
@@ -109,6 +116,8 @@ pub enum Event {
     Progress(ProgressEvent),
     /// The queue changed.
     Queue(QueueEvent),
+    /// A sync target changed.
+    Devices(Box<SyncDevicesEvent>),
 }
 
 impl Event {
@@ -143,6 +152,7 @@ impl Event {
             Self::Playback(_) => Topic::Playback,
             Self::Progress(_) => Topic::Progress,
             Self::Queue(_) => Topic::Queue,
+            Self::Devices(_) => Topic::Devices,
         }
     }
 }

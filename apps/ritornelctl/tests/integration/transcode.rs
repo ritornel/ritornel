@@ -4,7 +4,7 @@ use super::support::{Scratch, Server, json, ok, ritornelctl};
 use std::path::Path;
 
 #[test]
-fn transcode_inspects_the_hub_packages_lossless_tracks_and_prunes() {
+fn transcode_inspects_the_hub_answers_an_outcome_for_each_track_and_prunes() {
     use ritornel_client::contract::{
         CONTRACT_VERSION, ClientKind, HelloParams, ListKind, ListOpenParams, Row,
     };
@@ -96,27 +96,8 @@ fn transcode_inspects_the_hub_packages_lossless_tracks_and_prunes() {
         stats["profiles"]["value"]["opus-160"]["dsp"]["replayGain"],
         "off"
     );
-    let (code, _, error) = ritornelctl(
-        &dir,
-        &[
-            "transcode",
-            "run",
-            "--profile",
-            "passthrough-flac",
-            "--derivative",
-            &ids[0],
-        ],
-    );
-    assert_eq!(code, Some(1));
-    assert!(
-        error.contains("FLAC pass-through needs the packaged layer"),
-        "{error}"
-    );
-    let single = json(
-        &dir,
-        &["transcode", "run", "--profile", "passthrough-flac", &ids[0]],
-    );
-    assert_eq!(single["job"]["state"], "succeeded");
+    // A FLAC master already is what native FLAC asks for: nothing is
+    // encoded, and each track says so.
     let batch = json(
         &dir,
         &[
@@ -128,36 +109,32 @@ fn transcode_inspects_the_hub_packages_lossless_tracks_and_prunes() {
             &ids[1],
         ],
     );
-    let artifacts = batch["artifacts"].as_array().unwrap();
-    assert_eq!(artifacts.len(), 2);
-    assert_eq!(artifacts[0], single["artifacts"][0]);
-    for (a, id) in artifacts.iter().zip(ids.iter()) {
-        assert_eq!(&a["appearanceId"], id.as_str());
-        assert_eq!(a["layer"], "packaged");
-        assert!(a["sizeBytes"].as_u64().unwrap() > 0);
-        assert_eq!(a["key"].as_str().unwrap().len(), 64);
-        assert_eq!(a["fileHash"], a["sampledHash"]);
+    assert_eq!(batch["job"]["state"], "succeeded");
+    let outcomes = batch["outcomes"].as_array().unwrap();
+    assert_eq!(outcomes.len(), 2);
+    for (outcome, id) in outcomes.iter().zip(ids.iter()) {
+        assert_eq!(&outcome["appearanceId"], id.as_str());
+        assert_eq!(outcome["outcome"], "passed_through");
+        assert_eq!(outcome["codec"], "flac");
     }
-    assert_eq!(json(&dir, &["transcode", "stats"])["packages"], 2);
+    // The cache keeps encodes alone: nothing was made, so nothing is kept.
+    let stats = json(&dir, &["transcode", "stats"]);
+    assert_eq!(
+        (&stats["derivatives"], &stats["usedBytes"]),
+        (&0.into(), &0.into())
+    );
+    assert!(stats.get("packages").is_none());
     for encoder in encoders.as_array().unwrap() {
         let profile = match encoder["family"].as_str().unwrap() {
             "lame" => "mp3-v2",
             "opusenc" => "opus-160",
             family => panic!("unknown encoder {family}"),
         };
-        let result = json(
-            &dir,
-            &[
-                "transcode",
-                "run",
-                "--profile",
-                profile,
-                "--derivative",
-                &ids[0],
-            ],
-        );
-        assert_eq!(result["artifacts"][0]["layer"], "derivative");
-        assert!(result["artifacts"][0]["sizeBytes"].as_u64().unwrap() > 0);
+        let result = json(&dir, &["transcode", "run", "--profile", profile, &ids[0]]);
+        let outcome = &result["outcomes"][0];
+        assert_eq!(outcome["outcome"], "encoded");
+        assert!(outcome["sizeBytes"].as_u64().unwrap() > 0);
+        assert_eq!(outcome["key"].as_str().unwrap().len(), 64);
     }
     let (code, _, stderr) =
         ritornelctl(&dir, &["transcode", "run", "--profile", "missing", &ids[0]]);

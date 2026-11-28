@@ -1,14 +1,15 @@
-//! File decoding and encoder backends. See "Transcoding" in docs/internals/playback.md.
+//! File decoding, encoder backends, the encode cache and tagged copies. See
+//! docs/internals/transcoding.md.
 
 mod cache;
 mod cli;
-mod package;
-pub use cache::{CacheEntry, Derivative, Pin, PinOwner, TranscodeCache};
-pub use package::{Artwork, Codec, Package, PackageSource, Tags};
+mod tagging;
+pub use cache::{CacheEntry, Derivative, Pin, PinOwner, TranscodeCache, sampled_hash};
+pub use tagging::{Artwork, Codec, CopySource, RITORNEL_ID, TaggedCopy, Tags};
 mod pool;
 pub use pool::{
-    Batch, BatchItem, BatchProgress, Cover, Encoding, Master, PackageAudio, Packaging,
-    TranscodePool, Transfer,
+    Batch, BatchItem, BatchProgress, Cover, Encoding, Master, PreparedTransfer, Tagging,
+    TranscodePool, Transfer, TransferAudio, TransferRequest,
 };
 
 mod profile;
@@ -233,48 +234,133 @@ fn publish(stage: tempfile::NamedTempFile, output: &Path, cancel: &AtomicBool) -
     Ok(())
 }
 
+/// What one track's file is made from, by the source policy.
+#[derive(Debug, Clone)]
+pub enum Sourced {
+    /// A lossless master, to encode.
+    Encode(Master),
+    /// A master whose own audio serves: nothing is encoded.
+    PassThrough(Master, String),
+    /// No copy can be made into what was asked for, and why, as a word:
+    /// `master_unavailable` where its files are not where the scan found
+    /// them, `no_format` otherwise.
+    Blocked(&'static str),
+}
+
 impl crate::LibraryStore {
-    /// The highest-ranked local lossless copy, restricted to FLAC for pass-through.
-    pub fn transcode_master(
+    /// Chooses the copy of an appearance on `server` that `profile` is
+    /// made from ([`choose_source`]): a lossless master is encoded, or
+    /// passed through for native FLAC; a lossy one is passed through where
+    /// `accepts` takes its codec, and is never encoded again.
+    pub fn transcode_source(
         &self,
         appearance: crate::Id,
         server: crate::Id,
         roots: &std::collections::HashMap<String, std::path::PathBuf>,
-        flac_only: bool,
-    ) -> Result<Option<Master>, crate::Error> {
-        use crate::playback::Catalog;
-        use rusqlite::OptionalExtension;
-        for copy in Catalog::copies(self, appearance, server)? {
-            let Some(path) = copy.path(roots) else {
-                continue;
-            };
-            let asset = self.read(|db| {
-                let sql = "SELECT hash_scheme, audio_hash FROM audio_asset
-                           WHERE public_id = ?1 AND lossless = 1 AND (?2 = 0 OR codec = 'flac')";
-                Ok(db
-                    .query_row(
-                        sql,
-                        rusqlite::params![copy.asset().as_bytes(), flac_only],
-                        |row| {
-                            Ok(AudioAsset {
-                                scheme: row.get(0)?,
-                                hash: row.get::<_, [u8; 32]>(1)?.into(),
-                            })
+        profile: Profile,
+        accepts: impl Fn(&str) -> bool,
+    ) -> Result<Sourced, crate::Error> {
+        use ritornel_domain::selection::Candidate;
+        let found: Vec<(Candidate, String, Master)> = self.read(|db| {
+            let mut statement = db.prepare_cached(
+                "SELECT si.id, aa.id, aa.lossless, aa.sample_rate_hz, aa.bit_depth,
+                        aa.bitrate_kbps, si.missing_since_ms IS NOT NULL, aa.codec,
+                        aa.hash_scheme, aa.audio_hash, lr.name, si.provider_key,
+                        si.size_bytes, si.mtime_ms
+                 FROM assignment a
+                 JOIN source_item si ON si.id = a.source_item_id
+                 JOIN source_item_revision sr ON sr.id = si.current_revision_id
+                 JOIN audio_asset aa ON aa.id = sr.audio_asset_id
+                 JOIN source_instance src ON src.id = si.source_instance_id
+                 JOIN library_root lr ON lr.id = src.root_id
+                 JOIN server s ON s.id = lr.server_id
+                 WHERE a.superseded_at_ms IS NULL
+                   AND si.retired_at_ms IS NULL
+                   AND si.item_kind = 'file'
+                   AND lr.kind = 'master'
+                   AND s.public_id = ?2
+                   AND a.appearance_id IN (
+                     SELECT id FROM track_appearance WHERE canonical_id =
+                       (SELECT canonical_id FROM track_appearance WHERE public_id = ?1))",
+            )?;
+            let rows = statement.query_map((appearance.as_bytes(), server.as_bytes()), |row| {
+                let root: String = row.get(10)?;
+                let rel_path: String = row.get(11)?;
+                Ok((
+                    Candidate {
+                        source_item: row.get(0)?,
+                        asset: row.get(1)?,
+                        lossless: row.get(2)?,
+                        sample_rate_hz: row.get(3)?,
+                        bit_depth: row.get(4)?,
+                        bitrate_kbps: row.get(5)?,
+                        missing: row.get(6)?,
+                    },
+                    row.get::<_, String>(7)?,
+                    (
+                        AudioAsset {
+                            scheme: row.get(8)?,
+                            hash: row.get::<_, [u8; 32]>(9)?.into(),
                         },
-                    )
-                    .optional()?)
+                        root,
+                        rel_path,
+                        FileFacts {
+                            size_bytes: row
+                                .get::<_, Option<i64>>(12)?
+                                .and_then(|size| u64::try_from(size).ok())
+                                .unwrap_or(u64::MAX),
+                            mtime_ms: row.get::<_, Option<i64>>(13)?.unwrap_or(i64::MIN),
+                        },
+                    ),
+                ))
             })?;
-            if let Some(asset) = asset
-                && path.is_file()
-            {
-                return Ok(Some(Master {
-                    asset,
-                    path,
-                    facts: copy.facts(),
-                }));
+            let mut found = Vec::new();
+            for row in rows {
+                let (candidate, codec, (asset, root, rel_path, facts)) = row?;
+                // A copy in a root this server has no folder for cannot be opened.
+                let Some(folder) = roots.get(&root) else {
+                    continue;
+                };
+                found.push((
+                    candidate,
+                    codec,
+                    Master {
+                        path: crate::walk::under(folder, &rel_path),
+                        asset,
+                        facts,
+                    },
+                ));
             }
-        }
-        Ok(None)
+            Ok(found)
+        })?;
+        let copies: Vec<(Candidate, &str)> = found
+            .iter()
+            .map(|(candidate, codec, _)| (candidate.clone(), codec.as_str()))
+            .collect();
+        let master = |chosen: &Candidate| {
+            found
+                .iter()
+                .find(|(candidate, ..)| candidate.source_item == chosen.source_item)
+                .map(|(_, codec, master)| (master.clone(), codec.clone()))
+        };
+        let blocked = if copies.iter().all(|(copy, _)| copy.missing) {
+            "master_unavailable"
+        } else {
+            "no_format"
+        };
+        Ok(
+            match choose_source(&copies, profile, accepts, false).map_err(crate::Error::Io)? {
+                SourceChoice::Encode(copy) => match master(copy) {
+                    Some((master, _)) => Sourced::Encode(master),
+                    None => Sourced::Blocked(blocked),
+                },
+                SourceChoice::PassThrough(copy) => match master(copy) {
+                    Some((master, codec)) => Sourced::PassThrough(master, codec),
+                    None => Sourced::Blocked(blocked),
+                },
+                SourceChoice::Blocked => Sourced::Blocked(blocked),
+            },
+        )
     }
 }
 

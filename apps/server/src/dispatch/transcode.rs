@@ -1,21 +1,20 @@
-//! Hub-local transcode jobs and the cache served to linked clients.
+//! Hub-local transcode jobs and the encode cache served to linked clients.
 
 use super::settings::set_by;
 use super::{Core, Stores};
 use ritornel_contract::methods::{Method, TranscodePrune, TranscodeStart};
 use ritornel_contract::transcode::{
-    ArtifactLayer, EncoderCapability, JobStarted, TranscodeArtifact, TranscodeParams,
+    EncoderCapability, JobStarted, TranscodeOutcome, TranscodeParams, TranscodeResult,
     TranscodeStatus,
 };
 use ritornel_contract::{ErrorCode, Id, Receipt, ReceiptStatus, RpcError, Setting};
 use ritornel_engine::transcode::{
-    BatchItem, Codec, Cover, Encoder, EncoderId, Encoding, LameEncoder, OpusEncoder, PackageAudio,
-    Packaging, Pcm, Profile, ReplayGain, Tags, Target, TranscodePool,
+    BatchItem, Codec, Encoder, EncoderId, Encoding, LameEncoder, OpusEncoder, Pcm, Profile,
+    ReplayGain, Sourced, Target, TranscodePool,
 };
 use ritornel_engine::{
     Command, Error, JobCancel, JobState, JobStop, LibraryStore, NewJob, Progress, ServerStore,
 };
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Weak, atomic::AtomicBool};
 
@@ -31,7 +30,51 @@ pub(crate) struct Transcodes {
 struct BatchRequest {
     appearances: Vec<Id>,
     profile: Profile,
-    layer: ArtifactLayer,
+}
+
+/// The codec a profile makes.
+pub(crate) fn codec_of(target: Target) -> Codec {
+    match target {
+        Target::Mp3 { .. } => Codec::Mp3,
+        Target::Opus { .. } => Codec::Opus,
+        Target::Flac {} => Codec::Flac,
+    }
+}
+
+impl Transcodes {
+    /// The encoder that makes `profile`, with the identity its startup
+    /// probe found: `None` where the program is not there, and for native
+    /// FLAC, which needs none.
+    pub(crate) fn encoding(&self, profile: Profile) -> Option<Encoding> {
+        let (backend, family): (Arc<dyn Encoder>, &str) = match profile.target {
+            Target::Mp3 { .. } => (Arc::new(LameEncoder), "lame"),
+            Target::Opus { .. } => (Arc::new(OpusEncoder), "opusenc"),
+            Target::Flac {} => return None,
+        };
+        let id = self.encoders.iter().find(|e| e.family == family)?.clone();
+        Some(Encoding {
+            backend,
+            id,
+            profile,
+            gain_tags: Default::default(),
+        })
+    }
+
+    /// The detected encoder programs, as the contract lists them.
+    pub(crate) fn capabilities(&self) -> Vec<EncoderCapability> {
+        self.encoders
+            .iter()
+            .map(|e| EncoderCapability {
+                family: e.family.into(),
+                version: e.version.clone(),
+                formats: match e.family {
+                    "lame" => vec!["mp3".into()],
+                    "opusenc" => vec!["opus".into()],
+                    _ => Vec::new(),
+                },
+            })
+            .collect()
+    }
 }
 
 impl Core {
@@ -49,7 +92,7 @@ impl Core {
         let Some(s) = self.transcodes() else {
             return Ok(None);
         };
-        let (used_bytes, derivatives, packages) = s
+        let (used_bytes, derivatives) = s
             .pool
             .cache()
             .usage(stores.server())
@@ -57,7 +100,6 @@ impl Core {
         Ok(Some(TranscodeStatus {
             used_bytes,
             derivatives,
-            packages,
             budget_bytes: Setting {
                 value: s.config.budget,
                 set_by: set_by(s.origins.transcode_cache_size),
@@ -76,19 +118,7 @@ impl Core {
                     .collect(),
                 set_by: set_by(s.origins.transcode_profiles),
             },
-            encoders: s
-                .encoders
-                .iter()
-                .map(|e| EncoderCapability {
-                    family: e.family.into(),
-                    version: e.version.clone(),
-                    formats: match e.family {
-                        "lame" => vec!["mp3".into()],
-                        "opusenc" => vec!["opus".into()],
-                        _ => Vec::new(),
-                    },
-                })
-                .collect(),
+            encoders: s.capabilities(),
         }))
     }
 
@@ -118,19 +148,9 @@ impl Core {
             .profiles
             .get(&p.profile)
             .ok_or_else(|| RpcError::new(ErrorCode::Invalid, "unknown transcode profile"))?;
-        if matches!(
-            (profile.target, p.layer),
-            (Target::Flac {}, ArtifactLayer::Derivative)
-        ) {
-            return Err(RpcError::new(
-                ErrorCode::Invalid,
-                "FLAC pass-through needs the packaged layer",
-            ));
-        }
         let request = BatchRequest {
             appearances: p.appearances.clone(),
             profile,
-            layer: p.layer,
         };
         serde_json::to_string(&request)
             .map_err(|_| RpcError::new(ErrorCode::Internal, "cannot serialize transcode request"))
@@ -204,9 +224,12 @@ impl Core {
             }
             let request: BatchRequest =
                 serde_json::from_str(&job.params_json).map_err(Error::Json)?;
-            let items = self
+            // One outcome for each appearance: what is not encoded is
+            // settled here, and the rest by the batch.
+            let (mut outcomes, items) = self
                 .with_library(|store, lib| s.items(lib, store, self.server_id, &request, &cancel))
                 .ok_or(Error::NoLibrary)??;
+            let (slots, items): (Vec<usize>, Vec<BatchItem>) = items.into_iter().unzip();
             let runtime = self.runtime.as_ref().ok_or(Error::WriterStopped)?;
             let mut bytes = 0i64;
             let mut saved = std::time::Instant::now();
@@ -227,25 +250,39 @@ impl Core {
                     }
                 }
             }))?;
-            let artifacts: Vec<_> = batch
-                .entries()
-                .zip(request.appearances)
-                .map(|(entry, appearance_id)| TranscodeArtifact {
-                    appearance_id,
-                    layer: request.layer,
-                    key: entry.key().to_hex().to_string(),
-                    size_bytes: entry.size_bytes,
-                    file_hash: entry.file_hash.to_hex().to_string(),
-                    sampled_hash: entry.sampled_hash.to_hex().to_string(),
+            for (slot, result) in slots.into_iter().zip(batch.results()) {
+                let result = match result {
+                    Ok(entry) => TranscodeResult::Encoded {
+                        key: entry.key().to_hex().to_string(),
+                        size_bytes: entry.size_bytes,
+                        file_hash: entry.file_hash.to_hex().to_string(),
+                        sampled_hash: entry.sampled_hash.to_hex().to_string(),
+                    },
+                    Err(error) => TranscodeResult::Failed {
+                        reason: error.to_string(),
+                    },
+                };
+                if let Some(outcome) = outcomes.get_mut(slot) {
+                    outcome.result = result;
+                }
+            }
+            let done = outcomes.len() as i64;
+            let failed = outcomes
+                .iter()
+                .filter(|outcome| {
+                    matches!(
+                        outcome.result,
+                        TranscodeResult::Blocked { .. } | TranscodeResult::Failed { .. }
+                    )
                 })
-                .collect();
-            let done = artifacts.len() as i64;
+                .count() as i64;
             let progress = Progress {
                 step: 1,
                 done,
                 total: Some(done),
                 bytes,
-                checkpoint_json: Some(serde_json::to_string(&artifacts).map_err(Error::Json)?),
+                failed,
+                checkpoint_json: Some(serde_json::to_string(&outcomes).map_err(Error::Json)?),
                 ..Default::default()
             };
             self.with_stores(|stores| stores.server().save_progress(job.id, progress))
@@ -267,6 +304,9 @@ impl Core {
 }
 
 impl Transcodes {
+    /// One outcome for each appearance, and the encodes still to make,
+    /// each with the outcome it fills in.
+    #[allow(clippy::type_complexity)]
     fn items(
         &self,
         library: &LibraryStore,
@@ -274,88 +314,52 @@ impl Transcodes {
         server: Id,
         request: &BatchRequest,
         cancel: &JobCancel,
-    ) -> Result<Vec<BatchItem>, Error> {
-        let roots = store.roots()?;
-        let paths = roots
-            .iter()
-            .map(|(n, p)| (n.clone(), PathBuf::from(p)))
+    ) -> Result<(Vec<TranscodeOutcome>, Vec<(usize, BatchItem)>), Error> {
+        let paths = store
+            .roots()?
+            .into_iter()
+            .map(|(n, p)| (n, PathBuf::from(p)))
             .collect();
-        let mut covers: HashMap<Id, Option<Cover>> = HashMap::new();
-        let backend: Option<(Arc<dyn Encoder>, &str)> = match request.profile.target {
-            Target::Mp3 { .. } => Some((Arc::new(LameEncoder), "lame")),
-            Target::Opus { .. } => Some((Arc::new(OpusEncoder), "opusenc")),
-            Target::Flac {} => None,
-        };
+        let made = codec_of(request.profile.target);
+        let mut outcomes = Vec::new();
         let mut items = Vec::new();
         for id in &request.appearances {
             if let Some(stop) = cancel.stopped() {
                 return Err(Error::JobStopped(stop));
             }
-            let master = library
-                .transcode_master(*id, server, &paths, backend.is_none())?
-                .ok_or_else(|| {
-                    Error::Io(std::io::Error::other(format!(
-                        "appearance {id} has no eligible local lossless master"
-                    )))
+            // A lossy master serves only a profile of its own codec.
+            let sourced =
+                library.transcode_source(*id, server, &paths, request.profile, |codec| {
+                    codec == made.extension()
                 })?;
-            let audio = if let Some((backend, family)) = &backend {
-                let encoder = self
-                    .encoders
-                    .iter()
-                    .find(|e| e.family == *family)
-                    .ok_or(Error::Invalid("the profile's encoder is unavailable"))?;
-                let gain_tags = if request.profile.dsp.replay_gain == ReplayGain::Off {
-                    Default::default()
-                } else {
-                    Pcm::open(&master.path, Some(master.facts))
-                        .map_err(Error::Io)?
-                        .gain_tags()
-                };
-                let encoding = Encoding {
-                    backend: backend.clone(),
-                    id: encoder.clone(),
-                    profile: request.profile,
-                    gain_tags,
-                };
-                if request.layer == ArtifactLayer::Derivative {
-                    items.push(BatchItem::Derivative { master, encoding });
-                    continue;
-                }
-                PackageAudio::Encode(encoding)
-            } else {
-                PackageAudio::PassThrough(Codec::Flac)
-            };
-            let track = library
-                .track(*id)?
-                .ok_or(Error::NotFound("unknown track appearance"))?;
-            let cover = match track.art {
-                Some(art) => {
-                    if let std::collections::hash_map::Entry::Vacant(slot) = covers.entry(art) {
-                        let bytes = library.original_cover(art, &roots)?;
-                        slot.insert(bytes.map(|bytes| Cover::new(bytes.into(), 500)));
+            let result = match sourced {
+                Sourced::Blocked(reason) => TranscodeResult::Blocked {
+                    reason: reason.to_owned(),
+                },
+                Sourced::PassThrough(_, codec) => TranscodeResult::PassedThrough { codec },
+                Sourced::Encode(master) => match self.encoding(request.profile) {
+                    None => TranscodeResult::Blocked {
+                        reason: "no_encoder".to_owned(),
+                    },
+                    Some(mut encoding) => {
+                        if request.profile.dsp.replay_gain != ReplayGain::Off {
+                            encoding.gain_tags = Pcm::open(&master.path, Some(master.facts))
+                                .map_err(Error::Io)?
+                                .gain_tags();
+                        }
+                        items.push((outcomes.len(), BatchItem { master, encoding }));
+                        // Filled in when its encode ends.
+                        TranscodeResult::Failed {
+                            reason: "not encoded".to_owned(),
+                        }
                     }
-                    covers.get(&art).cloned().flatten()
-                }
-                None => None,
+                },
             };
-            let tags = Tags {
-                title: track.title,
-                artist: track.artist,
-                album: track.album,
-                disc: track.disc.and_then(|v| v.try_into().ok()),
-                track: track.track.and_then(|v| v.try_into().ok()),
-                ..Tags::default()
-            };
-            items.push(BatchItem::Package {
-                master,
-                audio,
-                packaging: Arc::new(Packaging {
-                    tags,
-                    cover,
-                    id3v1: matches!(request.profile.target, Target::Mp3 { .. }),
-                }),
+            outcomes.push(TranscodeOutcome {
+                appearance_id: *id,
+                result,
             });
         }
-        Ok(items)
+        Ok((outcomes, items))
     }
 }

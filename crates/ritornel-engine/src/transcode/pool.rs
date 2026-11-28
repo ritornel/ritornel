@@ -1,12 +1,20 @@
-//! Batch materialization. Only the callers await dependencies. A worker
-//! never waits for another encode, a package, or a free worker.
+//! Encodes made on dedicated threads, and the transfers prepared from
+//! them. Only the callers await dependencies. A worker never waits for
+//! another encode or a free worker.
+//!
+//! A batch warms the cache and answers one result for each item, so one
+//! blocked or failed track never fails the rest. A prepared transfer is
+//! what a sync hands a device: an ID, an exact length, a digest of the
+//! bytes and a reader. The tagged copy behind it is a scratch file the
+//! transfer owns, and the encode it was made from stays held until the
+//! transfer ends.
 
 mod workers;
 
 use super::cache::Object;
 use super::{
-    Artwork, AudioAsset, CacheEntry, Codec, Derivative, Encoder, EncoderId, GainTags, Package,
-    PackageSource, Pcm, Pin, PinOwner, Profile, Tags, TranscodeCache,
+    Artwork, AudioAsset, CacheEntry, Codec, CopySource, Derivative, Encoder, EncoderId, GainTags,
+    Pcm, Pin, PinOwner, Profile, TaggedCopy, Tags, TranscodeCache,
 };
 use crate::playback::FileFacts;
 use crate::{Error, JobCancel, ServerStore};
@@ -47,6 +55,11 @@ impl fmt::Debug for Encoding {
 }
 
 impl Encoding {
+    /// The key of the encode this makes of `master`.
+    pub fn key(&self, master: &Master) -> Result<blake3::Hash, Error> {
+        Ok(self.derivative(master)?.key)
+    }
+
     fn derivative(&self, master: &Master) -> Result<Object, Error> {
         if !self.backend.supports(self.profile) {
             return Err(Error::Invalid("unsupported encoder profile"));
@@ -77,18 +90,24 @@ impl Cover {
             max_side,
         }
     }
+
+    /// BLAKE3 of the source picture's bytes.
+    pub fn hash(&self) -> blake3::Hash {
+        self.hash
+    }
 }
 
+/// What a tagged copy carries beside its audio.
 #[derive(Clone, Debug, Default)]
-pub struct Packaging {
+pub struct Tagging {
     pub tags: Tags,
     pub cover: Option<Cover>,
     pub id3v1: bool,
 }
 
-impl Packaging {
-    fn package(&self) -> Package<'_> {
-        Package {
+impl Tagging {
+    fn copy(&self) -> TaggedCopy<'_> {
+        TaggedCopy {
             tags: &self.tags,
             artwork: self.cover.as_ref().map(|c| Artwork {
                 bytes: &c.bytes,
@@ -99,25 +118,28 @@ impl Packaging {
     }
 }
 
+/// Where a transfer's audio comes from, as the source policy chose.
 #[derive(Clone, Debug)]
-pub enum PackageAudio {
+pub enum TransferAudio {
+    /// Encoded from the master, through the cache.
     Encode(Encoding),
+    /// The master's own audio, read directly.
     PassThrough(Codec),
 }
 
-/// The caller selects the master and output using the source policy.
-/// Pass-through packages read the master directly.
+/// One encode to make or find: the caller selects the master.
 #[derive(Clone, Debug)]
-pub enum BatchItem {
-    Derivative {
-        master: Master,
-        encoding: Encoding,
-    },
-    Package {
-        master: Master,
-        audio: PackageAudio,
-        packaging: Arc<Packaging>,
-    },
+pub struct BatchItem {
+    pub master: Master,
+    pub encoding: Encoding,
+}
+
+/// What a sync asks for by key: one tagged copy of one master.
+#[derive(Clone, Debug)]
+pub struct TransferRequest {
+    pub master: Master,
+    pub audio: TransferAudio,
+    pub tagging: Arc<Tagging>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -258,67 +280,14 @@ impl Context {
     }
 
     async fn item(self: &Arc<Self>, item: BatchItem) -> ResultEntry {
-        let (master, audio, packaging) = match item {
-            BatchItem::Derivative { master, encoding } => {
-                let object = encoding.derivative(&master)?;
-                return self.derivative(master, encoding, object).await;
-            }
-            BatchItem::Package {
-                master,
-                audio,
-                packaging,
-            } => (master, audio, packaging),
-        };
-        let (derivative, hash, scheme, codec) = match audio {
-            PackageAudio::Encode(e) => {
-                let object = e.derivative(&master)?;
-                (Some((e, object)), object.key, None, object.codec)
-            }
-            PackageAudio::PassThrough(codec) => {
-                (None, master.asset.hash, Some(master.asset.scheme), codec)
-            }
-        };
-        let object = packaging
-            .package()
-            .object_for(
-                hash,
-                scheme,
-                codec,
-                packaging.cover.as_ref().map(|c| (c.hash, c.max_side)),
-            )
-            .map_err(Error::Io)?;
-        let ctx = self.clone();
-        self.flight(object.key, move |slot| async move {
-            // A package can outlive its derivative. Try it before opening the master.
-            if let Some(hit) = ctx.lookup(slot.clone(), object).await? {
-                return Ok(hit);
-            }
-            let audio = if let Some((encoding, base)) = derivative {
-                Some(ctx.derivative(master.clone(), encoding, base).await?)
-            } else {
-                None
-            };
-            ctx.ensure(slot, object, move |path, cancel| {
-                let source = match &audio {
-                    Some(audio) => PackageSource::Derivative(&audio.entry),
-                    None => PackageSource::Master {
-                        asset: master.asset,
-                        path: &master.path,
-                        facts: master.facts,
-                        codec,
-                    },
-                };
-                packaging.package().write(source, path, cancel)
-            })
-            .await
-        })
-        .await
+        let object = item.encoding.derivative(&item.master)?;
+        self.derivative(item.master, item.encoding, object).await
     }
 
     fn pin(&self) -> Result<Pin, Error> {
         Ok(Pin {
             id: self.store.new_id()?,
-            owner: PinOwner::SyncBatch,
+            owner: PinOwner::Batch,
         })
     }
 
@@ -365,7 +334,7 @@ impl Context {
     }
 }
 
-/// Keeps a cached object pinned while a response is being sent.
+/// Keeps a cached encode pinned while a response is being sent.
 pub struct Transfer {
     lease: Arc<Lease>,
     // A response owns its body. Release the pin before the last owner can join the index thread.
@@ -382,21 +351,81 @@ impl fmt::Debug for Transfer {
     }
 }
 
-/// Files in request order, pinned until the caller drops the batch.
+/// One tagged copy made ready to send: what a sync hands a put. It has an
+/// identity, an exact length and a digest of the bytes sent, and a caller
+/// gets a reader and never a path. The scratch file behind it is this
+/// transfer's own and goes when it is dropped; the encode it was tagged
+/// from stays held until then, so a transfer never evicts its own audio.
+pub struct PreparedTransfer {
+    id: crate::Id,
+    codec: Codec,
+    len: u64,
+    digest: blake3::Hash,
+    sampled: blake3::Hash,
+    scratch: tempfile::TempPath,
+    _encode: Option<Arc<Lease>>,
+    // The lease's release joins the pool's index thread: keep the pool.
+    _pool: Arc<TranscodePool>,
+}
+
+impl PreparedTransfer {
+    /// What names this transfer.
+    pub fn id(&self) -> crate::Id {
+        self.id
+    }
+    pub fn codec(&self) -> Codec {
+        self.codec
+    }
+    /// The exact length of the bytes a reader gives.
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+    /// BLAKE3 of those bytes. It is not the key the copy was asked for by.
+    pub fn digest(&self) -> blake3::Hash {
+        self.digest
+    }
+    /// BLAKE3 of the first and last MiB, counting overlapping bytes once.
+    pub fn sampled_hash(&self) -> blake3::Hash {
+        self.sampled
+    }
+    /// The bytes, from the start. Each reader holds the copy open.
+    pub fn reader(&self) -> std::io::Result<std::fs::File> {
+        std::fs::File::open(&self.scratch)
+    }
+}
+
+impl fmt::Debug for PreparedTransfer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PreparedTransfer")
+            .field("id", &self.id)
+            .field("codec", &self.codec)
+            .field("len", &self.len)
+            .finish_non_exhaustive()
+    }
+}
+
+/// One result for each item, in request order. An encode is pinned until
+/// the caller drops the batch.
 pub struct Batch<'pool> {
-    entries: Vec<Arc<Lease>>,
+    entries: Vec<Result<Arc<Lease>, Arc<Error>>>,
     _pool: std::marker::PhantomData<&'pool TranscodePool>,
 }
 
 impl Batch<'_> {
-    pub fn entries(&self) -> impl ExactSizeIterator<Item = &CacheEntry> {
-        self.entries.iter().map(|lease| &lease.entry)
+    pub fn results(&self) -> impl ExactSizeIterator<Item = Result<&CacheEntry, &Error>> {
+        self.entries.iter().map(|entry| match entry {
+            Ok(lease) => Ok(&lease.entry),
+            Err(error) => Err(error.as_ref()),
+        })
     }
 }
 
 impl fmt::Debug for Batch<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_list().entries(self.entries()).finish()
+        f.debug_list().entries(self.results()).finish()
     }
 }
 
@@ -447,12 +476,8 @@ impl TranscodePool {
         })
     }
 
-    /// Pin a published file until its response body is dropped, including on disconnect.
-    pub async fn transfer(
-        self: &Arc<Self>,
-        key: blake3::Hash,
-        layer: ritornel_contract::transcode::ArtifactLayer,
-    ) -> Result<Option<Transfer>, Error> {
+    /// Pin a cached encode until its response body is dropped, including on disconnect.
+    pub async fn transfer(self: &Arc<Self>, key: blake3::Hash) -> Result<Option<Transfer>, Error> {
         let ctx = self.context.clone();
         let lease = self
             .context
@@ -464,7 +489,7 @@ impl TranscodePool {
                 };
                 Ok(ctx
                     .cache
-                    .transfer(&ctx.store, key, layer, pin)?
+                    .transfer(&ctx.store, key, pin)?
                     .map(|entry| ctx.lease(pin, entry)))
             })
             .await?;
@@ -488,8 +513,77 @@ impl TranscodePool {
         }
     }
 
-    /// Jobs and disconnected callers can stop independently. Dropping this
-    /// future withdraws its waits and releases any results collected so far.
+    /// Makes one tagged copy ready to send. The audio is the master's own
+    /// or its encode, found in the cache or made there; the copy is written
+    /// to a scratch file the transfer owns. Asked again with the same
+    /// request, it makes the same bytes. Dropping the future withdraws its
+    /// waits.
+    pub async fn prepare(
+        self: &Arc<Self>,
+        request: TransferRequest,
+    ) -> Result<PreparedTransfer, Arc<Error>> {
+        let ctx = self.context.clone();
+        let TransferRequest {
+            master,
+            audio,
+            tagging,
+        } = request;
+        let (encode, codec) = match audio {
+            TransferAudio::Encode(encoding) => {
+                let object = encoding.derivative(&master)?;
+                tagging.copy().check(object.codec).map_err(Error::Io)?;
+                let lease = ctx.derivative(master.clone(), encoding, object).await?;
+                (Some(lease), object.codec)
+            }
+            TransferAudio::PassThrough(codec) => {
+                tagging.copy().check(codec).map_err(Error::Io)?;
+                (None, codec)
+            }
+        };
+        let id = ctx.store.new_id()?;
+        let held = encode.clone();
+        let cache = ctx.cache.clone();
+        let (scratch, len, digest, sampled) = ctx
+            .workers
+            .run(None, move |cancel| {
+                let source = match &held {
+                    Some(lease) => CopySource::Encode(&lease.entry),
+                    None => CopySource::Master {
+                        asset: master.asset,
+                        path: &master.path,
+                        facts: master.facts,
+                        codec,
+                    },
+                };
+                // The scratch name is reserved, and the copy is written to
+                // it afresh: the writer refuses a file that is there.
+                let scratch = cache.scratch().map_err(Error::Io)?;
+                std::fs::remove_file(&scratch).map_err(Error::Io)?;
+                tagging
+                    .copy()
+                    .write(source, &scratch, cancel)
+                    .map_err(Error::Io)?;
+                let mut file = std::fs::File::open(&scratch).map_err(Error::Io)?;
+                let (len, digest, sampled) =
+                    super::cache::hashes(&mut file, cancel).map_err(Error::Io)?;
+                Ok((scratch, len, digest, sampled))
+            })
+            .await?;
+        Ok(PreparedTransfer {
+            id,
+            codec,
+            len,
+            digest,
+            sampled,
+            scratch,
+            _encode: encode,
+            _pool: self.clone(),
+        })
+    }
+
+    /// Warms the cache. Jobs and disconnected callers can stop
+    /// independently. Dropping this future withdraws its waits and releases
+    /// any results collected so far. One item's failure is its own result.
     pub async fn ensure_batch(
         &self,
         items: Vec<BatchItem>,
@@ -499,9 +593,7 @@ impl TranscodePool {
         let total = items.len();
         let mut entries = Vec::with_capacity(total);
         let mut pending = stream::iter(items.into_iter().enumerate())
-            .map(|(index, item)| async move {
-                self.context.item(item).await.map(|entry| (index, entry))
-            })
+            .map(|(index, item)| async move { (index, self.context.item(item).await) })
             .buffer_unordered(self.workers.get());
         let mut tick = tokio::time::interval(Duration::from_millis(20));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -510,13 +602,12 @@ impl TranscodePool {
             tokio::select! {
                 _ = tick.tick() => {},
                 result = pending.next() => {
-                    let Some(result) = result else { break };
-                    let (index, entry) = result?;
+                    let Some((index, entry)) = result else { break };
                     progress(BatchProgress {
                         index,
                         completed: entries.len() + 1,
                         total,
-                        size_bytes: entry.entry.size_bytes,
+                        size_bytes: entry.as_ref().map_or(0, |lease| lease.entry.size_bytes),
                     });
                     entries.push((index, entry));
                 }

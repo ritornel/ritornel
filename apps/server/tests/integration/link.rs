@@ -2190,7 +2190,7 @@ async fn cache_routes_require_a_link_and_serve_the_exact_pinned_bytes() {
             (status, headers, bytes[end + 4..].to_vec())
         };
 
-        // Seed both cache layers with the production pool, independent of PATH.
+        // Seed the encode cache with the production pool, independent of PATH.
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/audio/a.flac");
         let master = Master {
             asset: AudioAsset {
@@ -2206,38 +2206,35 @@ async fn cache_routes_require_a_link_and_serve_the_exact_pinned_bytes() {
         )
         .unwrap();
         let cancel = jobs.job_cancel(1, Arc::default()).unwrap();
-        let items = vec![
-            BatchItem::Derivative {
-                master: master.clone(),
-                encoding: Encoding {
-                    backend: Arc::new(FakeEncoder),
-                    id: FakeEncoder.probe().unwrap().unwrap(),
-                    profile: Profile {
-                        target: Target::Mp3 { mode: Mp3::V2 },
-                        dsp: Dsp::default(),
-                    },
-                    gain_tags: GainTags::default(),
+        let items = vec![BatchItem {
+            master,
+            encoding: Encoding {
+                backend: Arc::new(FakeEncoder),
+                id: FakeEncoder.probe().unwrap().unwrap(),
+                profile: Profile {
+                    target: Target::Mp3 { mode: Mp3::V2 },
+                    dsp: Dsp::default(),
                 },
+                gain_tags: GainTags::default(),
             },
-            BatchItem::Package {
-                master,
-                audio: PackageAudio::PassThrough(Codec::Flac),
-                packaging: Arc::new(Packaging {
-                    tags: Tags::default(),
-                    cover: None,
-                    id3v1: false,
-                }),
-            },
-        ];
+        }];
         let batch = hub
             .transcode_pool()
             .ensure_batch(items, &cancel, |_| {})
             .await
             .unwrap();
         for (entry, (layer, mime)) in batch
-            .entries()
-            .zip([("derivative", "audio/mpeg"), ("packaged", "audio/flac")])
+            .results()
+            .map(Result::unwrap)
+            .zip([("derivative", "audio/mpeg")])
         {
+            // A tagged copy is only ever a prepared transfer: the route
+            // that served the packaged layer is gone.
+            let packaged = format!("/v1/cache/packaged/{}", entry.key());
+            assert_eq!(
+                fetch("GET", &packaged, Some(&link), None, None).await.0,
+                404
+            );
             let path = format!("/v1/cache/{layer}/{}", entry.key());
             let content = std::fs::read(entry.path()).unwrap();
             let size = content.len();
@@ -2335,7 +2332,7 @@ async fn a_streaming_download_survives_prune_and_releases_its_pin_at_shutdown() 
         let root = scratch.data_dir("hub");
         let store = ritornel_engine::ServerStore::open(&root.join("server.db"), Arc::new(SystemClock), Arc::new(OsEntropy)).unwrap();
         let cache = TranscodeCache::open(&store, &root.join("cache"), key(), TranscodeCache::DEFAULT_BUDGET).unwrap();
-        let pin = Pin { id: key(), owner: PinOwner::SyncBatch };
+        let pin = Pin { id: key(), owner: PinOwner::Batch };
         let entry = cache.derivative(&store, Derivative {
             asset:AudioAsset { scheme:1, hash:[81;32].into() },
             encoder: &FakeEncoder.probe().unwrap().unwrap(),

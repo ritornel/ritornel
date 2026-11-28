@@ -1,7 +1,13 @@
-//! Two layers of immutable audio files. Publication, access and eviction
-//! share a lock. File I/O runs outside SQLite transactions.
+//! One layer of immutable audio files: the encodes a server has made and
+//! can make again, kept for as long as the budget allows. Publication,
+//! access and eviction share a lock. File I/O runs outside SQLite
+//! transactions.
+//!
+//! A tagged copy is not kept here. It is a scratch file under `tmp/` that
+//! one prepared transfer owns and deletes, so tagged copies never compete
+//! with encodes for the budget.
 
-use super::{AudioAsset, Codec, EncoderId, GainTags, Package, PackageSource, Profile, Target};
+use super::{AudioAsset, Codec, EncoderId, GainTags, Profile, Target};
 use crate::{Error, Id, ServerStore};
 use rusqlite::{OptionalExtension, Transaction, params};
 use std::collections::HashSet;
@@ -12,7 +18,10 @@ use std::sync::{Mutex, PoisonError, atomic::AtomicBool};
 
 #[derive(Debug, Clone, Copy)]
 pub enum PinOwner {
-    SyncBatch,
+    /// A batch warming the cache.
+    Batch,
+    /// A transfer being prepared or sent to a sync target.
+    Transfer,
     HttpTransfer,
     AbSession,
 }
@@ -45,64 +54,27 @@ impl Derivative<'_> {
             .encoder
             .derivative_key(self.asset, self.profile, self.gain_tags)
             .map_err(Error::Io)?;
-        Ok(Object {
-            key,
-            layer: Layer::Derivative,
-            codec,
-            source: None,
-            master_scheme: None,
-        })
+        Ok(Object { key, codec })
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Layer {
-    Derivative,
-    Packaged,
-}
-impl Layer {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Derivative => "derivative",
-            Self::Packaged => "packaged",
-        }
-    }
-    fn directory(self) -> &'static str {
-        match self {
-            Self::Derivative => "transcodes",
-            Self::Packaged => "packaged",
-        }
-    }
-}
+/// Where cached encodes are, under the cache's root.
+const ENCODES: &str = "transcodes";
+/// Where the cache once kept tagged files. Removed when the cache opens.
+const PACKAGED: &str = "packaged";
+/// What a prepared transfer's scratch file is named by, under `tmp/`.
+const SCRATCH: &str = "transfer-";
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Object {
     pub(super) key: blake3::Hash,
-    layer: Layer,
     pub(super) codec: Codec,
-    source: Option<blake3::Hash>,
-    master_scheme: Option<u32>,
 }
 
 impl Object {
-    pub(super) fn package(
-        key: blake3::Hash,
-        codec: Codec,
-        source: blake3::Hash,
-        master_scheme: Option<u32>,
-    ) -> Self {
-        Self {
-            key,
-            layer: Layer::Packaged,
-            codec,
-            source: Some(source),
-            master_scheme,
-        }
-    }
-
     fn path(self, root: &Path) -> PathBuf {
         let key = self.key.to_hex();
-        root.join(self.layer.directory())
+        root.join(ENCODES)
             .join(key.as_str().get(..2).unwrap_or_default())
             .join(format!("{key}.{}", self.codec.extension()))
     }
@@ -126,9 +98,6 @@ impl CacheEntry {
     pub fn codec(&self) -> Codec {
         self.object.codec
     }
-    pub fn is_derivative(&self) -> bool {
-        self.object.layer == Layer::Derivative
-    }
 }
 
 #[derive(Debug)]
@@ -147,19 +116,34 @@ impl TranscodeCache {
     /// by a crash, including a restored index with absent files.
     pub fn open(store: &ServerStore, root: &Path, boot_id: Id, budget: u64) -> Result<Self, Error> {
         ensure_directory(root)?;
-        for name in ["tmp", "transcodes", "packaged"] {
+        for name in ["tmp", ENCODES] {
             ensure_directory(&root.join(name))?;
+        }
+        // The tagged files an older cache kept: its index lost their rows
+        // in a migration, which cannot delete files. Tried at every start
+        // until the folder is gone, and never through a link.
+        let packaged = root.join(PACKAGED);
+        match fs::symlink_metadata(&packaged) {
+            Ok(found) if found.is_dir() => fs::remove_dir_all(&packaged).map_err(Error::Io)?,
+            Ok(_) => fs::remove_file(&packaged).map_err(Error::Io)?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(Error::Io(e)),
         }
         for entry in fs::read_dir(root.join("tmp")).map_err(Error::Io)? {
             let entry = entry.map_err(Error::Io)?;
-            if entry.file_type().map_err(Error::Io)?.is_dir()
+            let kind = entry.file_type().map_err(Error::Io)?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            // An encode a dead run was making, in its private directory.
+            if kind.is_dir()
                 && entry.path().extension().is_some_and(|ext| ext == "part")
-                && entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with("transcode-")
+                && name.starts_with("transcode-")
             {
                 fs::remove_dir_all(entry.path()).map_err(Error::Io)?;
+            }
+            // A tagged copy whose transfer a dead run held.
+            if kind.is_file() && name.starts_with(SCRATCH) {
+                fs::remove_file(entry.path()).map_err(Error::Io)?;
             }
         }
         let cache = Self {
@@ -177,7 +161,7 @@ impl TranscodeCache {
         })?;
         let rows = store.read(|db| {
             let mut stmt =
-                db.prepare("SELECT id,cache_key,layer,codec,size_bytes FROM transcode_entry")?;
+                db.prepare("SELECT id,cache_key,codec,size_bytes FROM transcode_entry")?;
             Ok(stmt
                 .query_map([], IndexedFile::read)?
                 .collect::<Result<Vec<_>, _>>()?)
@@ -198,21 +182,19 @@ impl TranscodeCache {
             }
             Ok(())
         })?;
-        // Only descend into the two cache-owned trees, never through a link.
-        for layer in [Layer::Derivative, Layer::Packaged] {
-            for bucket in fs::read_dir(root.join(layer.directory())).map_err(Error::Io)? {
-                let bucket = bucket.map_err(Error::Io)?;
-                if !bucket.file_type().map_err(Error::Io)?.is_dir() {
-                    continue;
-                }
-                for entry in fs::read_dir(bucket.path()).map_err(Error::Io)? {
-                    let entry = entry.map_err(Error::Io)?;
-                    if entry.file_type().map_err(Error::Io)?.is_file()
-                        && is_object_path(&entry.path())
-                        && !kept.contains(&entry.path())
-                    {
-                        fs::remove_file(entry.path()).map_err(Error::Io)?;
-                    }
+        // Only descend into the cache's own tree, never through a link.
+        for bucket in fs::read_dir(root.join(ENCODES)).map_err(Error::Io)? {
+            let bucket = bucket.map_err(Error::Io)?;
+            if !bucket.file_type().map_err(Error::Io)?.is_dir() {
+                continue;
+            }
+            for entry in fs::read_dir(bucket.path()).map_err(Error::Io)? {
+                let entry = entry.map_err(Error::Io)?;
+                if entry.file_type().map_err(Error::Io)?.is_file()
+                    && is_object_path(&entry.path())
+                    && !kept.contains(&entry.path())
+                {
+                    fs::remove_file(entry.path()).map_err(Error::Io)?;
                 }
             }
         }
@@ -235,25 +217,16 @@ impl TranscodeCache {
         })
     }
 
-    pub fn package(
-        &self,
-        store: &ServerStore,
-        source: PackageSource<'_>,
-        package: &Package<'_>,
-        pin: Pin,
-    ) -> Result<CacheEntry, Error> {
-        if let PackageSource::Derivative(entry) = source
-            && !entry.is_derivative()
-        {
-            return Err(Error::Invalid(
-                "a packaged file cannot be a derivative source",
-            ));
-        }
-        let object = package.object(source).map_err(Error::Io)?;
-        let cancel = AtomicBool::new(false);
-        self.ensure(store, object, pin, &cancel, |path| {
-            package.write(source, path, &cancel)
-        })
+    /// A new scratch file for one prepared transfer's tagged copy. It is
+    /// the transfer's own: it goes when the transfer ends, and the next
+    /// start clears what a dead run left. Scratch files are work in
+    /// progress and no part of the budget.
+    pub(super) fn scratch(&self) -> io::Result<tempfile::TempPath> {
+        Ok(tempfile::Builder::new()
+            .prefix(SCRATCH)
+            .suffix(".part")
+            .tempfile_in(self.root.join("tmp"))?
+            .into_temp_path())
     }
 
     pub(super) fn ensure(
@@ -309,15 +282,12 @@ impl TranscodeCache {
             let key = object.key.to_hex().to_string();
             tx.execute(
                 "INSERT INTO transcode_entry
-                 (cache_key, layer, codec, source_key, master_scheme, size_bytes,
-                  file_hash, sampled_hash, created_at_ms, last_used_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+                 (cache_key, codec, size_bytes, file_hash, sampled_hash,
+                  created_at_ms, last_used_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
                 params![
                     key,
-                    object.layer.name(),
                     object.codec.extension(),
-                    object.source.map(|hash| hash.to_hex().to_string()),
-                    object.master_scheme,
                     sql_size,
                     file_hash.as_bytes(),
                     sampled_hash.as_bytes(),
@@ -513,7 +483,8 @@ fn is_present(path: &Path, size: u64) -> Result<bool, Error> {
 
 fn hold(tx: &Transaction<'_>, entry: i64, boot: Id, pin: Pin, now: i64) -> Result<(), Error> {
     let kind = match pin.owner {
-        PinOwner::SyncBatch => "sync_batch",
+        PinOwner::Batch => "batch",
+        PinOwner::Transfer => "transfer",
         PinOwner::HttpTransfer => "http_transfer",
         PinOwner::AbSession => "ab_session",
     };
@@ -534,7 +505,6 @@ fn hold(tx: &Transaction<'_>, entry: i64, boot: Id, pin: Pin, now: i64) -> Resul
 struct IndexedFile {
     id: i64,
     key: String,
-    layer: String,
     codec: String,
     size: u64,
 }
@@ -543,34 +513,16 @@ impl IndexedFile {
         Ok(Self {
             id: row.get(0)?,
             key: row.get(1)?,
-            layer: row.get(2)?,
-            codec: row.get(3)?,
-            size: size_column(row, 4)?,
+            codec: row.get(2)?,
+            size: size_column(row, 3)?,
         })
     }
 
     fn path(&self, root: &Path) -> Result<PathBuf, Error> {
         let key = blake3::Hash::from_hex(&self.key)
             .map_err(|_| Error::Corrupt("bad transcode cache key"))?;
-        let layer = match self.layer.as_str() {
-            "packaged" => Layer::Packaged,
-            "derivative" => Layer::Derivative,
-            _ => return Err(Error::Corrupt("bad transcode layer")),
-        };
-        let codec = match self.codec.as_str() {
-            "flac" => Codec::Flac,
-            "mp3" => Codec::Mp3,
-            "opus" => Codec::Opus,
-            _ => return Err(Error::Corrupt("bad transcode codec")),
-        };
-        Ok(Object {
-            key,
-            layer,
-            codec,
-            source: None,
-            master_scheme: None,
-        }
-        .path(root))
+        let codec = Codec::named(&self.codec).ok_or(Error::Corrupt("bad transcode codec"))?;
+        Ok(Object { key, codec }.path(root))
     }
 }
 
@@ -587,11 +539,11 @@ fn victims(
     let needed = total.saturating_sub(budget);
     let mut victims = Vec::new();
     if total > budget {
-        // The index orders 'packaged' ahead of 'derivative' within this closed enum.
+        // Least recently used goes first, and whatever is held is passed over.
         let mut oldest = db.prepare(
-            "SELECT id, cache_key, layer, codec, size_bytes FROM transcode_entry e
+            "SELECT id, cache_key, codec, size_bytes FROM transcode_entry e
              WHERE NOT EXISTS (SELECT 1 FROM transcode_pin p WHERE p.entry_id = e.id)
-             ORDER BY layer DESC, last_used_at_ms, id LIMIT -1 OFFSET ?1",
+             ORDER BY last_used_at_ms, id LIMIT -1 OFFSET ?1",
         )?;
         for row in oldest.query_map([unavailable], IndexedFile::read)? {
             let row = row?;
@@ -607,7 +559,10 @@ fn victims(
 
 /// Hash short files once. Above two MiB the sample is the concatenation of
 /// the first and last MiB, with no overlapping bytes.
-fn hashes(file: &mut File, cancel: &AtomicBool) -> io::Result<(u64, blake3::Hash, blake3::Hash)> {
+pub(super) fn hashes(
+    file: &mut File,
+    cancel: &AtomicBool,
+) -> io::Result<(u64, blake3::Hash, blake3::Hash)> {
     const MIB: u64 = 1 << 20;
     let size = file.metadata()?.len();
     if size == 0 {
@@ -630,15 +585,24 @@ fn hashes(file: &mut File, cancel: &AtomicBool) -> io::Result<(u64, blake3::Hash
 }
 
 impl TranscodeCache {
-    /// Occupied bytes and entry counts in each layer, in one index snapshot.
-    pub fn usage(&self, store: &ServerStore) -> Result<(u64, u64, u64), Error> {
+    /// Occupied bytes and how many encodes hold them, in one index snapshot.
+    pub fn usage(&self, store: &ServerStore) -> Result<(u64, u64), Error> {
         store.read(|db| {
             Ok(db.query_row(
-                "SELECT coalesce(sum(size_bytes),0), count(*) FILTER (WHERE layer='derivative'),
-             count(*) FILTER (WHERE layer='packaged') FROM transcode_entry",
+                "SELECT coalesce(sum(size_bytes),0), count(*) FROM transcode_entry",
                 [],
-                |r| Ok((size_column(r, 0)?, size_column(r, 1)?, size_column(r, 2)?)),
+                |r| Ok((size_column(r, 0)?, size_column(r, 1)?)),
             )?)
+        })
+    }
+
+    /// Whether an encode of this key is cached now. A plan asks, to say how
+    /// many of its encodes are still to make; it holds nothing.
+    pub fn holds(&self, store: &ServerStore, key: blake3::Hash) -> Result<bool, Error> {
+        store.read(|db| {
+            Ok(db
+                .prepare_cached("SELECT 1 FROM transcode_entry WHERE cache_key=?1")?
+                .exists([key.to_hex().as_str()])?)
         })
     }
 
@@ -650,18 +614,13 @@ impl TranscodeCache {
         self.prune_to(store, 0)
     }
 
+    /// A cached encode by its key, held for a download.
     pub(super) fn transfer(
         &self,
         store: &ServerStore,
         key: blake3::Hash,
-        layer: ritornel_contract::transcode::ArtifactLayer,
         pin: Pin,
     ) -> Result<Option<CacheEntry>, Error> {
-        use ritornel_contract::transcode::ArtifactLayer;
-        let layer = match layer {
-            ArtifactLayer::Derivative => Layer::Derivative,
-            ArtifactLayer::Packaged => Layer::Packaged,
-        };
         let _lock = self
             .publication
             .lock()
@@ -669,31 +628,35 @@ impl TranscodeCache {
         let codec: Option<String> = store.read(|db| {
             Ok(db
                 .query_row(
-                    "SELECT codec FROM transcode_entry WHERE cache_key=?1 AND layer=?2",
-                    params![key.to_hex().as_str(), layer.name()],
+                    "SELECT codec FROM transcode_entry WHERE cache_key=?1",
+                    [key.to_hex().as_str()],
                     |r| r.get(0),
                 )
                 .optional()?)
         })?;
-        let codec = match codec.as_deref() {
-            Some("mp3") => Codec::Mp3,
-            Some("opus") => Codec::Opus,
-            Some("flac") => Codec::Flac,
-            None => return Ok(None),
-            _ => return Err(Error::Corrupt("bad transcode codec")),
+        let Some(codec) = codec else {
+            return Ok(None);
         };
-        self.hit(
-            store,
-            Object {
-                key,
-                layer,
-                codec,
-                source: None,
-                master_scheme: None,
-            },
-            pin,
-        )
+        let codec = Codec::named(&codec).ok_or(Error::Corrupt("bad transcode codec"))?;
+        self.hit(store, Object { key, codec }, pin)
     }
+}
+
+/// The sampled hash of a file of `size` bytes read from `file`: the whole
+/// of a short one, and above two MiB the first and last MiB, counted once.
+/// A sync compares it with a baseline before anything destructive.
+pub fn sampled_hash(file: &mut (impl Read + Seek), size: u64) -> io::Result<blake3::Hash> {
+    const MIB: u64 = 1 << 20;
+    let mut hasher = blake3::Hasher::new();
+    file.rewind()?;
+    if size <= 2 * MIB {
+        io::copy(file, &mut hasher)?;
+    } else {
+        io::copy(&mut file.by_ref().take(MIB), &mut hasher)?;
+        file.seek(SeekFrom::End(-(MIB as i64)))?;
+        io::copy(file, &mut hasher)?;
+    }
+    Ok(hasher.finalize())
 }
 
 #[cfg(test)]

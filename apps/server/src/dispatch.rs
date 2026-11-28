@@ -57,6 +57,7 @@ mod backup;
 mod calls;
 mod churn;
 mod corrections;
+pub(crate) mod devices;
 mod export;
 mod handoff;
 mod history;
@@ -211,6 +212,9 @@ pub(crate) struct Core {
     watch: std::sync::OnceLock<crate::watch::Watching>,
     /// Where backups go, once the server has started.
     backups: std::sync::OnceLock<crate::backup::Backups>,
+    /// What is held of each player and folder the library syncs to while
+    /// the server runs: the plan of its next sync, and a run under way.
+    devices: devices::Devices,
     /// The most a satellite's cache of pulled masters holds, in bytes,
     /// once the server has started.
     transcodes: std::sync::OnceLock<std::sync::Weak<Transcodes>>,
@@ -355,6 +359,7 @@ impl Core {
             answering: Mutex::new(()),
             watch: std::sync::OnceLock::new(),
             backups: std::sync::OnceLock::new(),
+            devices: devices::Devices::default(),
             transcodes: Default::default(),
             cache_bytes: std::sync::OnceLock::new(),
             start_up: std::sync::OnceLock::new(),
@@ -562,6 +567,10 @@ impl Core {
         }
         if self.has_player() {
             capabilities.push(capability::PLAYBACK.to_owned());
+        }
+        // The hub plans and makes every file a player or a folder gets.
+        if this.role == ServerRole::Hub {
+            capabilities.push(capability::DEVICES.to_owned());
         }
         if self.catalogue().is_some() {
             capabilities.push(capability::CORRECTIONS_LOOKUP.to_owned());
@@ -1028,6 +1037,39 @@ impl Core {
                     || Ok("{}".into()),
                 )
             }),
+            methods::DevicesList::NAME => {
+                run::<methods::DevicesList>(params, |_| self.devices_list(stores))
+            }
+            methods::DevicesGet::NAME => run::<methods::DevicesGet>(params, |params| {
+                self.devices_get(stores, &params, show_paths)
+            }),
+            methods::DevicesFormats::NAME => run::<methods::DevicesFormats>(params, |params| {
+                self.devices_formats(stores, &params)
+            }),
+            methods::DevicesActions::NAME => run::<methods::DevicesActions>(params, |params| {
+                self.devices_actions(stores, &params)
+            }),
+            methods::DevicesUnmanaged::NAME => run::<methods::DevicesUnmanaged>(params, |params| {
+                self.devices_unmanaged(stores, &params)
+            }),
+            methods::DevicesPlays::NAME => {
+                run::<methods::DevicesPlays>(params, |params| self.devices_plays(stores, &params))
+            }
+            methods::DevicesSet::NAME => {
+                run::<methods::DevicesSet>(params, |params| self.devices_set(stores, &params))
+            }
+            methods::DevicesAddFolder::NAME => run::<methods::DevicesAddFolder>(params, |params| {
+                self.devices_add_folder(stores, &params)
+            }),
+            methods::DevicesSync::NAME => run::<methods::DevicesSync>(params, |params| {
+                self.devices_sync(stores, &params, show_paths)
+            }),
+            methods::DevicesEject::NAME => {
+                run::<methods::DevicesEject>(params, |params| self.devices_eject(stores, &params))
+            }
+            methods::DevicesForget::NAME => {
+                run::<methods::DevicesForget>(params, |params| self.devices_forget(stores, &params))
+            }
             ScanStart::NAME => run::<ScanStart>(params, |params| {
                 self.scan_start(stores, &params, show_paths)
             }),

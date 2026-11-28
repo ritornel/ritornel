@@ -319,6 +319,9 @@ impl Server {
             origins: run.origins,
         });
         core.attach_transcodes(&transcodes);
+        // Before the worker claims anything: a sync a dead run left open
+        // belongs to a session that run held in memory.
+        core.close_stale_syncs();
         let moves = Task(core.start_moves());
         let listening = Listening::start(Arc::clone(&core), tickets, listener, listen, bounds)?;
         info!(endpoint = %listening.endpoint(), "listening");

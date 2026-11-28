@@ -40,8 +40,13 @@ use crate::session::Session;
 
 /// The topics whose events come from the hub. The rest are this server's
 /// own: its player, its queue, and its status.
-pub(crate) const HUB_TOPICS: [Topic; 4] =
-    [Topic::Library, Topic::List, Topic::Jobs, Topic::Players];
+pub(crate) const HUB_TOPICS: [Topic; 5] = [
+    Topic::Library,
+    Topic::List,
+    Topic::Jobs,
+    Topic::Players,
+    Topic::Devices,
+];
 
 /// Whether the hub answers, as the satellite last found.
 #[derive(Debug, Clone, Default)]

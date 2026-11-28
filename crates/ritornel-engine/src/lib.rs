@@ -90,6 +90,7 @@ mod service_session;
 mod sqlite;
 mod stats;
 mod stream_import;
+pub mod sync;
 #[cfg(test)]
 mod testing;
 mod timekeeping;

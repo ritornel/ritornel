@@ -15,6 +15,7 @@
 mod support;
 
 mod backup;
+mod devices;
 mod lastfm;
 mod play;
 mod scan;

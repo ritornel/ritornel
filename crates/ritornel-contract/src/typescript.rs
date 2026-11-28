@@ -54,7 +54,6 @@ const ROUTES: &[(&str, &str)] = &[
     ("link", route::LINK),
     ("audio", route::AUDIO),
     ("cacheDerivative", route::CACHE_DERIVATIVE),
-    ("cachePackaged", route::CACHE_PACKAGED),
 ];
 
 /// The capability flags, by the name each has in `CAPABILITIES`. A flag
@@ -66,6 +65,7 @@ const CAPABILITIES: &[(&str, &str)] = &[
     ("mediaArt", capability::MEDIA_ART),
     ("playback", capability::PLAYBACK),
     ("players", capability::PLAYERS),
+    ("devices", capability::DEVICES),
 ];
 
 const HEADER: &str = "\
@@ -616,7 +616,7 @@ fn the_maps_follow_the_method_table_and_the_topics() {
     assert!(text.contains("  \"jobs\": Extract<Event, { topic: \"jobs\" }>;\n"));
     assert!(text.contains("  \"list\": Extract<Event, { topic: \"list\" }>;\n"));
     assert!(text.contains(
-        "export const TOPICS = [\"servers\", \"players\", \"jobs\", \"library\", \"list\", \"playback\", \"progress\", \"queue\"] as const;\n"
+        "export const TOPICS = [\"servers\", \"players\", \"jobs\", \"library\", \"list\", \"playback\", \"progress\", \"queue\", \"devices\"] as const;\n"
     ));
 }
 

@@ -17,6 +17,8 @@ ritornel-contract.workspace = true
 ritornel-domain.workspace = true
 # What a history source hands over: import records, a cursor and loves.
 ritornel-source.workspace = true
+# What a device family implements, for syncing to a player or a folder.
+ritornel-device.workspace = true
 # The audio hash, and the hash a payload and a picture are known by. Pinned
 # exactly because the hash is a stored key.
 blake3 = "=1.8.7"

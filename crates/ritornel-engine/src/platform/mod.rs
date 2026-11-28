@@ -37,9 +37,20 @@ use windows as system;
 ))]
 use other_unix as system;
 
-pub(crate) use system::{Folder, entry_missing, file_id, met_a_link, mono_ms, read_at, read_boot};
+pub(crate) use system::{
+    Folder, disk_bytes, eject, entry_missing, file_id, met_a_link, mono_ms, read_at, read_boot,
+};
 #[cfg(test)]
 pub(crate) use system::{link_file, link_folder, mode_of, seal, set_listable};
+
+/// What a system that cannot eject a drive answers.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn no_eject() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "ejecting a drive is not built for this system yet: eject it with the system",
+    )
+}
 
 /// An error that says a folder holds something that may not be read.
 pub(crate) fn refused(why: &str) -> std::io::Error {
@@ -91,6 +102,10 @@ mod other_unix {
 
     pub(crate) fn read_boot() -> Option<Id> {
         None
+    }
+
+    pub(crate) fn eject(_folder: &std::path::Path) -> std::io::Result<()> {
+        Err(super::no_eject())
     }
 }
 

@@ -1,8 +1,14 @@
-//! Project tags and cover art onto a separate, seekable copy of the audio.
+//! A tagged copy: the projected tags and cover written onto a separate,
+//! seekable copy of the audio. One definition serves every target; what a
+//! target sets is the cover's size and whether an MP3 gets an ID3v1
+//! trailer. A copy is made for one transfer and never cached, and the same
+//! inputs make the same bytes every time.
 
+use lofty::TextEncoding;
 use lofty::config::WriteOptions;
 use lofty::file::FileType;
-use lofty::id3::v2::Id3v2Tag;
+use lofty::id3::v2::{ExtendedTextFrame, Frame, Id3v2Tag};
+use lofty::ogg::tag::VorbisComments;
 use lofty::picture::{MimeType, Picture, PictureType};
 use lofty::prelude::{Accessor, ItemKey, TagExt};
 use lofty::probe::Probe;
@@ -14,9 +20,13 @@ use std::path::Path;
 
 use crate::playback::FileFacts;
 
-use super::{AudioAsset, CacheEntry, cache::Object};
+use super::{AudioAsset, CacheEntry, GainTag, GainTags};
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize)]
+/// The field a tagged copy carries Ritornel's own identifier in: a Vorbis
+/// comment of this name, or a `TXXX` frame of this description.
+pub const RITORNEL_ID: &str = "RITORNEL_ID";
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Codec {
     Mp3,
@@ -25,11 +35,21 @@ pub enum Codec {
 }
 
 impl Codec {
-    pub(super) fn extension(self) -> &'static str {
+    pub fn extension(self) -> &'static str {
         match self {
             Self::Mp3 => "mp3",
             Self::Opus => "opus",
             Self::Flac => "flac",
+        }
+    }
+
+    /// The codec the scan names so, if a tagged copy can be made of it.
+    pub fn named(codec: &str) -> Option<Self> {
+        match codec {
+            "mp3" => Some(Self::Mp3),
+            "opus" => Some(Self::Opus),
+            "flac" => Some(Self::Flac),
+            _ => None,
         }
     }
 }
@@ -46,6 +66,26 @@ pub struct Tags {
     pub disc: Option<u32>,
     pub year: Option<u16>,
     pub genre: Option<String>,
+    /// The master's ReplayGain figures, written as tags for the player to
+    /// apply: Vorbis comments, or `TXXX` frames in an MP3 and never APEv2.
+    /// A copy whose audio already has gain applied carries none.
+    #[serde(skip)]
+    pub gain: GainTags,
+    /// Ritornel's own identifier for the file, as [`RITORNEL_ID`]. A
+    /// recovery hint for finding a file again after a rename: no plan,
+    /// check or readback uses it.
+    #[serde(skip)]
+    pub ritornel_id: Option<String>,
+}
+
+/// A gain in decibels as taggers write it.
+fn gain_text(db: f32) -> String {
+    format!("{db:.2} dB")
+}
+
+/// A peak as taggers write it.
+fn peak_text(peak: f32) -> String {
+    format!("{peak:.6}")
 }
 
 impl Tags {
@@ -73,6 +113,35 @@ impl Tags {
         }
         tag
     }
+
+    /// The ReplayGain fields and Ritornel's identifier, by the names both
+    /// Vorbis comments and `TXXX` descriptions give them, in a fixed order.
+    fn named(&self) -> Vec<(&'static str, String)> {
+        let pair = |tag: GainTag, gain: &'static str, peak: &'static str| {
+            [
+                tag.gain_db.map(|db| (gain, gain_text(db))),
+                tag.peak.map(|value| (peak, peak_text(value))),
+            ]
+        };
+        pair(
+            self.gain.album,
+            "REPLAYGAIN_ALBUM_GAIN",
+            "REPLAYGAIN_ALBUM_PEAK",
+        )
+        .into_iter()
+        .chain(pair(
+            self.gain.track,
+            "REPLAYGAIN_TRACK_GAIN",
+            "REPLAYGAIN_TRACK_PEAK",
+        ))
+        .flatten()
+        .chain(
+            self.ritornel_id
+                .as_ref()
+                .map(|id| (RITORNEL_ID, id.clone())),
+        )
+        .collect()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -82,19 +151,22 @@ pub struct Artwork<'a> {
     pub max_side: u32,
 }
 
+/// What is written onto a copy of the audio.
 #[derive(Debug)]
-pub struct Package<'a> {
+pub struct TaggedCopy<'a> {
     pub tags: &'a Tags,
-    /// A supplied cover must decode successfully for this package to be published.
+    /// A supplied cover must decode successfully for the copy to be made.
+    /// It is embedded as a baseline JPEG, never a progressive one.
     pub artwork: Option<Artwork<'a>>,
     /// Also write an ID3v1 trailer for older MP3 players.
     pub id3v1: bool,
 }
 
-/// Keep the pin on a derivative until the package call returns.
+/// The audio a tagged copy is made of. Keep the pin on an encode until the
+/// copy has been written.
 #[derive(Debug, Clone, Copy)]
-pub enum PackageSource<'a> {
-    Derivative(&'a CacheEntry),
+pub enum CopySource<'a> {
+    Encode(&'a CacheEntry),
     Master {
         asset: AudioAsset,
         path: &'a Path,
@@ -102,17 +174,12 @@ pub enum PackageSource<'a> {
         codec: Codec,
     },
 }
-impl PackageSource<'_> {
+
+impl CopySource<'_> {
     pub(super) fn codec(self) -> Codec {
         match self {
-            Self::Derivative(entry) => entry.codec(),
+            Self::Encode(entry) => entry.codec(),
             Self::Master { codec, .. } => codec,
-        }
-    }
-    pub(super) fn hash(self) -> blake3::Hash {
-        match self {
-            Self::Derivative(entry) => entry.key(),
-            Self::Master { asset, .. } => asset.hash,
         }
     }
     fn verify(self, input: &File) -> io::Result<()> {
@@ -125,66 +192,34 @@ impl PackageSource<'_> {
     }
     fn path(&self) -> &Path {
         match self {
-            Self::Derivative(entry) => entry.path(),
+            Self::Encode(entry) => entry.path(),
             Self::Master { path, .. } => path,
         }
     }
 }
 
-impl Package<'_> {
-    pub fn key(&self, source: PackageSource<'_>) -> io::Result<blake3::Hash> {
-        Ok(self.object(source)?.key)
-    }
-
-    pub(super) fn object(&self, source: PackageSource<'_>) -> io::Result<Object> {
-        let scheme = match source {
-            PackageSource::Master { asset, .. } => Some(asset.scheme),
-            PackageSource::Derivative(_) => None,
-        };
-        self.object_for(
-            source.hash(),
-            scheme,
-            source.codec(),
-            self.artwork.map(|a| (blake3::hash(a.bytes), a.max_side)),
-        )
-    }
-
-    pub(super) fn object_for(
-        &self,
-        hash: blake3::Hash,
-        scheme: Option<u32>,
-        codec: Codec,
-        artwork: Option<(blake3::Hash, u32)>,
-    ) -> io::Result<Object> {
+impl TaggedCopy<'_> {
+    pub(super) fn check(&self, codec: Codec) -> io::Result<()> {
         if self.id3v1 && codec != Codec::Mp3 {
             return Err(io::Error::other("ID3v1 requires MP3 audio"));
         }
-        if artwork.is_some_and(|(_, max_side)| max_side == 0) {
+        if self.artwork.is_some_and(|art| art.max_side == 0) {
             return Err(io::Error::other("cover size must be positive"));
         }
-        let art = artwork.map(|(hash, max_side)| (hash.to_hex().to_string(), max_side));
-        // Version the tag writer, JPEG settings and metadata projection together.
-        let bytes = serde_json::to_vec(&(
-            "ritornel-package-v1",
-            scheme,
-            hash.to_hex().as_str(),
-            codec,
-            self.tags,
-            art,
-            self.id3v1,
-        ))?;
-        Ok(Object::package(blake3::hash(&bytes), codec, hash, scheme))
+        Ok(())
     }
 
-    pub(super) fn write(
+    /// Writes the copy to a new file at `staged`.
+    pub fn write(
         &self,
-        source: PackageSource<'_>,
+        source: CopySource<'_>,
         staged: &Path,
         cancel: &std::sync::atomic::AtomicBool,
     ) -> io::Result<()> {
+        let codec = source.codec();
+        self.check(codec)?;
         let mut input = File::open(source.path())?;
         source.verify(&input)?;
-        let codec = source.codec();
         let expected = match codec {
             Codec::Mp3 => FileType::Mpeg,
             Codec::Opus => FileType::Opus,
@@ -195,7 +230,7 @@ impl Package<'_> {
             .file_type()
             != Some(expected)
         {
-            return Err(io::Error::other("package source does not match its codec"));
+            return Err(io::Error::other("the audio does not match its codec"));
         }
         input.rewind()?;
         let mut output = OpenOptions::new()
@@ -227,18 +262,39 @@ impl Package<'_> {
         let options = WriteOptions::new()
             .use_id3v23(true)
             .respect_read_only(false);
+        let named = self.tags.named();
         if codec == Codec::Mp3 {
-            // Conversion groups fields by frame ID in a hash map. The projection
-            // has at most one frame per ID, so sorting makes rebuilds byte-stable.
+            // Conversion groups fields by frame ID in a hash map, and the
+            // ReplayGain figures and Ritornel's identifier are several
+            // `TXXX` frames. Ordering by frame ID and then by description
+            // makes a rebuild the same bytes.
             let mut frames: Vec<_> = Id3v2Tag::from(tag).into_iter().collect();
-            frames.sort_unstable_by(|a, b| a.id().as_str().cmp(b.id().as_str()));
+            // Plain figures and IDs, in the encoding every player reads.
+            frames.extend(named.into_iter().map(|(description, value)| {
+                Frame::UserText(ExtendedTextFrame::new(
+                    TextEncoding::Latin1,
+                    description.to_owned(),
+                    value,
+                ))
+            }));
+            let described = |frame: &Frame<'_>| match frame {
+                Frame::UserText(text) => text.description.to_string(),
+                _ => String::new(),
+            };
+            frames.sort_by(|a, b| {
+                (a.id().as_str(), described(a)).cmp(&(b.id().as_str(), described(b)))
+            });
             let mut ordered = Id3v2Tag::new();
             for frame in frames {
                 ordered.insert(frame);
             }
             ordered.save_to(&mut output, options.remove_others(true))
         } else {
-            tag.save_to(&mut output, options.remove_others(true))
+            let mut comments = VorbisComments::from(tag);
+            for (key, value) in named {
+                comments.push(key.to_owned(), value);
+            }
+            comments.save_to(&mut output, options.remove_others(true))
         }
         .map_err(io::Error::other)?;
         if self.id3v1 {

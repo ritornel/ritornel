@@ -7,6 +7,7 @@ members = [
     "crates/ritornel-engine",
     "crates/ritornel-client",
     "crates/ritornel-source",
+    "crates/ritornel-device",
     "crates/ritornel-lastfm",
     "crates/ritornel-musicbrainz",
     "crates/ritornel-windows",
@@ -27,7 +28,8 @@ publish = false
 # Dependencies point one way: contract <- domain <- engine <- server, and
 # contract <- client <- each client program. A plugin stands beside them:
 # source <- engine, and source <- each plugin <- server, and no plugin
-# depends on the engine. `scripts/check-deps.py` enforces it. See "Workspace and tooling" in docs/internals/server.md.
+# depends on the engine. A device family is the same again: device <- engine.
+# `scripts/check-deps.py` enforces it. See "Workspace and tooling" in docs/internals/server.md.
 [workspace.dependencies]
 ritornel-build = { path = "crates/ritornel-build" }
 ritornel-contract = { path = "crates/ritornel-contract" }
@@ -35,6 +37,7 @@ ritornel-domain = { path = "crates/ritornel-domain" }
 ritornel-engine = { path = "crates/ritornel-engine" }
 ritornel-client = { path = "crates/ritornel-client" }
 ritornel-source = { path = "crates/ritornel-source" }
+ritornel-device = { path = "crates/ritornel-device" }
 ritornel-lastfm = { path = "crates/ritornel-lastfm" }
 ritornel-musicbrainz = { path = "crates/ritornel-musicbrainz" }
 ritornel-windows = { path = "crates/ritornel-windows" }

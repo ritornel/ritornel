@@ -149,6 +149,20 @@ pub fn free_bytes(path: &Path) -> io::Result<u64> {
     Ok(free)
 }
 
+/// The size of the disk that holds `path`, and the bytes this user may
+/// still write on it.
+pub fn disk_bytes(path: &Path) -> io::Result<(u64, u64)> {
+    let wide = crate::wide(path);
+    let (mut free, mut total) = (0u64, 0u64);
+    // SAFETY: `wide` ends in a NUL, and the total not asked for is null.
+    let ok =
+        unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut free, &mut total, std::ptr::null_mut()) };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((total, free))
+}
+
 /// Renames the file or folder at `from` to `to`, on the same volume, and
 /// asks for the rename to be written through to the disk before this
 /// returns (`MOVEFILE_WRITE_THROUGH`), where Unix would sync the folder that
