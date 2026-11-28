@@ -432,6 +432,19 @@ async fn an_invite_works_once_and_only_for_the_hub_it_names() {
         for seed in [1, 4] {
             assert_eq!(post(&hub, &request(&exposed, other.server_id(), seed)).await.0, 403);
         }
+        // So is one whose join is otherwise not a join, for any secret it
+        // carries.
+        let garbled = InviteLink::parse(&invite(&hub, &hub_client).await).unwrap();
+        let plain = ritornel_client::post(
+            hub.endpoint(),
+            route::LINK,
+            None,
+            &serde_json::json!({ "secret": hex::encode(&garbled.secret), "proof": 7 }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(plain.status, 409);
+        assert_eq!(post(&hub, &request(&garbled, other.server_id(), 1)).await.0, 403);
 
         // The secret is spent by the satellite that uses it first.
         assert_eq!(

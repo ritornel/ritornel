@@ -358,8 +358,18 @@ async fn serve_http<S>(
     let seen = Arc::clone(&asked);
     let router = router
         .layer(middleware::from_fn(move |request: Request, next: Next| {
-            seen.store(true, Ordering::Relaxed);
-            next.run(request)
+            let seen = Arc::clone(&seen);
+            async move {
+                if !seen.load(Ordering::Relaxed) {
+                    // Past the deadline it is not served, however the
+                    // timer that ends the connection rounds.
+                    if tokio::time::Instant::now() >= deadline {
+                        return StatusCode::REQUEST_TIMEOUT.into_response();
+                    }
+                    seen.store(true, Ordering::Relaxed);
+                }
+                next.run(request).await
+            }
         }))
         .layer(Extension(secure));
     let mut http = http1::Builder::new();
@@ -750,28 +760,36 @@ async fn join(
         )
             .into_response();
     };
-    let asked = serde_json::from_slice::<ritornel_contract::LinkRequest>(&body);
     if !secure.0 {
-        let withdrawn = asked
-            .as_ref()
+        // Only the secret is looked for, so a body that is otherwise not a
+        // join still has its invite withdrawn.
+        #[derive(serde::Deserialize)]
+        struct Named {
+            secret: String,
+        }
+        let withdrawn = serde_json::from_slice::<Named>(&body)
             .ok()
-            .and_then(|asked| hex::decode(&asked.secret))
+            .and_then(|named| hex::decode(&named.secret))
             .is_some_and(|secret| core.withdraw_invite(&secret));
         warn!(
             withdrawn,
             "a satellite of an older release sent its join without TLS"
         );
-        // A conflict, as for another contract version, so a satellite of an
-        // older release shows this rather than calling the invite spent.
-        return (
-            StatusCode::CONFLICT,
+        let why = if withdrawn {
             "this hub takes a join over TLS alone, and runs a newer release than this \
              server. The invite was sent where others could read it, so it no longer \
              works: update this server, then join with a new invite from \
-             `ritornelctl link invite` on the hub\n",
-        )
-            .into_response();
+             `ritornelctl link invite` on the hub\n"
+        } else {
+            "this hub takes a join over TLS alone, and runs a newer release than this \
+             server: update this server, then join with a new invite from \
+             `ritornelctl link invite` on the hub\n"
+        };
+        // A conflict, as for another contract version, so a satellite of an
+        // older release shows this rather than calling the invite spent.
+        return (StatusCode::CONFLICT, why).into_response();
     }
+    let asked = serde_json::from_slice::<ritornel_contract::LinkRequest>(&body);
     let Ok(asked) = asked else {
         return (StatusCode::BAD_REQUEST, "that is not a request to link\n").into_response();
     };
