@@ -172,6 +172,87 @@ fn a_batch_is_stored_with_its_cursor_and_a_second_reading_writes_nothing() {
 }
 
 #[test]
+fn a_scrobble_whose_album_was_filled_in_later_stays_one_play() {
+    let rig = rig();
+    // A scrobble's key hashes its album, so the same scrobble read again
+    // with its album filled in comes with another key.
+    let read = |album: Option<&str>, ordinal: u8| {
+        let mut scrobble = record(T0 - 3 * HOUR, "Moss Arcade", "Paper Kites", ordinal);
+        scrobble.track.album = album.map(str::to_owned);
+        scrobble
+            .source_key
+            .extend_from_slice(album.unwrap_or("-").as_bytes());
+        scrobble
+    };
+    let span = |records| batch(records, T0 - 4 * HOUR, T0);
+    let counted = "SELECT count(*) FROM play_event WHERE counts = 1 AND excluded = 0";
+    let imports = "SELECT count(*) FROM history_observation WHERE kind = 'import'";
+    assert_eq!(rig.ingest(&span(vec![read(None, 0)])).new, 1);
+    assert_eq!(rig.one(counted), "1");
+
+    // Read again with its album: it is the scrobble stored, and nothing
+    // is written, by an incremental read or a full one.
+    let revision = rig.revision();
+    let filled = span(vec![read(Some("Tin Weather"), 0)]);
+    for full in [false, true] {
+        let stored = rig.read(&filled, full);
+        assert_eq!((stored.new, stored.gone, stored.set_aside), (0, 0, 0));
+    }
+    assert_eq!(rig.revision(), revision);
+    assert_eq!(
+        (rig.one(counted), rig.one(imports)),
+        ("1".into(), "1".into())
+    );
+
+    // A second play of it in that second, beside the first still listed,
+    // is a play of its own.
+    let both = span(vec![read(None, 0), read(Some("Tin Weather"), 0)]);
+    assert_eq!(rig.ingest(&both).new, 1);
+    assert_eq!(rig.one(counted), "2");
+}
+
+#[test]
+fn a_shifted_reads_duplicate_listed_again_is_no_scrobble_with_its_album_filled_in() {
+    let rig = rig();
+    let at = T0 - 3 * HOUR;
+    let scrobble = |album: &str, ordinal: u8| {
+        let mut scrobble = record(at, "Moss Arcade", "Paper Kites", ordinal);
+        scrobble.track.album = Some(album.to_owned());
+        scrobble.source_key.extend_from_slice(album.as_bytes());
+        scrobble
+    };
+    let span = |records| batch(records, T0 - 4 * HOUR, T0);
+    let counted = "SELECT count(*) FROM play_event WHERE counts = 1 AND excluded = 0";
+    // A read whose pages shifted stored one scrobble twice, and missed one
+    // of the same track on another album.
+    rig.ingest(&span(vec![
+        scrobble("Tin Weather", 0),
+        scrobble("Tin Weather", 1),
+    ]));
+    // A full read sets the second aside, and stores the one it missed.
+    let stored = rig.read(
+        &span(vec![scrobble("Tin Weather", 0), scrobble("Salt Road", 0)]),
+        true,
+    );
+    assert_eq!((stored.new, stored.set_aside), (1, 1));
+    assert_eq!(rig.one(counted), "2");
+
+    // The duplicate's key listed again is the import set aside, held
+    // already, and is never taken for the other album's scrobble: nothing
+    // is lost, nothing is counted twice, and a new track beside it is
+    // stored.
+    let mut again = vec![scrobble("Tin Weather", 0), scrobble("Tin Weather", 1)];
+    again.push(record(T0 - 2 * HOUR, "Moss Arcade", "Lanternfish", 0));
+    let stored = rig.ingest(&span(again.clone()));
+    assert_eq!(stored.new, 1);
+    assert_eq!(rig.one(counted), "3");
+    // A full read lifts the duplicate, which the source lists again.
+    let stored = rig.read(&span(again), true);
+    assert_eq!((stored.new, stored.set_aside), (0, 0));
+    assert_eq!(rig.one(counted), "4");
+}
+
+#[test]
 fn a_full_read_sets_aside_a_scrobble_an_earlier_read_stored_twice() {
     let rig = rig();
     // An earlier read whose pages shifted between requests: Paper Kites

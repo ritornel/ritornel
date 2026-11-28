@@ -86,6 +86,26 @@ impl DataDir {
         &self.root
     }
 
+    /// The directory as the system resolves it now, links followed, as
+    /// text: what scrobbling turned on here is bound to, so that a copy of
+    /// the directory, or the directory moved, is told apart from it. See
+    /// "Copied and restored data directories" in docs/internals/history.md.
+    /// A path that is not UTF-8 is given by its bytes in hex, after
+    /// `bytes:`, which no absolute path begins with, so no two paths are
+    /// one place.
+    pub(crate) fn place(&self) -> String {
+        let resolved = crate::backup::resolved(&self.root);
+        // Asked before it is made plain, which on Windows reads it lossily.
+        if resolved.to_str().is_some() {
+            return crate::platform::plain_path(&resolved)
+                .to_string_lossy()
+                .into_owned();
+        }
+        let bytes = resolved.as_os_str().as_encoded_bytes();
+        let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        format!("bytes:{hex}")
+    }
+
     pub(crate) fn lock_file(&self) -> PathBuf {
         self.root.join(local::SERVER_LOCK)
     }

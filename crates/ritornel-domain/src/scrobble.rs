@@ -547,6 +547,20 @@ pub fn same_track(artist: &str, title: &str, other_artist: &str, other_title: &s
     (key(artist), key(title)) == (key(other_artist), key(other_title))
 }
 
+/// Whether two artist and title pairs may name one track that the
+/// service corrected as it took it: the artist or the title is the same by
+/// its normalised key, and that key is not empty. Weaker than
+/// [`same_track`], so it is only asked of a scrobble at the exact second of
+/// a play, where nothing else could be its echo.
+pub fn corrected_track(artist: &str, title: &str, other_artist: &str, other_title: &str) -> bool {
+    let key = |text: &str| crate::normalize::words_key(&text.replace(['\u{fe0e}', '\u{fe0f}'], ""));
+    let same = |one: &str, other: &str| {
+        let one = key(one);
+        !one.is_empty() && one == key(other)
+    };
+    same(artist, other_artist) || same(title, other_title)
+}
+
 impl Catalog {
     /// Indexes these recordings under every artist and title they show,
     /// their own and each appearance's.
@@ -1120,6 +1134,33 @@ mod tests {
         // A title of symbols alone is still its symbols.
         assert_eq!(bound("--->"), Some((9, Rule::Exact)));
         assert_eq!(bound("<---"), None);
+    }
+
+    #[test]
+    fn a_track_the_service_corrected_keeps_its_artist_or_its_title() {
+        // The title corrected, or the artist: either may be one track.
+        assert!(corrected_track(
+            "Mira Vale",
+            "Lantrens",
+            "Mira Vale",
+            "Lanterns"
+        ));
+        assert!(corrected_track(
+            "Mira Valle",
+            "Lanterns",
+            "Mira Vale",
+            "Lanterns"
+        ));
+        assert!(corrected_track("Mira Vale", "Echo", "mira vale", "ECHO"));
+        // Nothing to match is no match.
+        assert!(!corrected_track("", "Lanterns", "", "Echo"));
+        // Both changed is another track.
+        assert!(!corrected_track(
+            "Mira Valle",
+            "Lantrens",
+            "Mira Vale",
+            "Lanterns"
+        ));
     }
 
     #[test]

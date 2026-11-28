@@ -16,7 +16,9 @@
 //! the artist, album and title it names, and its place among identical
 //! scrobbles of the same second, so two plays of one track that Last.fm
 //! dates to the same second stay two ("Last.fm" in
-//! docs/internals/history.md).
+//! docs/internals/history.md). A scrobble whose album Last.fm fills in
+//! later is listed under a new key; the library takes it for the import it
+//! replaces rather than as a second play.
 //! A span is always whole seconds, so every scrobble of one second is read
 //! in the same span, and that place is the same whenever it is read. A
 //! second whose scrobbles fall on both sides of a page boundary is read

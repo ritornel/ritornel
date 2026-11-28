@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use rusqlite::{Connection, OptionalExtension};
 
 use ritornel_domain::history::PlayRule;
-use ritornel_domain::scrobble::same_track;
+use ritornel_domain::scrobble::{corrected_track, same_track};
 
 use crate::history_store::{rederive_delivery, rederive_delivery_by};
 use crate::{Error, Id, LibraryStore, WriteRequest};
@@ -122,6 +122,12 @@ pub(crate) const ALREADY_SCROBBLED: &str = "the account already has this play fr
 /// part of a play some listen here made, as its echo or beside it, says
 /// nothing of another play. This is not cross-source grouping by a window of
 /// time; it only keeps a play from being scrobbled twice.
+///
+/// One such scrobble stands for one play: plays already withdrawn as
+/// [`ALREADY_SCROBBLED`] claim the scrobbles first, one each, and this play
+/// is already scrobbled only if one is left for it. The matching takes in
+/// every scrobble and withdrawn play linked to this one by a chain of
+/// seconds a second apart, so no claim is missed at its edge.
 fn already_scrobbled(
     connection: &Connection,
     endpoint: i64,
@@ -129,8 +135,61 @@ fn already_scrobbled(
     artist: &str,
     title: &str,
 ) -> Result<bool, Error> {
+    if foreign_scrobbles(
+        connection,
+        endpoint,
+        seconds - 1,
+        seconds + 1,
+        artist,
+        title,
+    )?
+    .is_empty()
+    {
+        return Ok(false);
+    }
+    // The scrobbles and the plays withdrawn for them that this play's
+    // claim can reach: each within a second of another, as far as they go.
+    let (mut lo, mut hi) = (seconds, seconds);
+    let (scrobbled, mut plays) = loop {
+        let scrobbled = foreign_scrobbles(connection, endpoint, lo - 1, hi + 1, artist, title)?;
+        let plays = withdrawn_plays(connection, endpoint, lo - 1, hi + 1, artist, title)?;
+        let (wide_lo, wide_hi) = scrobbled
+            .iter()
+            .chain(&plays)
+            .fold((lo, hi), |(lo, hi), at| (lo.min(*at), hi.max(*at)));
+        if (wide_lo, wide_hi) == (lo, hi) {
+            break (scrobbled, plays);
+        }
+        (lo, hi) = (wide_lo, wide_hi);
+    };
+    plays.push(seconds);
+    let edges: Vec<Vec<usize>> = plays
+        .iter()
+        .map(|play| {
+            scrobbled
+                .iter()
+                .enumerate()
+                .filter(|(_, at)| at.abs_diff(*play) <= 1)
+                .map(|(index, _)| index)
+                .collect()
+        })
+        .collect();
+    Ok(last_is_matched(&edges))
+}
+
+/// The seconds, from `lo` to `hi`, of the account's active scrobbles of
+/// this track that no listen here made, as [`already_scrobbled`] counts
+/// them.
+fn foreign_scrobbles(
+    connection: &Connection,
+    endpoint: i64,
+    lo: i64,
+    hi: i64,
+    artist: &str,
+    title: &str,
+) -> Result<Vec<i64>, Error> {
     let mut statement = connection.prepare_cached(
-        "SELECT i.artist, i.title FROM observation_import i
+        "SELECT i.played_at_utc_ms, i.artist, i.title FROM observation_import i
          JOIN history_observation o ON o.id = i.observation_id
          WHERE o.endpoint_id = ?1 AND i.played_at_utc_ms BETWEEN ?2 AND ?3
            AND NOT EXISTS (
@@ -142,17 +201,90 @@ fn already_scrobbled(
                                JOIN history_observation yo
                                  ON yo.id = y.observation_id AND yo.kind = 'listen'
                                WHERE y.play_event_id = pe.id))
-           )",
+           )
+         ORDER BY i.played_at_utc_ms, o.id",
     )?;
-    let found: Vec<(String, String)> = statement
-        .query_map(
-            (endpoint, (seconds - 1) * 1000, (seconds + 1) * 1000),
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?
-        .collect::<Result<_, _>>()?;
-    Ok(found
-        .iter()
-        .any(|(their_artist, their_title)| same_track(artist, title, their_artist, their_title)))
+    let rows = statement.query_map((endpoint, lo * 1000, hi * 1000 + 999), |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut found = Vec::new();
+    for row in rows {
+        let (at_ms, their_artist, their_title) = row?;
+        if same_track(artist, title, &their_artist, &their_title) {
+            found.push(at_ms.div_euclid(1000));
+        }
+    }
+    Ok(found)
+}
+
+/// The seconds, from `lo` to `hi`, of plays of this track withdrawn as
+/// [`ALREADY_SCROBBLED`] to the account.
+fn withdrawn_plays(
+    connection: &Connection,
+    endpoint: i64,
+    lo: i64,
+    hi: i64,
+    artist: &str,
+    title: &str,
+) -> Result<Vec<i64>, Error> {
+    let mut statement = connection.prepare_cached(
+        "SELECT sent_timestamp_s, artist, title FROM history_delivery
+         WHERE endpoint_id = ?1 AND state = 'withdrawn' AND detail = ?2
+           AND sent_timestamp_s BETWEEN ?3 AND ?4
+         ORDER BY sent_timestamp_s, id",
+    )?;
+    let rows = statement.query_map((endpoint, ALREADY_SCROBBLED, lo, hi), |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut found = Vec::new();
+    for row in rows {
+        let (at, their_artist, their_title) = row?;
+        if same_track(artist, title, &their_artist, &their_title) {
+            found.push(at);
+        }
+    }
+    Ok(found)
+}
+
+/// Whether, matching each left vertex in turn to a right one of its own
+/// along `edges`, as many as can be, the last is matched. Those before it
+/// keep theirs: an augmenting path never unmatches a vertex.
+fn last_is_matched(edges: &[Vec<usize>]) -> bool {
+    fn augment(
+        left: usize,
+        edges: &[Vec<usize>],
+        seen: &mut BTreeSet<usize>,
+        owner: &mut HashMap<usize, usize>,
+    ) -> bool {
+        for &right in edges.get(left).into_iter().flatten() {
+            if !seen.insert(right) {
+                continue;
+            }
+            let free = match owner.get(&right).copied() {
+                None => true,
+                Some(other) => augment(other, edges, seen, owner),
+            };
+            if free {
+                owner.insert(right, left);
+                return true;
+            }
+        }
+        false
+    }
+    let mut owner = HashMap::new();
+    let mut matched = false;
+    for left in 0..edges.len() {
+        matched = augment(left, edges, &mut BTreeSet::new(), &mut owner);
+    }
+    matched
 }
 
 /// A play's scrobble metadata snapshot, used when refreshing a never-attempted
@@ -173,6 +305,15 @@ enum PendingCheck {
     /// Its play is no longer eligible (or its track names changed after an
     /// earlier send attempt): withdraw it and never send.
     Withdraw(&'static str),
+    /// The account has its play from another player, at this second and
+    /// under these names, which a never-tried delivery takes from its play
+    /// as it is now: withdraw it under them, so that the scrobble it claims
+    /// is known by them ([`already_scrobbled`]), and never send.
+    Scrobbled {
+        timestamp_s: i64,
+        artist: String,
+        title: String,
+    },
     /// Eligible to send at `timestamp_s` with the queued snapshot as stored.
     Send { timestamp_s: i64 },
     /// Eligible to send after refreshing the never-attempted delivery's stored
@@ -299,7 +440,11 @@ fn check_pending(
         check_artist,
         check_title,
     )? {
-        return Ok(PendingCheck::Withdraw(ALREADY_SCROBBLED));
+        return Ok(PendingCheck::Scrobbled {
+            timestamp_s: check_seconds,
+            artist: check_artist.to_owned(),
+            title: check_title.to_owned(),
+        });
     }
     let Some(play) = play else {
         return Ok(PendingCheck::Withdraw(
@@ -725,6 +870,30 @@ impl LibraryStore {
                                     .execute((delivery, why, write.now_ms(), write.rev()))?;
                                 continue;
                             }
+                            PendingCheck::Scrobbled {
+                                timestamp_s,
+                                artist,
+                                title,
+                            } => {
+                                connection
+                                    .prepare_cached(
+                                        "UPDATE history_delivery
+                                         SET state = 'withdrawn', detail = ?2, updated_at_ms = ?3,
+                                             rev = ?4, sent_timestamp_s = ?5, artist = ?6,
+                                             title = ?7
+                                         WHERE id = ?1",
+                                    )?
+                                    .execute(rusqlite::params![
+                                        delivery,
+                                        ALREADY_SCROBBLED,
+                                        write.now_ms(),
+                                        write.rev(),
+                                        timestamp_s,
+                                        artist,
+                                        title,
+                                    ])?;
+                                continue;
+                            }
                             PendingCheck::Send { timestamp_s } => (timestamp_s, None),
                             PendingCheck::Refresh(snapshot) => {
                                 (snapshot.timestamp_s, Some(snapshot))
@@ -809,7 +978,7 @@ impl LibraryStore {
                         Settled::Refused(detail) => ("refused", None, None, Some(detail), None),
                         Settled::Unknown(detail) => ("unknown", None, None, Some(detail), None),
                     };
-                    connection
+                    let changed = connection
                         .prepare_cached(
                             "UPDATE history_delivery
                              SET state = ?2, accepted_artist = ?3, accepted_title = ?4,
@@ -828,6 +997,11 @@ impl LibraryStore {
                             write.now_ms(),
                             write.rev(),
                         ])?;
+                    // One no longer sending, as a start marks one an earlier
+                    // run left, keeps what it was found to be.
+                    if changed == 0 {
+                        continue;
+                    }
                     // What an echo is matched on may have changed.
                     rederive_delivery(write, *delivery)?;
                 }
@@ -1118,6 +1292,7 @@ pub struct Held {
 }
 
 /// An active, non-excluded import observation not yet corroborating any listen.
+#[derive(Clone)]
 struct UnmatchedImport {
     observation: i64,
     seconds: i64,
@@ -1273,6 +1448,110 @@ fn match_reconcile_candidates(
         .into_iter()
         .map(|(imp, (u, refresh))| (u, (imp, refresh)))
         .collect()
+}
+
+/// A second a restore candidate may have been sent at, with the names it
+/// would have been sent under.
+struct SentAt<'a> {
+    second: i64,
+    /// How far either side its clock may have put it.
+    tolerance: i64,
+    artist: &'a str,
+    title: &'a str,
+    /// The play's names now, when they are what it would have been sent
+    /// under.
+    refresh: Option<&'a Snapshot>,
+}
+
+/// Where a restore candidate may have been sent: a delivery at its own
+/// second and names, and at its play's as they are now if it was never
+/// tried; an unplanned listen at its second, within its clock's tolerance.
+fn sent_at(candidate: &ReconcileCandidate) -> Vec<SentAt<'_>> {
+    match candidate {
+        ReconcileCandidate::Pending {
+            queued_s,
+            queued_artist,
+            queued_title,
+            refresh,
+            ..
+        } => {
+            let mut found = vec![SentAt {
+                second: *queued_s,
+                tolerance: 0,
+                artist: queued_artist,
+                title: queued_title,
+                refresh: None,
+            }];
+            if let Some(current) = refresh {
+                found.push(SentAt {
+                    second: current.timestamp_s,
+                    tolerance: 0,
+                    artist: &current.artist,
+                    title: &current.title,
+                    refresh: Some(current),
+                });
+            }
+            found
+        }
+        ReconcileCandidate::Unplanned(listen) => vec![SentAt {
+            second: listen.at_ms.div_euclid(1000),
+            tolerance: restore_tolerance_s(&listen.clock_basis, listen.time_precision_ms),
+            artist: &listen.artist,
+            title: &listen.title,
+            refresh: None,
+        }],
+    }
+}
+
+/// The second tier of restore matching, for what the first left: a play
+/// and a scrobble that are alone in one exact second, whose names may be
+/// one track the service corrected ([`corrected_track`]), as when Last.fm
+/// corrected a title after the backup was taken and before its echo was
+/// imported. A second that holds another candidate, by its time or within
+/// its clock's tolerance, or another unmatched scrobble, is passed over, so
+/// that a scrobble another player sent beside ours is never taken for it.
+fn match_corrected(
+    candidates: &[ReconcileCandidate],
+    imports: &[UnmatchedImport],
+    matched: &mut BTreeMap<usize, (usize, Option<Snapshot>)>,
+) {
+    let taken: BTreeSet<usize> = matched.values().map(|(import, _)| *import).collect();
+    let mut claims: BTreeMap<i64, BTreeSet<usize>> = BTreeMap::new();
+    for (index, candidate) in candidates.iter().enumerate() {
+        for at in sent_at(candidate) {
+            for near in
+                at.second.saturating_sub(at.tolerance)..=at.second.saturating_add(at.tolerance)
+            {
+                claims.entry(near).or_default().insert(index);
+            }
+        }
+    }
+    let mut at_second: BTreeMap<i64, Vec<usize>> = BTreeMap::new();
+    for (index, import) in imports.iter().enumerate() {
+        at_second.entry(import.seconds).or_default().push(index);
+    }
+    for (index, candidate) in candidates.iter().enumerate() {
+        if matched.contains_key(&index) {
+            continue;
+        }
+        for at in sent_at(candidate) {
+            if at.tolerance != 0 || claims.get(&at.second).map(BTreeSet::len) != Some(1) {
+                continue;
+            }
+            let Some(&[import]) = at_second.get(&at.second).map(Vec::as_slice) else {
+                continue;
+            };
+            let Some(found) = imports.get(import) else {
+                continue;
+            };
+            if !taken.contains(&import)
+                && corrected_track(at.artist, at.title, &found.artist, &found.title)
+            {
+                matched.insert(index, (import, at.refresh.cloned()));
+                break;
+            }
+        }
+    }
 }
 
 /// Tolerance in whole seconds for matching an unplanned listen during restore
@@ -1489,10 +1768,39 @@ pub(crate) fn reconcile_late_listen(
             play_s.saturating_sub(tolerance_s),
             play_s.saturating_add(tolerance_s),
         )?;
-        let matched = imports
-            .into_iter()
+        let named = imports
+            .iter()
             .filter(|imp| same_track(&artist, &title, &imp.artist, &imp.title))
             .min_by_key(|imp| (imp.seconds.abs_diff(play_s), imp.observation));
+        // As `match_corrected` does: a scrobble alone in the exact second of
+        // a play alone in it may be the play's, under names the service
+        // corrected.
+        let corrected = || -> Result<Option<&UnmatchedImport>, Error> {
+            let [only] = imports.as_slice() else {
+                return Ok(None);
+            };
+            if tolerance_s != 0
+                || only.seconds != play_s
+                || !corrected_track(&artist, &title, &only.artist, &only.title)
+            {
+                return Ok(None);
+            }
+            let plays: i64 = connection.query_row(
+                "SELECT count(*) FROM play_event pe
+                 JOIN play_event_observation peo
+                   ON peo.play_event_id = pe.id AND peo.role = 'primary'
+                 JOIN history_observation o ON o.id = peo.observation_id AND o.kind = 'listen'
+                 WHERE pe.listener_id = ?1 AND pe.event_at_utc_ms BETWEEN ?2 AND ?3
+                   AND pe.counts = 1 AND pe.excluded = 0",
+                (listener, play_s * 1000, play_s * 1000 + 999),
+                |row| row.get(0),
+            )?;
+            Ok((plays == 1).then_some(only))
+        };
+        let matched = match named {
+            Some(import) => Some(import.clone()),
+            None => corrected()?.cloned(),
+        };
         if let Some(import) = matched {
             let candidate = UnplannedListen {
                 observation: primary_obs,
@@ -1816,7 +2124,8 @@ impl LibraryStore {
                         })
                         .collect();
 
-                    let matched = match_reconcile_candidates(&edges);
+                    let mut matched = match_reconcile_candidates(&edges);
+                    match_corrected(&candidates, &imports, &mut matched);
                     for (cand_idx, (imp_idx, chosen_refresh)) in matched {
                         let (Some(candidate), Some(import)) =
                             (candidates.get(cand_idx), imports.get(imp_idx))

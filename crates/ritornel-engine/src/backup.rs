@@ -357,6 +357,25 @@ pub fn hold_sending(copy: &Path, taken_at_ms: i64) -> Result<bool, Error> {
     Ok(held)
 }
 
+/// Turns scrobbling off for every session that scrobbles in `copy`, a
+/// backup's copy of `server.db`, and binds it to no data directory: a
+/// server started on it, wherever it is put back and whatever its build,
+/// sends nothing until the owner turns scrobbling on again, as the server
+/// the backup was taken from may still be sending as the same session. The
+/// `server.db` copied is not changed. The copy is synced again, as
+/// [`copy_database`] leaves it. Returns whether any session was marked.
+pub fn unbind_scrobbling(copy: &Path) -> Result<bool, Error> {
+    let connection = Location::File(copy.to_owned()).open(OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    let unbound = crate::service_session::unbind_copy(&connection)?;
+    drop(connection);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(copy)
+        .and_then(|file| file.sync_all())
+        .map_err(Error::Io)?;
+    Ok(unbound)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -506,6 +525,51 @@ mod tests {
         let path = scratch.0.join("library.db");
         std::os::unix::fs::symlink(&path, &path).unwrap();
         assert!(pending_migrations(&path, Database::Library).is_err());
+    }
+
+    #[test]
+    fn a_server_put_back_from_a_backup_scrobbles_nothing_until_it_is_turned_on_again() {
+        use crate::{PlaceCheck, ServiceKey};
+        let scratch = Scratch::new("unbound");
+        let path = scratch.0.join("server.db");
+        let server = open(&path);
+        let account = Id::from_bytes([7; 16]);
+        // With no session that scrobbles, a copy is not changed.
+        let idle = scratch.0.join("idle.db");
+        copy_database(&path, &idle).unwrap();
+        assert!(!unbind_scrobbling(&idle).unwrap());
+
+        server
+            .save_service_session("lastfm", account, "someone", &ServiceKey::new("KEY"), false)
+            .unwrap();
+        server
+            .set_scrobbling("lastfm", true, "/invented/data")
+            .unwrap();
+        let copy = scratch.0.join("copy.db");
+        copy_database(&path, &copy).unwrap();
+        assert!(unbind_scrobbling(&copy).unwrap());
+        // The server copied still scrobbles where it was turned on.
+        let check = |store: &ServerStore| {
+            store
+                .check_scrobbling_place("lastfm", "/invented/data", false)
+                .unwrap()
+        };
+        assert_eq!(check(&server), PlaceCheck::Same);
+        drop(server);
+
+        // Put back, even where it was taken, it scrobbles nothing, as an
+        // older build that knows no place finds it too; this one says so
+        // once. Turned on again, it scrobbles there.
+        let restored = open(&copy);
+        let session = restored.service_session("lastfm").unwrap().unwrap();
+        assert_eq!(session.scrobble_from_ms, None);
+        assert_eq!(session.key.expose(), "KEY", "the session itself is kept");
+        assert_eq!(check(&restored), PlaceCheck::Restored);
+        assert_eq!(check(&restored), PlaceCheck::Same);
+        restored
+            .set_scrobbling("lastfm", true, "/invented/data")
+            .unwrap();
+        assert_eq!(check(&restored), PlaceCheck::Same);
     }
 
     #[test]

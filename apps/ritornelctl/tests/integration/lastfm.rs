@@ -547,3 +547,117 @@ fn what_begins_to_play_is_shown_as_playing_now_only_while_scrobbling_is_on() {
         assert!(!written.contains(secret), "a secret in the log");
     }
 }
+
+/// Copies a stopped server's data directory, as `cp -R` does.
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let to = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &to);
+        } else {
+            std::fs::copy(entry.path(), &to).unwrap();
+        }
+    }
+}
+
+#[test]
+fn a_copied_or_restored_data_directory_scrobbles_nothing_until_scrobbling_is_turned_on_there() {
+    let scratch = scratch();
+    let (data_dir, music) = (scratch.data_dir(), music(&scratch, TRACK_SECONDS));
+    let folder = music.to_str().unwrap();
+    let place = scratch.0.join("backups");
+    std::fs::create_dir_all(&place).unwrap();
+    let backups = [("RITORNEL_BACKUP_DIR", place.to_str().unwrap())];
+    let fake = FakeLastfm::start("someone", Vec::new());
+    let since = |dir: &Path| json(dir, &["lastfm", "status"])["scrobblingSince"].clone();
+    let plays = |dir: &Path| json(dir, &["history"])["plays"].as_array().unwrap().len();
+
+    let server = start(&data_dir, &fake, &backups);
+    ok(&data_dir, &["library", "create"]);
+    ok(&data_dir, &["scan", folder]);
+    ok(&data_dir, &["lastfm", "signin"]);
+    json(&data_dir, &["lastfm", "scrobbling", "on"]);
+    let on = since(&data_dir);
+    assert!(on.is_number(), "{on}");
+    server.stop();
+
+    // The album played, on a run that cannot reach Last.fm: two plays
+    // wait to be scrobbled when the backup is taken and the directory is
+    // copied.
+    let mut command = null_output_command(&data_dir, &backups);
+    command.env("RITORNEL_TEST_NULL_OUTPUT_SPEED", "50");
+    let server = Server::start_command(command, false);
+    ok(&data_dir, &["play", folder, "--follow"]);
+    until(&data_dir, &["history"], |recent| recent["undelivered"] == 0);
+    assert_eq!(plays(&data_dir), 2);
+    let backed_up = json(&data_dir, &["backup"]);
+    let backup = PathBuf::from(backed_up["backup"]["path"].as_str().unwrap());
+    let readme = std::fs::read_to_string(backup.join("README.txt")).unwrap();
+    assert!(
+        readme.contains("ritornelctl lastfm scrobbling on"),
+        "{readme}"
+    );
+    server.stop();
+
+    // A copy of the data directory has the same server and session, and
+    // scrobbling is off there, so nothing is planned or sent.
+    let copy = scratch.0.join("copy");
+    copy_dir(&data_dir, &copy);
+    let server = start(&copy, &fake, &[]);
+    let status = json(&copy, &["lastfm", "status"]);
+    assert_eq!(status.get("scrobblingSince"), None, "{status}");
+    assert_eq!(status["deliveries"], serde_json::json!([]), "{status}");
+    assert!(logs(&copy).contains("copied or moved from"));
+    // Turned on there, it scrobbles what is played from then on, and never
+    // the plays the copy came with, which stay in its history.
+    json(&copy, &["lastfm", "scrobbling", "on"]);
+    let rearmed = since(&copy).as_u64().unwrap();
+    ok(&copy, &["play", folder, "--follow"]);
+    let deadline = Instant::now() + WAIT;
+    while fake.scrobbled().len() < 2 {
+        assert!(Instant::now() < deadline, "{:?}", fake.scrobbled());
+        // sleep: between looks; the deadline bounds them.
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    until(&copy, &["lastfm", "status"], |status| {
+        status["deliveries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|count| !matches!(count["state"].as_str(), Some("pending" | "sending")))
+    });
+    let sent = fake.scrobbled();
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert!(
+        sent.iter().all(|scrobble| scrobble.at_s >= rearmed / 1000),
+        "only what was played after it was turned on: {sent:?}"
+    );
+    assert_eq!(plays(&copy), 4);
+    server.stop();
+    let server = start(&copy, &fake, &[]);
+    assert!(
+        since(&copy).is_number(),
+        "turned on there, it stays on there"
+    );
+    server.stop();
+
+    // The data directory it was copied from goes on as it was.
+    let server = start(&data_dir, &fake, &[]);
+    assert_eq!(since(&data_dir), on);
+    server.stop();
+
+    // Put back from the backup, even where it was taken, it scrobbles
+    // nothing until it is turned on again.
+    for name in ["server.db", "library.db"] {
+        for sidecar in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(data_dir.join(format!("{name}{sidecar}")));
+        }
+        std::fs::copy(backup.join(name), data_dir.join(name)).unwrap();
+    }
+    let server = start(&data_dir, &fake, &[]);
+    assert_eq!(since(&data_dir), Value::Null);
+    assert!(logs(&data_dir).contains("put back from a backup"));
+    server.stop();
+}
