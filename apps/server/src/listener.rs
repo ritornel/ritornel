@@ -376,18 +376,21 @@ async fn serve_http<S>(
     // there is nobody to tell.
     loop {
         tokio::select! {
-            _ = connection.as_mut() => return,
-            () = stopped(&mut stopping) => {
-                connection.as_mut().graceful_shutdown();
-                let _ = connection.await;
-                return;
-            }
+            // The deadline is looked at first, so a first request that is
+            // overdue when this task runs is not served for being ready.
+            biased;
             () = tokio::time::sleep_until(deadline), if waiting_for_first => {
                 if !asked.load(Ordering::Relaxed) {
                     return;
                 }
                 waiting_for_first = false;
             }
+            () = stopped(&mut stopping) => {
+                connection.as_mut().graceful_shutdown();
+                let _ = connection.await;
+                return;
+            }
+            _ = connection.as_mut() => return,
         }
     }
 }
@@ -451,20 +454,8 @@ async fn require_credential(
         return next.run(request).await;
     }
     // A satellite joining presents the invite's secret in its body, which
-    // is checked there, and only over TLS: the secret is never read from a
-    // connection anyone between could read too.
+    // is checked there ([`join`]).
     if request.method() == Method::POST && request.uri().path() == route::LINK {
-        if !secure {
-            info!("a satellite tried to join without TLS: it runs an older release");
-            // A conflict, as for another contract version, so a satellite of
-            // an older release shows this rather than calling the invite spent.
-            return (
-                StatusCode::CONFLICT,
-                "this hub takes a join over TLS alone, and runs a newer release than this \
-                 server: update this server, then join with the same invite\n",
-            )
-                .into_response();
-        }
         return next.run(request).await;
     }
     // Each check is a comparison in memory. It reads no file and no
@@ -730,7 +721,17 @@ const LINK_BODY_WAIT: Duration = Duration::from_secs(5);
 /// A satellite joining: `POST /v1/link`, with the invite's secret in a
 /// [`LinkRequest`](ritornel_contract::LinkRequest). It is answered with the
 /// link session's token, or refused with why.
-async fn join(State(core): State<Arc<Core>>, request: Request) -> Response {
+///
+/// It is taken over TLS alone. A join over plain HTTP comes from a
+/// satellite of an older release, and its secret has travelled where
+/// anyone between could read it: the invite it names is withdrawn, so that
+/// whoever read the secret cannot join with it, and the satellite is told
+/// to update and join with a new one.
+async fn join(
+    State(core): State<Arc<Core>>,
+    Extension(secure): Extension<Secure>,
+    request: Request,
+) -> Response {
     // A server names no origin, and a page in a browser is not let try.
     if request.headers().contains_key(header::ORIGIN) {
         return (StatusCode::FORBIDDEN, "a page may not link a server\n").into_response();
@@ -749,7 +750,29 @@ async fn join(State(core): State<Arc<Core>>, request: Request) -> Response {
         )
             .into_response();
     };
-    let Ok(asked) = serde_json::from_slice::<ritornel_contract::LinkRequest>(&body) else {
+    let asked = serde_json::from_slice::<ritornel_contract::LinkRequest>(&body);
+    if !secure.0 {
+        let withdrawn = asked
+            .as_ref()
+            .ok()
+            .and_then(|asked| hex::decode(&asked.secret))
+            .is_some_and(|secret| core.withdraw_invite(&secret));
+        warn!(
+            withdrawn,
+            "a satellite of an older release sent its join without TLS"
+        );
+        // A conflict, as for another contract version, so a satellite of an
+        // older release shows this rather than calling the invite spent.
+        return (
+            StatusCode::CONFLICT,
+            "this hub takes a join over TLS alone, and runs a newer release than this \
+             server. The invite was sent where others could read it, so it no longer \
+             works: update this server, then join with a new invite from \
+             `ritornelctl link invite` on the hub\n",
+        )
+            .into_response();
+    }
+    let Ok(asked) = asked else {
         return (StatusCode::BAD_REQUEST, "that is not a request to link\n").into_response();
     };
     // It writes both databases.

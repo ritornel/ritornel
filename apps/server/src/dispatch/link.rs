@@ -401,6 +401,12 @@ impl Core {
         })
     }
 
+    /// Withdraws the open invite whose secret is `secret`, if there is one:
+    /// a secret sent where others could read it opens nothing.
+    pub(crate) fn withdraw_invite(&self, secret: &[u8]) -> bool {
+        self.invites.redeem(secret).is_some()
+    }
+
     /// The hub's side of `POST /v1/link`: checks the secret and the
     /// satellite's version, registers it in the library, and issues its
     /// link session. It writes both databases, so it runs where waiting is

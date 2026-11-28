@@ -462,6 +462,31 @@ impl fmt::Debug for InviteLink {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_join_proof_names_the_hub_the_satellite_and_its_release() {
+        let hub = Id::from_bytes([1; 16]);
+        let satellite = Id::from_bytes([2; 16]);
+        let secret = [9; 32];
+        let proof = link_request_proof(hub, satellite, 8, &secret);
+        assert!(proof.starts_with(b"ritornel link request proof v2\0"));
+        for other in [
+            link_request_proof(Id::from_bytes([3; 16]), satellite, 8, &secret),
+            link_request_proof(hub, Id::from_bytes([3; 16]), 8, &secret),
+            link_request_proof(hub, satellite, 7, &secret),
+            link_request_proof(hub, satellite, 8, &[8; 32]),
+        ] {
+            assert_ne!(proof, other);
+        }
+        // What a satellite of the release before signed is not this.
+        let before = [
+            b"ritornel link request proof v1\0".as_slice(),
+            hub.as_bytes(),
+            &secret,
+        ]
+        .concat();
+        assert_ne!(proof, before);
+    }
+
     fn invite() -> InviteLink {
         InviteLink {
             hub: Id::from_bytes([0x11; 16]),

@@ -407,26 +407,32 @@ async fn an_invite_works_once_and_only_for_the_hub_it_names() {
         unproved.proof = request(&parsed, other.server_id(), 2).proof;
         assert_eq!(post(&hub, &unproved).await.0, 400);
 
-        // It is never taken over plain HTTP, where anyone between could read
-        // it, and is not spent by being sent so.
+        // A join read on its way cannot be sent again as another server:
+        // the proof names the server it is for.
+        let mut taken = request(&parsed, other.server_id(), 1);
+        taken.server_id = ritornel_client::contract::Id::from_bytes([3; 16]);
+        assert_eq!(post(&hub, &taken).await.0, 400);
+
+        // A join is never taken over plain HTTP. Its secret has travelled
+        // where anyone between could read it, so the invite it names no
+        // longer opens anything, for any key, and the satellite is told to
+        // update and ask for a new one.
+        let exposed = InviteLink::parse(&invite(&hub, &hub_client).await).unwrap();
         let plain = ritornel_client::post(
             hub.endpoint(),
             route::LINK,
             None,
-            &request(&parsed, other.server_id(), 1),
+            &request(&exposed, other.server_id(), 1),
         )
         .await
         .unwrap();
         assert_eq!(plain.status, 409);
-        assert!(
-            String::from_utf8_lossy(&plain.body).contains("update this server"),
-            "{plain:?}"
-        );
-        // Nor can whoever read a join send it again as another server: the
-        // proof names the server it is for.
-        let mut taken = request(&parsed, other.server_id(), 1);
-        taken.server_id = ritornel_client::contract::Id::from_bytes([3; 16]);
-        assert_eq!(post(&hub, &taken).await.0, 400);
+        let said = String::from_utf8_lossy(&plain.body);
+        assert!(said.contains("update this server") && said.contains("new invite"), "{said}");
+        for seed in [1, 4] {
+            assert_eq!(post(&hub, &request(&exposed, other.server_id(), seed)).await.0, 403);
+        }
+
         // The secret is spent by the satellite that uses it first.
         assert_eq!(
             post(&hub, &request(&parsed, other.server_id(), 1)).await.0,

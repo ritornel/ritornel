@@ -329,6 +329,51 @@ mod tests {
         }
     }
 
+    /// Two connections on one connector to `address`, and how each
+    /// handshake went.
+    async fn twice(connector: &TlsConnector, address: SocketAddr) -> Vec<rustls::HandshakeKind> {
+        let mut kinds = Vec::new();
+        for _ in 0..2 {
+            let tcp = TcpStream::connect(address).await.unwrap();
+            let mut tls = connector
+                .connect(ServerName::from(address.ip()), tcp)
+                .await
+                .unwrap();
+            // Read the answer, which carries any ticket the server sends.
+            tls.write_all(b"ping").await.unwrap();
+            let mut answer = [0; 4];
+            tls.read_exact(&mut answer).await.unwrap();
+            kinds.push(tls.get_ref().1.handshake_kind().unwrap());
+        }
+        kinds
+    }
+
+    #[tokio::test]
+    async fn neither_end_resumes_a_session_when_the_other_would() {
+        use rustls::HandshakeKind::Full;
+        let hub = signer(7);
+        // The satellite's connector, against a server that issues tickets
+        // and keeps sessions.
+        let resuming_server = serve_tls(acceptor_with(
+            Arc::new(IdentityKey(Arc::clone(&hub))),
+            hub.public_key(),
+        ))
+        .await;
+        let ours = connector(hub.public_key()).unwrap();
+        assert_eq!(twice(&ours, resuming_server).await, [Full, Full]);
+        // A client that would resume, against the hub's acceptor.
+        let resuming_client = TlsConnector::from(Arc::new(
+            ClientConfig::builder_with_provider(provider())
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .unwrap()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(Pinned::new(hub.public_key())))
+                .with_no_client_auth(),
+        ));
+        let hubs = serve_tls(acceptor(Arc::clone(&hub)).unwrap()).await;
+        assert_eq!(twice(&resuming_client, hubs).await, [Full, Full]);
+    }
+
     #[tokio::test]
     async fn another_key_is_refused() {
         let address = serve_tls(acceptor(signer(7)).unwrap()).await;
