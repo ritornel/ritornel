@@ -1018,6 +1018,32 @@ mod tests {
     }
 
     #[test]
+    fn answers_that_could_not_be_recorded_are_recorded_whatever_the_session_has_become() {
+        use ritornel_engine::Settled;
+        let clock = Arc::new(SetClock::at(T0));
+        let (core, _scratch, _cli) = hub(&clock);
+        let lastfm = core.lastfm().unwrap();
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let left = || vec![(999, Settled::Unknown("no answer".to_owned()))];
+        // Refused since, the session sends nothing, and what it had sent is
+        // recorded all the same.
+        core.with_stores(|stores| {
+            stores
+                .server()
+                .refuse_service_session(SERVICE, "k")
+                .unwrap()
+        });
+        lastfm.leave_unsettled(left());
+        crate::lastfm::scrobble_once(&core, lastfm, &stop);
+        assert_eq!(lastfm.unsettled_count(), 0);
+        // Signed out, the same.
+        core.with_stores(|stores| stores.server().remove_service_session(SERVICE).unwrap());
+        lastfm.leave_unsettled(left());
+        crate::lastfm::scrobble_once(&core, lastfm, &stop);
+        assert_eq!(lastfm.unsettled_count(), 0);
+    }
+
+    #[test]
     fn a_failure_waits_for_the_next_trigger_and_a_refused_session_stops_imports() {
         let clock = Arc::new(SetClock::at(T0));
         let (core, _scratch, cli) = hub(&clock);

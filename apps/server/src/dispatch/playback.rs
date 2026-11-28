@@ -116,6 +116,7 @@ pub(super) fn refused(error: ritornel_engine::Error) -> RpcError {
             "this idempotency key was used before with other params",
         ),
         Engine::Playback(what) => RpcError::new(ErrorCode::Unavailable, what),
+        Engine::JobEnding => RpcError::new(ErrorCode::Conflict, Engine::JobEnding.to_string()),
         Engine::StaleQueue { current } => RpcError::new(
             ErrorCode::Conflict,
             "the queue has changed since that edit was decided: read it again",

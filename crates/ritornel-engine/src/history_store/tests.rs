@@ -1509,6 +1509,103 @@ fn one_scrobble_another_player_sent_keeps_back_one_play_of_ours_and_no_more() {
     assert_eq!(withdrawn(), 4);
 }
 
+#[test]
+fn scrobbles_another_player_sent_a_second_apart_each_keep_back_one_play_however_they_chain() {
+    let at = library();
+    let account = at
+        .library
+        .ensure_service_account("lastfm", "someone")
+        .unwrap();
+    // Plays of one track at 0, 2 and 4 seconds, and the other player's
+    // scrobbles at 1 and 3: two scrobbles keep back two plays, never three,
+    // whichever is looked at last.
+    let start = (T0 + 10 * MINUTE) / 1000 * 1000;
+    for (key, after) in [(1, 0), (2, 2_000), (3, 4_000)] {
+        at.send(
+            &at.listen(key, 0, start + after, 200_000),
+            PlayRule::CURRENT,
+        );
+    }
+    for after_s in [1, 3] {
+        scrobble_of(
+            &at,
+            account,
+            start / 1000 + after_s,
+            "Moss Arcade",
+            "Paper Kites",
+        );
+    }
+    assert_eq!(at.library.plan_deliveries(account, 0).unwrap(), 1);
+    assert_eq!(
+        at.count(
+            "SELECT count(*) FROM history_delivery WHERE state = 'withdrawn'
+             AND detail LIKE '%already%'"
+        ),
+        2
+    );
+}
+
+#[test]
+fn a_play_withdrawn_under_names_edited_since_it_was_queued_claims_its_scrobble_under_them() {
+    use ritornel_domain::library::Kind;
+    let at = library();
+    seed_metadata_claims(&at);
+    let account = at
+        .library
+        .ensure_service_account("lastfm", "someone")
+        .unwrap();
+    let start = (T0 + 10 * MINUTE) / 1000 * 1000;
+    at.send(&at.listen(1, 0, start, 200_000), PlayRule::CURRENT);
+    assert_eq!(at.library.plan_deliveries(account, 0).unwrap(), 1);
+    // Its title is edited before it is sent, and the other player's
+    // scrobble names the track as it is now.
+    at.library
+        .set_metadata_edit(
+            WriteRequest {
+                method: "catalog.edit",
+                command: None,
+                client: None,
+            },
+            Kind::TrackAppearance,
+            at.tracks[0].0,
+            "title",
+            "Paper Kites (Edited)",
+        )
+        .unwrap();
+    scrobble_of(
+        &at,
+        account,
+        start / 1000,
+        "Moss Arcade",
+        "Paper Kites (Edited)",
+    );
+    assert!(
+        at.library
+            .take_due_deliveries(account, 0, 50)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        at.count(
+            "SELECT count(*) FROM history_delivery WHERE state = 'withdrawn'
+             AND title = 'Paper Kites (Edited)'"
+        ),
+        1,
+        "withdrawn under the names it was checked by"
+    );
+    // So the one scrobble is claimed, and another play of it beside the
+    // first is sent.
+    at.send(&at.listen(2, 0, start + 1_000, 200_000), PlayRule::CURRENT);
+    assert_eq!(at.library.plan_deliveries(account, 0).unwrap(), 1);
+    assert_eq!(
+        at.library
+            .take_due_deliveries(account, 0, 50)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
 /// What a program that knows nothing of Ritornel would do with an export:
 /// read each line as JSON, and the table as CSV, with nothing of this
 /// crate's but the folder's name.

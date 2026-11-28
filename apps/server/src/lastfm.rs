@@ -227,6 +227,24 @@ impl Lastfm {
         self.playing.clear_all();
     }
 
+    /// For tests: answers to a batch that could not be recorded.
+    #[cfg(all(test, feature = "lastfm"))]
+    pub(crate) fn leave_unsettled(&self, settled: Vec<(i64, ritornel_engine::Settled)>) {
+        *self
+            .unsettled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = settled;
+    }
+
+    /// For tests: how many answers wait to be recorded.
+    #[cfg(all(test, feature = "lastfm"))]
+    pub(crate) fn unsettled_count(&self) -> usize {
+        self.unsettled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
     /// For the crash test: how many batches of a sync are committed before
     /// the server aborts.
     #[cfg(feature = "lastfm")]
@@ -824,8 +842,12 @@ mod enabled {
         job: Job,
         shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) {
+        info!(job_id = %job.public_id, kind = %job.kind, "a job is claimed");
+        sync_job(core, job, shutdown);
+    }
+
+    fn sync_job(core: &Core, job: Job, shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>) {
         let (row, job_id) = (job.id, job.public_id);
-        info!(job_id = %job_id, kind = %job.kind, "a job is claimed");
         let finish = |state: JobState, failure: Option<String>, summary: Option<&SyncSummary>| {
             let finished = core.with_stores(|stores| {
                 if let Some(summary) = summary {
@@ -988,7 +1010,7 @@ mod enabled {
                                     "a full sync was asked for while this one ran: it reads the \
                                      whole history now"
                                 );
-                                run_sync(
+                                sync_job(
                                     core,
                                     Job {
                                         params_json: upgraded,
@@ -1039,6 +1061,12 @@ mod enabled {
     /// batches, until nothing is due. Each batch is marked as being sent
     /// before it leaves.
     pub(crate) fn scrobble_once(core: &Core, lastfm: &Lastfm, stop: &AtomicBool) {
+        // What was sent is recorded first, whatever has become of the
+        // session since: signed out, refused or with scrobbling off, the
+        // answers it had are still the plays' own.
+        if !record_unsettled(&lastfm.unsettled, &|settled| settle(core, settled)) {
+            return;
+        }
         let Ok(client) = lastfm.client() else {
             return;
         };
@@ -1097,16 +1125,7 @@ mod enabled {
                 None => None,
             },
             send: &|key, plays| client.scrobble(key, plays),
-            settle: &|settled| match core
-                .with_library(|_, library| library.settle_deliveries(settled))
-            {
-                Some(Ok(())) => true,
-                Some(Err(failed)) => {
-                    error!(error = %failed, "what became of scrobbles could not be recorded");
-                    false
-                }
-                None => false,
-            },
+            settle: &|settled| settle(core, settled),
             refuse: &|key| {
                 if let Some(Err(failed)) = core.with_stores(|stores| {
                     stores
@@ -1135,6 +1154,39 @@ mod enabled {
             },
             unsettled: &lastfm.unsettled,
         });
+    }
+
+    /// Records what became of scrobbles sent, in the library.
+    fn settle(core: &Core, settled: Vec<(i64, Settled)>) -> bool {
+        match core.with_library(|_, library| library.settle_deliveries(settled)) {
+            Some(Ok(())) => true,
+            Some(Err(failed)) => {
+                error!(error = %failed, "what became of scrobbles could not be recorded");
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Records the answers to a batch that could not be recorded when they
+    /// came. Whether nothing is left to record.
+    fn record_unsettled(
+        unsettled: &std::sync::Mutex<Vec<(i64, Settled)>>,
+        settle: &dyn Fn(Vec<(i64, Settled)>) -> bool,
+    ) -> bool {
+        let mut unsettled = lock(unsettled);
+        if unsettled.is_empty() {
+            return true;
+        }
+        if !settle(unsettled.clone()) {
+            return false;
+        }
+        info!(
+            settled = unsettled.len(),
+            "what became of scrobbles sent earlier is recorded now"
+        );
+        unsettled.clear();
+        true
     }
 
     /// Sends a batch of plays as a session, once.
@@ -1191,18 +1243,8 @@ mod enabled {
             let Some(_turn) = sending.turn.batch() else {
                 return;
             };
-            {
-                let mut unsettled = lock(sending.unsettled);
-                if !unsettled.is_empty() {
-                    if !(sending.settle)(unsettled.clone()) {
-                        return;
-                    }
-                    info!(
-                        settled = unsettled.len(),
-                        "what became of scrobbles sent earlier is recorded now"
-                    );
-                    unsettled.clear();
-                }
+            if !record_unsettled(sending.unsettled, sending.settle) {
+                return;
             }
             let Some(session) = (sending.session)() else {
                 return;

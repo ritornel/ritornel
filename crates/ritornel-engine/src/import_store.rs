@@ -614,59 +614,96 @@ fn gone(connection: &Connection, endpoint: i64, batch: &Batch) -> Result<u64, Er
         .count() as u64)
 }
 
-/// The keys of the batch's records that are scrobbles the library holds
-/// already under another key, because the source changed what one names
-/// after it was stored, as Last.fm does when it fills in an album: a
-/// scrobble's key hashes its album. In each second, a record the library
-/// does not hold, naming the artist and title of an import there that the
-/// batch no longer lists, under another album, is that import, one for
-/// one, and is not stored again, so one scrobble stays one play. An import
-/// a full read set aside as a shifted read's duplicate (`set_aside`, or
-/// before) is not listed because it was never there, and stands for no
-/// record.
+/// What [`relisted`] finds.
+#[derive(Debug, Default)]
+struct Relisted {
+    /// The keys of the batch's records that are imports the library holds.
+    keys: HashSet<Vec<u8>>,
+    /// How many imports the batch no longer lists by their keys are among
+    /// them, which [`gone`] counts.
+    replaced: u64,
+}
+
+/// The batch's records that are scrobbles the library holds already under
+/// another key, because the source changed what one names after it was
+/// stored, as Last.fm does when it fills in an album: a scrobble's key
+/// hashes its album. In each second, a record whose key is not `held`,
+/// naming the artist and title of an import there that the batch no longer
+/// lists, under another album, is that import, one for one, and is not
+/// stored again, so one scrobble stays one play. An import that a
+/// `shifted_read` correction in force sets aside, or that this full read
+/// sets aside (`set_aside`), is not listed because it was never there, and
+/// stands for no record.
 fn relisted(
     connection: &Connection,
     endpoint: i64,
     batch: &Batch,
+    held: &HashSet<Vec<u8>>,
     set_aside: &[i64],
-) -> Result<HashSet<Vec<u8>>, Error> {
+) -> Result<Relisted, Error> {
     type Named = (i64, String, String);
     let keys: HashSet<&[u8]> = batch
         .records
         .iter()
         .map(|record| record.source_key.as_slice())
         .collect();
+    struct Unlisted {
+        named: Named,
+        album: Option<String>,
+        set_aside_by: Option<i64>,
+    }
     let mut statement = connection.prepare_cached(
-        "SELECT o.id, o.source_key, i.played_at_utc_ms, i.artist, i.title, i.album
+        "SELECT o.id, o.source_key, i.played_at_utc_ms, i.artist, i.title, i.album,
+                (SELECT max(c.observation_id) FROM correction_target t
+                 JOIN observation_correction c ON c.observation_id = t.correction_id
+                 JOIN history_observation co ON co.id = c.observation_id
+                 WHERE t.target_observation_id = o.id AND c.verb = 'exclude'
+                   AND json_extract(co.payload_json, '$.reason') = ?4)
          FROM observation_import i
          JOIN history_observation o ON o.id = i.observation_id
          WHERE o.endpoint_id = ?1 AND i.played_at_utc_ms >= ?2 AND i.played_at_utc_ms < ?3
-           AND NOT EXISTS (SELECT 1 FROM correction_target t
-                           JOIN observation_correction c ON c.observation_id = t.correction_id
-                           JOIN history_observation co ON co.id = c.observation_id
-                           WHERE t.target_observation_id = o.id AND c.verb = 'exclude'
-                             AND json_extract(co.payload_json, '$.reason') = ?4)
          ORDER BY o.id",
     )?;
-    let mut unlisted: HashMap<Named, Vec<Option<String>>> = HashMap::new();
-    let mut held = HashSet::new();
     let mut rows = statement.query(rusqlite::params![
         endpoint,
         batch.span.from_ms,
         batch.span.to_ms,
         SHIFTED_READ
     ])?;
+    let mut unlisted = Vec::new();
     while let Some(row) = rows.next()? {
         let (observation, key): (i64, Vec<u8>) = (row.get(0)?, row.get(1)?);
         if !keys.contains(key.as_slice()) && !set_aside.contains(&observation) {
-            unlisted
-                .entry((row.get(2)?, row.get(3)?, row.get(4)?))
-                .or_default()
-                .push(row.get(5)?);
+            unlisted.push(Unlisted {
+                named: (row.get(2)?, row.get(3)?, row.get(4)?),
+                album: row.get(5)?,
+                set_aside_by: row.get(6)?,
+            });
         }
-        held.insert(key);
     }
-    let mut found = HashSet::new();
+    drop(rows);
+    if unlisted.is_empty() {
+        return Ok(Relisted::default());
+    }
+    // Which corrections stand, as derivation has it: one revoked lets its
+    // import count again.
+    let active = if unlisted.iter().any(|import| import.set_aside_by.is_some()) {
+        ritornel_domain::history::active_corrections(&crate::history_store::corrections(
+            connection,
+        )?)
+    } else {
+        Default::default()
+    };
+    let mut by_name: HashMap<Named, Vec<Option<String>>> = HashMap::new();
+    for import in unlisted {
+        if import
+            .set_aside_by
+            .is_none_or(|correction| !active.contains(&correction))
+        {
+            by_name.entry(import.named).or_default().push(import.album);
+        }
+    }
+    let mut found = Relisted::default();
     for record in &batch.records {
         if held.contains(&record.source_key) {
             continue;
@@ -678,12 +715,13 @@ fn relisted(
         );
         // The same names and album under a new key is another scrobble of
         // that second, as its place among them says.
-        let Some(left) = unlisted.get_mut(&named) else {
+        let Some(left) = by_name.get_mut(&named) else {
             continue;
         };
         if let Some(at) = left.iter().position(|album| *album != record.track.album) {
             left.swap_remove(at);
-            found.insert(record.source_key.clone());
+            found.keys.insert(record.source_key.clone());
+            found.replaced += 1;
         }
     }
     Ok(found)
@@ -875,7 +913,8 @@ pub(crate) fn ingest_imports(
         rows.endpoint,
         batch.records.iter().map(|record| &record.source_key),
     )?;
-    held.extend(relisted(connection, rows.endpoint, batch, set_aside)?);
+    let relisted = relisted(connection, rows.endpoint, batch, &held, set_aside)?;
+    held.extend(relisted.keys);
     let mut observations = BTreeSet::new();
     let mut new_items = Vec::new();
     for record in &batch.records {
@@ -1216,12 +1255,21 @@ impl LibraryStore {
                 } else {
                     Recheck::default()
                 };
-                let relisted = relisted(connection, rows.endpoint, &batch, &found.set_aside)?;
-                Ok((
-                    batch.records.len() - held.len() - relisted.len(),
-                    gone(connection, rows.endpoint, &batch)?,
-                    found.set_aside.len() + found.revoke.len(),
-                ))
+                let relisted =
+                    relisted(connection, rows.endpoint, &batch, &held, &found.set_aside)?;
+                let new = batch
+                    .records
+                    .iter()
+                    .filter(|record| {
+                        !held.contains(&record.source_key)
+                            && !relisted.keys.contains(&record.source_key)
+                    })
+                    .count();
+                // An import the batch lists again under another key is not
+                // gone.
+                let gone =
+                    gone(connection, rows.endpoint, &batch)?.saturating_sub(relisted.replaced);
+                Ok((new, gone, found.set_aside.len() + found.revoke.len()))
             })?
         };
         if new == 0 && rechecked == 0 {

@@ -142,6 +142,10 @@ pub enum Error {
     /// A job's write was stopped before its transaction began because the
     /// job was asked to stop or the server is shutting down.
     JobStopped(crate::JobStop),
+    /// More was asked of a job of the same kind and key that is being
+    /// cancelled, which will not do it. Asked again once it has ended, it
+    /// starts a job of its own.
+    JobEnding,
 }
 
 impl fmt::Display for Error {
@@ -240,6 +244,9 @@ impl fmt::Display for Error {
             Self::Unchanged => f.write_str("nothing changed, so nothing was written"),
             Self::JobStopped(crate::JobStop::Cancelled) => f.write_str("the job was cancelled"),
             Self::JobStopped(crate::JobStop::Shutdown) => f.write_str("the server is stopping"),
+            Self::JobEnding => {
+                f.write_str("a job like this one is being cancelled: ask again once it has ended")
+            }
         }
     }
 }

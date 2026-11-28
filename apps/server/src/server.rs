@@ -242,7 +242,13 @@ impl Server {
         // Scrobbling goes on only in the data directory it was turned on
         // in: a copy of it, or one put back from a backup, would send as
         // the same session as the server it came from.
-        match store.check_scrobbling_place("lastfm", &dir.place())? {
+        // A library held until an import, with no place recorded, was put
+        // back from an older build's backup.
+        let held_for_import = match (&library, store.service_session("lastfm")?) {
+            (Some(library), Some(session)) => library.held_for_import(session.account)?.is_some(),
+            _ => false,
+        };
+        match store.check_scrobbling_place("lastfm", &dir.place(), held_for_import)? {
             PlaceCheck::Same => {}
             PlaceCheck::Recorded => info!("Last.fm scrobbling is bound to this data directory"),
             PlaceCheck::Moved { from } => warn!(

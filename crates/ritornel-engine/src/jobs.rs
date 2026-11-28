@@ -240,8 +240,6 @@ fn job_by_id(connection: &Connection, id: Id) -> Result<Option<Job>, Error> {
         .optional()?)
 }
 
-/// The stored result of a server-local command, if it was carried out
-/// before. The same ID with another request is refused.
 /// Ends a job in `transaction`, unless it has ended: one asked to stop
 /// never ends as succeeded, but as cancelled.
 fn end(
@@ -268,6 +266,8 @@ fn end(
     job_by_row(transaction, job)
 }
 
+/// The stored result of a server-local command, if it was carried out
+/// before. The same ID with another request is refused.
 pub(crate) fn receipt(connection: &Connection, command: &Command) -> Result<Option<String>, Error> {
     let stored: Option<(Vec<u8>, String)> = connection
         .query_row(
@@ -414,7 +414,8 @@ impl ServerStore {
     /// does what is asked already. A queued job is claimed with them; a
     /// running one finds them when it would end
     /// ([`finish_succeeded_job`](Self::finish_succeeded_job)) and runs
-    /// again, so what was asked is never dropped.
+    /// again, so what was asked is never dropped. One being cancelled is
+    /// refused as [`Error::JobEnding`], and the command is not kept.
     pub fn start_job_upgrading(
         &self,
         command: Command,
@@ -440,9 +441,12 @@ impl ServerStore {
             let (row, created) = match running {
                 Some(row) => {
                     let current = job_by_row(transaction, row)?;
-                    if matches!(current.state, JobState::Queued | JobState::Running)
-                        && let Some(params) = upgrade(&current.params_json)
-                    {
+                    if let Some(params) = upgrade(&current.params_json) {
+                        // One being cancelled will not do it, and the
+                        // command is kept for none.
+                        if current.state == JobState::Cancelling {
+                            return Err(Error::JobEnding);
+                        }
                         transaction.execute(
                             "UPDATE job SET params_json = ?2 WHERE id = ?1",
                             (row, &params),
@@ -1058,6 +1062,38 @@ mod tests {
         // Asked of a job that has ended, it is a job of its own.
         let (next, created) = ask(6, "{\"full\":true}");
         assert!(created && next.id != running.id);
+
+        // Asked of one being cancelled, it is refused, and kept for no job:
+        // asked again once that job has ended, it is a job of its own.
+        store
+            .finish_job(next.id, JobState::Succeeded, None)
+            .unwrap();
+        let (dying, _) = ask(7, "{}");
+        store
+            .cancel_job(command(8, "cancel"), "jobs.cancel", dying.public_id)
+            .unwrap();
+        let claimed = store.claim_job(id(0xb0)).unwrap();
+        assert!(claimed.is_none(), "a queued job cancelled ends at once");
+        let (dying, _) = ask(9, "{}");
+        store.claim_job(id(0xb0)).unwrap().unwrap();
+        store
+            .cancel_job(command(10, "cancel"), "jobs.cancel", dying.public_id)
+            .unwrap();
+        let asked = store.start_job_upgrading(
+            command(11, "{\"full\":true}"),
+            "scan.start",
+            NewJob {
+                params_json: "{\"full\":true}".to_owned(),
+                ..scan("main")
+            },
+            |_| Some("{\"full\":true}".to_owned()),
+        );
+        assert!(matches!(asked, Err(Error::JobEnding)), "{asked:?}");
+        store
+            .finish_job(dying.id, JobState::Cancelled, None)
+            .unwrap();
+        let (fresh, created) = ask(11, "{\"full\":true}");
+        assert!(created && fresh.id != dying.id);
     }
 
     #[test]

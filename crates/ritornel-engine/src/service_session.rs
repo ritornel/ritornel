@@ -111,11 +111,12 @@ pub(crate) fn set_scrobbling(
     Ok(found)
 }
 
-/// Marks every session that scrobbles in `connection`, a backup's copy of
-/// `server.db`, as bound to no data directory, so that a server started on
-/// it turns scrobbling off ([`ServerStore::check_scrobbling_place`]). A
-/// file with no sessions table is left alone. Returns whether any session
-/// was marked.
+/// Turns scrobbling off for every session that scrobbles in `connection`,
+/// a backup's copy of `server.db`, and marks it as bound to no data
+/// directory, so that a server started on it, of this build or an older
+/// one, sends nothing until the owner turns scrobbling on again, and this
+/// build says why ([`ServerStore::check_scrobbling_place`]). A file with no
+/// sessions table is left alone. Returns whether any session was marked.
 pub(crate) fn unbind_copy(connection: &Connection) -> Result<bool, Error> {
     let is_server: bool = connection.query_row(
         "SELECT count(*) = 2 FROM sqlite_schema
@@ -133,6 +134,7 @@ pub(crate) fn unbind_copy(connection: &Connection) -> Result<bool, Error> {
     for service in &services {
         keep_place(connection, service, None)?;
     }
+    connection.execute("UPDATE service_session SET scrobble_from_ms = NULL", [])?;
     Ok(!services.is_empty())
 }
 
@@ -143,7 +145,7 @@ pub enum PlaceCheck {
     /// Scrobbling is off, or on in this data directory.
     Same,
     /// On, with no data directory recorded, as one from a build before
-    /// they were: this one is recorded now.
+    /// they were, and no restore waiting: this one is recorded now.
     Recorded,
     /// On, turned on in this other data directory, which this one was
     /// copied or moved from: scrobbling is turned off.
@@ -151,8 +153,9 @@ pub enum PlaceCheck {
         /// The data directory it was turned on in.
         from: String,
     },
-    /// On, in a data directory restored from a backup: scrobbling is
-    /// turned off.
+    /// Put back from a backup: a backup's copy marked so, or one an older
+    /// build took, with no data directory recorded and the library held
+    /// until an import. Scrobbling is off.
     Restored,
 }
 
@@ -243,14 +246,37 @@ impl ServerStore {
 
     /// Checks, as a server starts in the data directory `place`, that
     /// scrobbling to `service` was turned on there. Turned on in another
-    /// one, which this one is a copy of or was moved from, or in a data
-    /// directory restored from a backup, it is turned off, so that two
-    /// servers never send as one session: the owner turns it on again. On
-    /// with no place recorded, as in a data directory from an older build,
-    /// it is bound to `place`.
-    pub fn check_scrobbling_place(&self, service: &str, place: &str) -> Result<PlaceCheck, Error> {
+    /// one, which this one is a copy of or was moved from, or put back from
+    /// a backup, it is turned off, so that two servers never send as one
+    /// session: the owner turns it on again. A backup's mark is cleared once
+    /// it has been found. On with no place recorded, as in a data directory
+    /// from an older build, it is bound to `place`, unless `held` says the
+    /// library is held until an import, as one an older build's backup put
+    /// back is.
+    pub fn check_scrobbling_place(
+        &self,
+        service: &str,
+        place: &str,
+        held: bool,
+    ) -> Result<PlaceCheck, Error> {
         let (service, place) = (service.to_owned(), place.to_owned());
         self.transact(move |transaction, _, _| {
+            let stored: Option<String> = transaction
+                .query_row(
+                    "SELECT value_json FROM server_setting WHERE key = ?1",
+                    [place_key(&service)],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            // A value that cannot be read is no data directory: off, as for
+            // a copy.
+            let bound = stored.as_deref().map(|stored| {
+                serde_json::from_str::<Option<String>>(stored).map_err(|_| stored.to_owned())
+            });
+            if let Some(Ok(None)) = bound {
+                set_scrobbling(transaction, &service, false, 0, &place)?;
+                return Ok(PlaceCheck::Restored);
+            }
             let on: bool = transaction
                 .query_row(
                     "SELECT scrobble_from_ms IS NOT NULL FROM service_session WHERE service = ?1",
@@ -262,27 +288,18 @@ impl ServerStore {
             if !on {
                 return Ok(PlaceCheck::Same);
             }
-            let stored: Option<String> = transaction
-                .query_row(
-                    "SELECT value_json FROM server_setting WHERE key = ?1",
-                    [place_key(&service)],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            let Some(stored) = stored else {
-                keep_place(transaction, &service, Some(&place))?;
-                return Ok(PlaceCheck::Recorded);
+            let found = match bound {
+                None if held => PlaceCheck::Restored,
+                None => {
+                    keep_place(transaction, &service, Some(&place))?;
+                    return Ok(PlaceCheck::Recorded);
+                }
+                Some(Ok(Some(from))) if from == place => return Ok(PlaceCheck::Same),
+                Some(Ok(Some(from)) | Err(from)) => PlaceCheck::Moved { from },
+                Some(Ok(None)) => PlaceCheck::Restored,
             };
-            // A value that cannot be read is no place: off, as for a copy.
-            let bound: Option<String> = serde_json::from_str(&stored).unwrap_or_default();
-            if bound.as_deref() == Some(place.as_str()) {
-                return Ok(PlaceCheck::Same);
-            }
             set_scrobbling(transaction, &service, false, 0, &place)?;
-            Ok(match bound {
-                Some(from) => PlaceCheck::Moved { from },
-                None => PlaceCheck::Restored,
-            })
+            Ok(found)
         })
     }
 
@@ -387,7 +404,11 @@ mod tests {
         let store =
             ServerStore::open_in_memory(clock.clone(), Arc::new(CountingEntropy::default()))
                 .unwrap();
-        let check = |place| store.check_scrobbling_place("lastfm", place).unwrap();
+        let check = |place| {
+            store
+                .check_scrobbling_place("lastfm", place, false)
+                .unwrap()
+        };
         // Signed out, and signed in with scrobbling off, nothing is checked.
         assert_eq!(check("/elsewhere"), PlaceCheck::Same);
         let account = Id::from_bytes([7; 16]);
@@ -441,6 +462,24 @@ mod tests {
             .unwrap();
         assert_eq!(check(PLACE), PlaceCheck::Recorded);
         assert_eq!(check(PLACE), PlaceCheck::Same);
+        // Unless the library is held until an import, as one an older
+        // build's backup put back is: then it is a restore, and off.
+        store
+            .transact(|transaction, _, _| forget_place(transaction, "lastfm"))
+            .unwrap();
+        assert_eq!(
+            store.check_scrobbling_place("lastfm", PLACE, true).unwrap(),
+            PlaceCheck::Restored
+        );
+        assert_eq!(
+            store
+                .service_session("lastfm")
+                .unwrap()
+                .unwrap()
+                .scrobble_from_ms,
+            None
+        );
+        store.set_scrobbling("lastfm", true, PLACE).unwrap();
         assert!(
             store
                 .service_session("lastfm")

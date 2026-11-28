@@ -549,11 +549,16 @@ pub fn same_track(artist: &str, title: &str, other_artist: &str, other_title: &s
 
 /// Whether two artist and title pairs may name one track that the
 /// service corrected as it took it: the artist or the title is the same by
-/// its normalised key. Weaker than [`same_track`], so it is only asked of a
-/// scrobble at the exact second of a play, where nothing else could be its
-/// echo.
+/// its normalised key, and that key is not empty. Weaker than
+/// [`same_track`], so it is only asked of a scrobble at the exact second of
+/// a play, where nothing else could be its echo.
 pub fn corrected_track(artist: &str, title: &str, other_artist: &str, other_title: &str) -> bool {
-    same_track(artist, "", other_artist, "") || same_track("", title, "", other_title)
+    let key = |text: &str| crate::normalize::words_key(&text.replace(['\u{fe0e}', '\u{fe0f}'], ""));
+    let same = |one: &str, other: &str| {
+        let one = key(one);
+        !one.is_empty() && one == key(other)
+    };
+    same(artist, other_artist) || same(title, other_title)
 }
 
 impl Catalog {
@@ -1147,6 +1152,8 @@ mod tests {
             "Lanterns"
         ));
         assert!(corrected_track("Mira Vale", "Echo", "mira vale", "ECHO"));
+        // Nothing to match is no match.
+        assert!(!corrected_track("", "Lanterns", "", "Echo"));
         // Both changed is another track.
         assert!(!corrected_track(
             "Mira Valle",

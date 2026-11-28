@@ -126,7 +126,7 @@ To look inside without changing anything: sqlite3 -readonly library.db
     )
 }
 
-/// What the README adds when the library copied has a Last.fm account.
+/// What the README adds when the server copied scrobbles to Last.fm.
 const UNBOUND: &str = "
 This server scrobbles to Last.fm. A server started on this backup, wherever
 it is put back, has scrobbling off until you turn it on again with
@@ -134,6 +134,7 @@ it is put back, has scrobbling off until you turn it on again with
 scrobbling as the same account.
 ";
 
+/// What the README adds when the library copied has a Last.fm account.
 const HELD: &str = "
 This library has a Last.fm account. A server started on it scrobbles nothing
 to Last.fm until that account has imported from there, which it does by

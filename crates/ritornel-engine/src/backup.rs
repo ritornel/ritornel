@@ -549,35 +549,27 @@ mod tests {
         copy_database(&path, &copy).unwrap();
         assert!(unbind_scrobbling(&copy).unwrap());
         // The server copied still scrobbles where it was turned on.
-        assert_eq!(
-            server
-                .check_scrobbling_place("lastfm", "/invented/data")
-                .unwrap(),
-            PlaceCheck::Same
-        );
+        let check = |store: &ServerStore| {
+            store
+                .check_scrobbling_place("lastfm", "/invented/data", false)
+                .unwrap()
+        };
+        assert_eq!(check(&server), PlaceCheck::Same);
         drop(server);
 
-        // Put back, even where it was taken, it scrobbles nothing until it
-        // is turned on again, and then it does, there.
+        // Put back, even where it was taken, it scrobbles nothing, as an
+        // older build that knows no place finds it too; this one says so
+        // once. Turned on again, it scrobbles there.
         let restored = open(&copy);
-        assert_eq!(
-            restored
-                .check_scrobbling_place("lastfm", "/invented/data")
-                .unwrap(),
-            PlaceCheck::Restored
-        );
         let session = restored.service_session("lastfm").unwrap().unwrap();
         assert_eq!(session.scrobble_from_ms, None);
         assert_eq!(session.key.expose(), "KEY", "the session itself is kept");
+        assert_eq!(check(&restored), PlaceCheck::Restored);
+        assert_eq!(check(&restored), PlaceCheck::Same);
         restored
             .set_scrobbling("lastfm", true, "/invented/data")
             .unwrap();
-        assert_eq!(
-            restored
-                .check_scrobbling_place("lastfm", "/invented/data")
-                .unwrap(),
-            PlaceCheck::Same
-        );
+        assert_eq!(check(&restored), PlaceCheck::Same);
     }
 
     #[test]

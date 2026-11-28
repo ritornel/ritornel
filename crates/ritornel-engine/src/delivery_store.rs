@@ -125,7 +125,9 @@ pub(crate) const ALREADY_SCROBBLED: &str = "the account already has this play fr
 ///
 /// One such scrobble stands for one play: plays already withdrawn as
 /// [`ALREADY_SCROBBLED`] claim the scrobbles first, one each, and this play
-/// is already scrobbled only if one is left for it.
+/// is already scrobbled only if one is left for it. The matching takes in
+/// every scrobble and withdrawn play linked to this one by a chain of
+/// seconds a second apart, so no claim is missed at its edge.
 fn already_scrobbled(
     connection: &Connection,
     endpoint: i64,
@@ -133,10 +135,60 @@ fn already_scrobbled(
     artist: &str,
     title: &str,
 ) -> Result<bool, Error> {
-    // A play withdrawn within two seconds may claim a scrobble within a
-    // second of this one; a scrobble within three may be what it claims
-    // instead.
-    let mut imports = connection.prepare_cached(
+    if foreign_scrobbles(
+        connection,
+        endpoint,
+        seconds - 1,
+        seconds + 1,
+        artist,
+        title,
+    )?
+    .is_empty()
+    {
+        return Ok(false);
+    }
+    // The scrobbles and the plays withdrawn for them that this play's
+    // claim can reach: each within a second of another, as far as they go.
+    let (mut lo, mut hi) = (seconds, seconds);
+    let (scrobbled, mut plays) = loop {
+        let scrobbled = foreign_scrobbles(connection, endpoint, lo - 1, hi + 1, artist, title)?;
+        let plays = withdrawn_plays(connection, endpoint, lo - 1, hi + 1, artist, title)?;
+        let (wide_lo, wide_hi) = scrobbled
+            .iter()
+            .chain(&plays)
+            .fold((lo, hi), |(lo, hi), at| (lo.min(*at), hi.max(*at)));
+        if (wide_lo, wide_hi) == (lo, hi) {
+            break (scrobbled, plays);
+        }
+        (lo, hi) = (wide_lo, wide_hi);
+    };
+    plays.push(seconds);
+    let edges: Vec<Vec<usize>> = plays
+        .iter()
+        .map(|play| {
+            scrobbled
+                .iter()
+                .enumerate()
+                .filter(|(_, at)| at.abs_diff(*play) <= 1)
+                .map(|(index, _)| index)
+                .collect()
+        })
+        .collect();
+    Ok(last_is_matched(&edges))
+}
+
+/// The seconds, from `lo` to `hi`, of the account's active scrobbles of
+/// this track that no listen here made, as [`already_scrobbled`] counts
+/// them.
+fn foreign_scrobbles(
+    connection: &Connection,
+    endpoint: i64,
+    lo: i64,
+    hi: i64,
+    artist: &str,
+    title: &str,
+) -> Result<Vec<i64>, Error> {
+    let mut statement = connection.prepare_cached(
         "SELECT i.played_at_utc_ms, i.artist, i.title FROM observation_import i
          JOIN history_observation o ON o.id = i.observation_id
          WHERE o.endpoint_id = ?1 AND i.played_at_utc_ms BETWEEN ?2 AND ?3
@@ -152,65 +204,54 @@ fn already_scrobbled(
            )
          ORDER BY i.played_at_utc_ms, o.id",
     )?;
-    let scrobbled: Vec<i64> = imports
-        .query_map(
-            (endpoint, (seconds - 3) * 1000, (seconds + 3) * 1000),
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            },
-        )?
-        .filter_map(|row| match row {
-            Ok((at_ms, their_artist, their_title)) => {
-                same_track(artist, title, &their_artist, &their_title)
-                    .then(|| Ok(at_ms.div_euclid(1000)))
-            }
-            Err(error) => Some(Err(error)),
-        })
-        .collect::<Result<_, _>>()?;
-    if !scrobbled.iter().any(|at| at.abs_diff(seconds) <= 1) {
-        return Ok(false);
+    let rows = statement.query_map((endpoint, lo * 1000, hi * 1000 + 999), |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut found = Vec::new();
+    for row in rows {
+        let (at_ms, their_artist, their_title) = row?;
+        if same_track(artist, title, &their_artist, &their_title) {
+            found.push(at_ms.div_euclid(1000));
+        }
     }
-    let mut withdrawn = connection.prepare_cached(
+    Ok(found)
+}
+
+/// The seconds, from `lo` to `hi`, of plays of this track withdrawn as
+/// [`ALREADY_SCROBBLED`] to the account.
+fn withdrawn_plays(
+    connection: &Connection,
+    endpoint: i64,
+    lo: i64,
+    hi: i64,
+    artist: &str,
+    title: &str,
+) -> Result<Vec<i64>, Error> {
+    let mut statement = connection.prepare_cached(
         "SELECT sent_timestamp_s, artist, title FROM history_delivery
          WHERE endpoint_id = ?1 AND state = 'withdrawn' AND detail = ?2
            AND sent_timestamp_s BETWEEN ?3 AND ?4
          ORDER BY sent_timestamp_s, id",
     )?;
-    let mut plays: Vec<i64> = withdrawn
-        .query_map(
-            (endpoint, ALREADY_SCROBBLED, seconds - 2, seconds + 2),
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            },
-        )?
-        .filter_map(|row| match row {
-            Ok((at, their_artist, their_title)) => {
-                same_track(artist, title, &their_artist, &their_title).then_some(Ok(at))
-            }
-            Err(error) => Some(Err(error)),
-        })
-        .collect::<Result<_, _>>()?;
-    plays.push(seconds);
-    let edges: Vec<Vec<usize>> = plays
-        .iter()
-        .map(|play| {
-            scrobbled
-                .iter()
-                .enumerate()
-                .filter(|(_, at)| at.abs_diff(*play) <= 1)
-                .map(|(index, _)| index)
-                .collect()
-        })
-        .collect();
-    Ok(last_is_matched(&edges))
+    let rows = statement.query_map((endpoint, ALREADY_SCROBBLED, lo, hi), |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut found = Vec::new();
+    for row in rows {
+        let (at, their_artist, their_title) = row?;
+        if same_track(artist, title, &their_artist, &their_title) {
+            found.push(at);
+        }
+    }
+    Ok(found)
 }
 
 /// Whether, matching each left vertex in turn to a right one of its own
@@ -264,6 +305,15 @@ enum PendingCheck {
     /// Its play is no longer eligible (or its track names changed after an
     /// earlier send attempt): withdraw it and never send.
     Withdraw(&'static str),
+    /// The account has its play from another player, at this second and
+    /// under these names, which a never-tried delivery takes from its play
+    /// as it is now: withdraw it under them, so that the scrobble it claims
+    /// is known by them ([`already_scrobbled`]), and never send.
+    Scrobbled {
+        timestamp_s: i64,
+        artist: String,
+        title: String,
+    },
     /// Eligible to send at `timestamp_s` with the queued snapshot as stored.
     Send { timestamp_s: i64 },
     /// Eligible to send after refreshing the never-attempted delivery's stored
@@ -390,7 +440,11 @@ fn check_pending(
         check_artist,
         check_title,
     )? {
-        return Ok(PendingCheck::Withdraw(ALREADY_SCROBBLED));
+        return Ok(PendingCheck::Scrobbled {
+            timestamp_s: check_seconds,
+            artist: check_artist.to_owned(),
+            title: check_title.to_owned(),
+        });
     }
     let Some(play) = play else {
         return Ok(PendingCheck::Withdraw(
@@ -816,6 +870,30 @@ impl LibraryStore {
                                     .execute((delivery, why, write.now_ms(), write.rev()))?;
                                 continue;
                             }
+                            PendingCheck::Scrobbled {
+                                timestamp_s,
+                                artist,
+                                title,
+                            } => {
+                                connection
+                                    .prepare_cached(
+                                        "UPDATE history_delivery
+                                         SET state = 'withdrawn', detail = ?2, updated_at_ms = ?3,
+                                             rev = ?4, sent_timestamp_s = ?5, artist = ?6,
+                                             title = ?7
+                                         WHERE id = ?1",
+                                    )?
+                                    .execute(rusqlite::params![
+                                        delivery,
+                                        ALREADY_SCROBBLED,
+                                        write.now_ms(),
+                                        write.rev(),
+                                        timestamp_s,
+                                        artist,
+                                        title,
+                                    ])?;
+                                continue;
+                            }
                             PendingCheck::Send { timestamp_s } => (timestamp_s, None),
                             PendingCheck::Refresh(snapshot) => {
                                 (snapshot.timestamp_s, Some(snapshot))
@@ -900,7 +978,7 @@ impl LibraryStore {
                         Settled::Refused(detail) => ("refused", None, None, Some(detail), None),
                         Settled::Unknown(detail) => ("unknown", None, None, Some(detail), None),
                     };
-                    connection
+                    let changed = connection
                         .prepare_cached(
                             "UPDATE history_delivery
                              SET state = ?2, accepted_artist = ?3, accepted_title = ?4,
@@ -919,6 +997,11 @@ impl LibraryStore {
                             write.now_ms(),
                             write.rev(),
                         ])?;
+                    // One no longer sending, as a start marks one an earlier
+                    // run left, keeps what it was found to be.
+                    if changed == 0 {
+                        continue;
+                    }
                     // What an echo is matched on may have changed.
                     rederive_delivery(write, *delivery)?;
                 }
