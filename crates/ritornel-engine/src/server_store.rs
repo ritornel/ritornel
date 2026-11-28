@@ -197,11 +197,7 @@ impl ServerStore {
         let writer = Writer::start(&location, "server.db writer")?;
         let migrated = {
             let clock = Arc::clone(&clock);
-            writer.call(move |connection| {
-                let migrated = migrate::run(connection, migrate::SERVER, &*clock)?;
-                crate::jobs::prune_receipts(connection, clock.now_ms())?;
-                Ok(migrated)
-            })?
+            writer.call(move |connection| migrate::run(connection, migrate::SERVER, &*clock))?
         };
         let reader = Reader::open(&location)?;
         Ok(Self {

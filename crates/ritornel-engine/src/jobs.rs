@@ -264,7 +264,7 @@ pub(crate) fn receipt(connection: &Connection, command: &Command) -> Result<Opti
 const RECEIPT_LIFE_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
 const RECEIPT_SWEEP_INTERVAL: i64 = 256;
 
-pub(crate) fn prune_receipts(connection: &Connection, now_ms: i64) -> Result<(), Error> {
+fn prune_receipts(connection: &Connection, now_ms: i64) -> Result<(), Error> {
     // A hub persists move.<key> until it releases the source. The destination
     // may be offline when the hub probes a lost load reply. Only the latest
     // load needs this protection: the hub resolves it before it can send
@@ -327,6 +327,11 @@ pub fn step_command(job: Id, step: i64) -> Id {
 }
 
 impl ServerStore {
+    /// Removes expired server-local command receipts after startup migrations finish.
+    pub fn prune_receipts(&self) -> Result<(), Error> {
+        self.transact(|tx, now_ms, _| prune_receipts(tx, now_ms))
+    }
+
     /// Records where a named root is on this machine. Naming the same path
     /// again changes nothing, and a name that is at another path is
     /// refused: a root is re-pointed by a call of its own.
@@ -849,18 +854,13 @@ mod tests {
                 .unwrap();
         }
         clock.set(T0 + RECEIPT_LIFE_MS + 1);
-        let sweep = || {
-            store
-                .transact(|tx, now, _| prune_receipts(tx, now))
-                .unwrap()
-        };
         let kept = |byte, method| {
             store
                 .stored_result(command(byte, method))
                 .unwrap()
                 .is_some()
         };
-        sweep();
+        store.prune_receipts().unwrap();
         assert!(kept(1, "move"));
         assert!(!kept(2, "link.handoff.load"));
         assert!(kept(3, "link.handoff.load"));
@@ -875,7 +875,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        sweep();
+        store.prune_receipts().unwrap();
         assert!(!kept(1, "move"));
         assert!(!kept(4, "link.handoff.take"));
     }

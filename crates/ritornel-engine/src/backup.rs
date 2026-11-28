@@ -208,7 +208,7 @@ fn server_digest(db: &rusqlite::Connection, history: HistoryStart) -> Result<Str
         // server. Finished jobs and committed items do not change.
         if matches!(
             table.as_str(),
-            "job" | "job_item" | "command_receipt" | "listen_staging" | "queue_entry" | "outbox"
+            "job" | "job_item" | "listen_staging" | "queue_entry" | "outbox"
         ) {
             // Separate aggregates let SQLite count the b-tree and seek its
             // last row without decoding every historical payload.
@@ -238,7 +238,12 @@ fn server_digest(db: &rusqlite::Connection, history: HistoryStart) -> Result<Str
             "job" => format!("SELECT * FROM job WHERE id >= {} AND {ACTIVE_JOB} ORDER BY id", history.job),
             // A move receipt can change from accepted to done with no new
             // receipt. Its recovery journal may already be gone by the retry.
-            "command_receipt" => format!("SELECT id FROM command_receipt WHERE id >= {} AND {OPEN_MOVE} ORDER BY id", history.receipt),
+            "command_receipt" => {
+                // A new receipt advances the last ID. Expiry of older receipts
+                // changes the row count even when no command has been issued.
+                hash_rows(db, "SELECT coalesce(max(id), 0) FROM command_receipt", &mut digest)?;
+                format!("SELECT id FROM command_receipt WHERE id >= {} AND {OPEN_MOVE} ORDER BY id", history.receipt)
+            }
             _ => format!("SELECT * FROM {quoted} ORDER BY rowid"),
         };
         hash_rows(db, &sql, &mut digest)?;
@@ -379,13 +384,10 @@ mod tests {
         }
     }
 
+    const NOW_MS: i64 = 1_763_000_000_000;
+
     fn open(path: &Path) -> ServerStore {
-        ServerStore::open(
-            path,
-            Arc::new(FixedClock::at(1_763_000_000_000)),
-            Arc::new(OsEntropy),
-        )
-        .unwrap()
+        ServerStore::open(path, Arc::new(FixedClock::at(NOW_MS)), Arc::new(OsEntropy)).unwrap()
     }
 
     #[test]
@@ -434,6 +436,35 @@ mod tests {
                 .unchanged(&path, &scratch.0.join("library.db"))
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn the_receipt_fingerprint_tracks_new_commands_as_older_receipts_expire() {
+        let scratch = Scratch::new("receipt-state");
+        let server = scratch.0.join("server.db");
+        let library = scratch.0.join("library.db");
+        let store = open(&server);
+        let db = rusqlite::Connection::open(&server).unwrap();
+        let record = |key: u8, at_ms: i64| {
+            db.execute(
+                "INSERT INTO command_receipt
+                 (command_id, request_fingerprint, method, result_json, created_at_ms)
+                 VALUES (?1, zeroblob(32), 'queue.clear', 'null', ?2)",
+                ([key; 16], at_ms),
+            )
+            .unwrap();
+        };
+        record(1, 0);
+        record(2, NOW_MS);
+        let snapshot = MigrationState::read(&server, &library).unwrap();
+        store.prune_receipts().unwrap();
+        let remaining: i64 = db
+            .query_row("SELECT count(*) FROM command_receipt", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, 1);
+        assert!(snapshot.unchanged(&server, &library).unwrap());
+        record(3, NOW_MS);
+        assert!(!snapshot.unchanged(&server, &library).unwrap());
     }
 
     #[test]

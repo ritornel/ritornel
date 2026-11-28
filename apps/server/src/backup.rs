@@ -1168,6 +1168,74 @@ mod tests {
         assert_eq!(finished(&dir.backups()).len(), 3);
     }
 
+    #[tokio::test]
+    async fn a_failed_library_migration_keeps_one_snapshot_as_receipts_expire() {
+        const THIRTY_DAYS_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
+        let scratch = Scratch::new();
+        let dir = data(&scratch);
+        with_library(&dir);
+        let clock = Arc::new(crate::testing::SetClock::at(AT));
+        let start = || async {
+            crate::Server::start(
+                crate::HeldDir::take(dir.root().to_owned())?,
+                crate::Listen::on_port(0),
+                clock.clone(),
+                Arc::new(OsEntropy),
+            )
+            .await
+        };
+        start().await.unwrap().stop().await.unwrap();
+
+        // Make library migration 2 fail when it records its ledger entry.
+        let library = rusqlite::Connection::open(dir.library_db()).unwrap();
+        library
+            .execute_batch(
+                "CREATE TEMP TABLE later_migrations AS SELECT * FROM schema_migration WHERE version > 1;
+                 DELETE FROM schema_migration WHERE version > 1;
+                 CREATE TRIGGER fail_migration BEFORE INSERT ON schema_migration BEGIN
+                   SELECT raise(ABORT, 'migration failed');
+                 END",
+            )
+            .unwrap();
+        let server = rusqlite::Connection::open(dir.server_db()).unwrap();
+        for (key, created_at) in [(1u8, AT - THIRTY_DAYS_MS - 1), (2, AT - THIRTY_DAYS_MS + 1)] {
+            server
+                .execute(
+                    "INSERT INTO command_receipt
+                     (command_id, request_fingerprint, method, result_json, created_at_ms)
+                     VALUES (?1, zeroblob(32), 'queue.clear', 'null', ?2)",
+                    ([key; 16], created_at),
+                )
+                .unwrap();
+        }
+        let receipts = || -> i64 {
+            server
+                .query_row("SELECT count(*) FROM command_receipt", [], |row| row.get(0))
+                .unwrap()
+        };
+        for elapsed in [0, 10_000, 20_000] {
+            clock.set(AT + elapsed);
+            assert!(matches!(
+                start().await,
+                Err(crate::Error::Library(
+                    ritornel_engine::Error::MigrationFailed { version: 2, .. }
+                ))
+            ));
+            assert_eq!(finished(&dir.backups()).len(), 1);
+            assert_eq!(receipts(), 2);
+        }
+        library
+            .execute_batch(
+                "DROP TRIGGER fail_migration;
+                 INSERT INTO schema_migration SELECT * FROM later_migrations",
+            )
+            .unwrap();
+        drop(library);
+        start().await.unwrap().stop().await.unwrap();
+        assert_eq!(receipts(), 0);
+        assert_eq!(finished(&dir.backups()).len(), 1);
+    }
+
     #[test]
     fn retries_replace_missing_or_incomplete_snapshots_and_back_up_a_replaced_database() {
         let scratch = Scratch::new();

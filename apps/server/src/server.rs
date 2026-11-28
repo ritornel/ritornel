@@ -210,6 +210,7 @@ impl Server {
         }
 
         let (identity, library) = library::open(dir, &store, identity, &clock, &entropy)?;
+        store.prune_receipts()?;
         crate::dispatch::record_backup(
             &store,
             started_ms,
