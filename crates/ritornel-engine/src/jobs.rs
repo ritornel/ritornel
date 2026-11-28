@@ -242,6 +242,32 @@ fn job_by_id(connection: &Connection, id: Id) -> Result<Option<Job>, Error> {
 
 /// The stored result of a server-local command, if it was carried out
 /// before. The same ID with another request is refused.
+/// Ends a job in `transaction`, unless it has ended: one asked to stop
+/// never ends as succeeded, but as cancelled.
+fn end(
+    transaction: &Connection,
+    job: i64,
+    state: JobState,
+    error: Option<String>,
+    now_ms: i64,
+) -> Result<Job, Error> {
+    let current = job_by_row(transaction, job)?;
+    if current.state.ended() {
+        return Ok(current);
+    }
+    let (final_state, final_error) = if current.cancel_requested && state == JobState::Succeeded {
+        (JobState::Cancelled, None)
+    } else {
+        (state, error)
+    };
+    transaction.execute(
+        "UPDATE job SET state = ?2, error_json = ?3, finished_at_ms = ?4, current_label = NULL
+          WHERE id = ?1",
+        (job, final_state.as_str(), &final_error, now_ms),
+    )?;
+    job_by_row(transaction, job)
+}
+
 pub(crate) fn receipt(connection: &Connection, command: &Command) -> Result<Option<String>, Error> {
     let stored: Option<(Vec<u8>, String)> = connection
         .query_row(
@@ -379,6 +405,23 @@ impl ServerStore {
         method: &'static str,
         new: NewJob,
     ) -> Result<(Job, bool), Error> {
+        self.start_job_upgrading(command, method, new, |_| None)
+    }
+
+    /// As [`start_job`](Self::start_job), and asks more of a queued or
+    /// running job of the same kind and key: `upgrade` is given its params
+    /// and returns the params it is to run with instead, or `None` when it
+    /// does what is asked already. A queued job is claimed with them; a
+    /// running one finds them when it would end
+    /// ([`finish_succeeded_job`](Self::finish_succeeded_job)) and runs
+    /// again, so what was asked is never dropped.
+    pub fn start_job_upgrading(
+        &self,
+        command: Command,
+        method: &'static str,
+        new: NewJob,
+        upgrade: impl FnOnce(&str) -> Option<String> + Send + 'static,
+    ) -> Result<(Job, bool), Error> {
         self.transact(move |transaction, now_ms, entropy| {
             if let Some(result) = receipt(transaction, &command)? {
                 let id = result.parse().map_err(|_| Error::Corrupt("a receipt"))?;
@@ -395,7 +438,18 @@ impl ServerStore {
                 )
                 .optional()?;
             let (row, created) = match running {
-                Some(row) => (row, false),
+                Some(row) => {
+                    let current = job_by_row(transaction, row)?;
+                    if matches!(current.state, JobState::Queued | JobState::Running)
+                        && let Some(params) = upgrade(&current.params_json)
+                    {
+                        transaction.execute(
+                            "UPDATE job SET params_json = ?2 WHERE id = ?1",
+                            (row, &params),
+                        )?;
+                    }
+                    (row, false)
+                }
                 None => {
                     let public_id = crate::new_id(now_ms, entropy)?;
                     transaction.execute(
@@ -526,29 +580,39 @@ impl ServerStore {
         state: JobState,
         error: Option<String>,
     ) -> Result<Job, Error> {
+        let ended = self
+            .transact(move |transaction, now_ms, _| end(transaction, job, state, error, now_ms))?;
+        self.forget_cancel(job);
+        Ok(ended)
+    }
+
+    /// Ends a job that succeeded, run with the params `ran`, as
+    /// [`finish_job`](Self::finish_job) does, unless they were upgraded
+    /// while it ran ([`start_job_upgrading`](Self::start_job_upgrading)):
+    /// then it is left running, and `Err` holds the params to run it again
+    /// with. The check and the end are one transaction, so an upgrade
+    /// either comes before the end and is run, or finds the job ended and
+    /// starts a new one.
+    pub fn finish_succeeded_job(&self, job: i64, ran: &str) -> Result<Result<Job, String>, Error> {
+        let ran = ran.to_owned();
         let ended = self.transact(move |transaction, now_ms, _| {
             let current = job_by_row(transaction, job)?;
-            if current.state.ended() {
-                return Ok(current);
+            if !current.state.ended() && !current.cancel_requested && current.params_json != ran {
+                return Ok(Err(current.params_json));
             }
-            let (final_state, final_error) =
-                if current.cancel_requested && state == JobState::Succeeded {
-                    (JobState::Cancelled, None)
-                } else {
-                    (state, error)
-                };
-            transaction.execute(
-                "UPDATE job SET state = ?2, error_json = ?3, finished_at_ms = ?4, current_label = NULL
-                  WHERE id = ?1",
-                (job, final_state.as_str(), &final_error, now_ms),
-            )?;
-            job_by_row(transaction, job)
+            end(transaction, job, JobState::Succeeded, None, now_ms).map(Ok)
         })?;
+        if ended.is_ok() {
+            self.forget_cancel(job);
+        }
+        Ok(ended)
+    }
+
+    fn forget_cancel(&self, job: i64) {
         self.cancels
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&job);
-        Ok(ended)
     }
 
     /// Whether this job has been asked to stop.
@@ -933,6 +997,67 @@ mod tests {
             .start_job(command(4, "a"), "scan.start", scan("main"))
             .unwrap();
         assert!(created && again.public_id != first.public_id);
+    }
+
+    #[test]
+    fn more_asked_of_a_queued_or_running_job_is_run_and_never_dropped() {
+        let store = store(&Arc::new(FixedClock::at(T0)));
+        let ask = |n: u8, params: &'static str| {
+            store
+                .start_job_upgrading(
+                    command(n, params),
+                    "scan.start",
+                    NewJob {
+                        params_json: params.to_owned(),
+                        ..scan("main")
+                    },
+                    move |active| (active != "{\"full\":true}").then(|| params.to_owned()),
+                )
+                .unwrap()
+        };
+        // Queued, it is claimed with what was asked of it since.
+        let (queued, created) = ask(1, "{}");
+        assert!(created);
+        let (same, created) = ask(2, "{\"full\":true}");
+        assert_eq!((same.id, created), (queued.id, false));
+        let claimed = store.claim_job(id(0xb0)).unwrap().unwrap();
+        assert_eq!(claimed.params_json, "{\"full\":true}");
+        assert_eq!(
+            store
+                .finish_succeeded_job(claimed.id, &claimed.params_json)
+                .unwrap()
+                .map(|job| job.state),
+            Ok(JobState::Succeeded)
+        );
+
+        // Running, it does not end as it ran: it runs again as asked.
+        let (running, _) = ask(3, "{}");
+        let running = {
+            let claimed = store.claim_job(id(0xb0)).unwrap().unwrap();
+            assert_eq!(claimed.id, running.id);
+            claimed
+        };
+        let (same, created) = ask(4, "{\"full\":true}");
+        assert_eq!((same.id, created), (running.id, false));
+        let again = store
+            .finish_succeeded_job(running.id, &running.params_json)
+            .unwrap();
+        assert_eq!(again, Err("{\"full\":true}".to_owned()));
+        assert_eq!(
+            store.job(running.public_id).unwrap().unwrap().state,
+            JobState::Running
+        );
+        // Asked again for what it runs already, it changes nothing more.
+        ask(5, "{\"full\":true}");
+        let ended = store
+            .finish_succeeded_job(running.id, "{\"full\":true}")
+            .unwrap()
+            .unwrap();
+        assert_eq!(ended.state, JobState::Succeeded);
+
+        // Asked of a job that has ended, it is a job of its own.
+        let (next, created) = ask(6, "{\"full\":true}");
+        assert!(created && next.id != running.id);
     }
 
     #[test]

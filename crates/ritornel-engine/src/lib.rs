@@ -150,7 +150,7 @@ pub use secret::{SessionToken, Signer, verify_signature};
 pub use server_store::{
     BackupFailed, BackupTaken, Changed, Role, ServerIdentity, ServerStore, SettingChange,
 };
-pub use service_session::{ServiceKey, ServiceSession};
+pub use service_session::{PlaceCheck, ServiceKey, ServiceSession};
 pub use sqlite::SQLITE_VERSION;
 pub use stream_import::{APPLY_METHOD, StoredRun, UNDO_METHOD};
 

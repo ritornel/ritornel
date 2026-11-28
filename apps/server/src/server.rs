@@ -10,7 +10,7 @@ use ritornel_contract::{Id, PermissionSet, TokenRole};
 use ritornel_engine::transcode::{
     Encoder, EncoderId, LameEncoder, OpusEncoder, TranscodeCache, TranscodePool,
 };
-use ritornel_engine::{Clock, Entropy, SQLITE_VERSION, ServerStore};
+use ritornel_engine::{Clock, Entropy, PlaceCheck, SQLITE_VERSION, ServerStore};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::{info, warn};
 
@@ -237,6 +237,24 @@ impl Server {
         let requeued = store.requeue_jobs_of_other_runs(boot_id)?;
         if requeued > 0 {
             info!(requeued, "jobs that an earlier run left are queued again");
+        }
+
+        // Scrobbling goes on only in the data directory it was turned on
+        // in: a copy of it, or one put back from a backup, would send as
+        // the same session as the server it came from.
+        match store.check_scrobbling_place("lastfm", &dir.place())? {
+            PlaceCheck::Same => {}
+            PlaceCheck::Recorded => info!("Last.fm scrobbling is bound to this data directory"),
+            PlaceCheck::Moved { from } => warn!(
+                turned_on_in = %from,
+                "Last.fm scrobbling was turned on in another data directory, which this one \
+                 was copied or moved from: it is off here until you turn it on again with \
+                 `ritornelctl lastfm scrobbling on`"
+            ),
+            PlaceCheck::Restored => warn!(
+                "this data directory was put back from a backup: Last.fm scrobbling is off \
+                 until you turn it on again with `ritornelctl lastfm scrobbling on`"
+            ),
         }
 
         let restored_held = if let Some(library) = &library {

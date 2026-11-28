@@ -1449,6 +1449,66 @@ fn a_play_another_scrobbler_already_sent_to_the_account_is_not_sent_again() {
     assert_eq!(at.library.plan_deliveries(account, 0).unwrap(), 1);
 }
 
+#[test]
+fn one_scrobble_another_player_sent_keeps_back_one_play_of_ours_and_no_more() {
+    let at = library();
+    let account = at
+        .library
+        .ensure_service_account("lastfm", "someone")
+        .unwrap();
+    // Two plays of one track in one second, as from two players at once,
+    // and the other player scrobbled one of them itself.
+    let start = T0 + 10 * MINUTE;
+    let first = at.listen(1, 0, start, 200_000);
+    let second = at.listen(2, 0, start + 500, 200_000);
+    at.send(&first, PlayRule::CURRENT);
+    at.send(&second, PlayRule::CURRENT);
+    scrobble_of(&at, account, start / 1000 + 1, "moss arcade", "PAPER KITES");
+    let withdrawn = || {
+        at.count(
+            "SELECT count(*) FROM history_delivery WHERE state = 'withdrawn'
+             AND detail LIKE '%already%'",
+        )
+    };
+    // Before they are queued: one is kept back, the other is sent.
+    assert_eq!(at.library.plan_deliveries(account, 0).unwrap(), 1);
+    assert_eq!(withdrawn(), 1);
+    assert_eq!(
+        at.library
+            .take_due_deliveries(account, 0, 50)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // After they are queued, the same: the scrobble is checked against
+    // each as its turn comes, and it stands for one.
+    let later = start + 20 * MINUTE;
+    let third = at.listen(3, 1, later, 300_000);
+    let fourth = at.listen(4, 1, later + 300, 300_000);
+    at.send(&third, PlayRule::CURRENT);
+    at.send(&fourth, PlayRule::CURRENT);
+    assert_eq!(at.library.plan_deliveries(account, 0).unwrap(), 2);
+    scrobble_of(&at, account, later / 1000, "Moss Arcade", "Lanternfish");
+    let due = at.library.take_due_deliveries(account, 0, 50).unwrap();
+    assert_eq!(due.len(), 1, "{due:?}");
+    assert_eq!(withdrawn(), 2);
+
+    // A second scrobble of that second stands for the other.
+    let fifth = at.listen(5, 0, start + 40 * MINUTE, 200_000);
+    let sixth = at.listen(6, 0, start + 40 * MINUTE + 200, 200_000);
+    at.send(&fifth, PlayRule::CURRENT);
+    at.send(&sixth, PlayRule::CURRENT);
+    for at_s in [
+        (start + 40 * MINUTE) / 1000,
+        (start + 40 * MINUTE) / 1000 - 1,
+    ] {
+        scrobble_of(&at, account, at_s, "Moss Arcade", "Paper Kites");
+    }
+    assert_eq!(at.library.plan_deliveries(account, 0).unwrap(), 0);
+    assert_eq!(withdrawn(), 4);
+}
+
 /// What a program that knows nothing of Ritornel would do with an export:
 /// read each line as JSON, and the table as CSV, with nothing of this
 /// crate's but the folder's name.
@@ -3016,6 +3076,129 @@ fn after_a_restore_the_import_finds_the_plays_the_service_took_and_only_those() 
         );
     }
     assert_eq!(sent, [start / 1000 + 1, (start + 10 * MINUTE) / 1000]);
+    let incremental = at.library.derived_history().unwrap();
+    at.rebuild(PlayRule::CURRENT, false);
+    assert_eq!(at.library.derived_history().unwrap(), incremental);
+}
+
+#[test]
+fn after_a_restore_a_play_whose_names_the_service_corrected_is_not_sent_again() {
+    let at = library();
+    let account = at
+        .library
+        .ensure_service_account("lastfm", "someone")
+        .unwrap();
+    let start = (T0 + 10 * MINUTE) / 1000 * 1000;
+    // Three plays waiting to be sent when the backup was taken.
+    at.send(&at.listen(1, 0, start, 200_000), PlayRule::CURRENT);
+    at.send(
+        &at.listen(2, 1, start + 10 * MINUTE, 250_000),
+        PlayRule::CURRENT,
+    );
+    at.send(
+        &at.listen(3, 0, start + 20 * MINUTE, 200_000),
+        PlayRule::CURRENT,
+    );
+    assert_eq!(
+        at.library.plan_deliveries(account, start - MINUTE).unwrap(),
+        3
+    );
+    at.library
+        .write(
+            WriteRequest {
+                method: "test.restore",
+                command: None,
+                client: None,
+            },
+            move |write| {
+                crate::delivery_store::hold_sending(write.connection(), start)?;
+                Ok(String::new())
+            },
+        )
+        .unwrap();
+    // The server the backup was taken from sent the first, and Last.fm
+    // corrected its title as it took it.
+    scrobble_keyed(
+        &at,
+        account,
+        b"first",
+        start / 1000,
+        "Moss Arcade",
+        "Paper Kite",
+    );
+    // Another player scrobbled another track in the second play's second.
+    scrobble_keyed(
+        &at,
+        account,
+        b"other",
+        (start + 10 * MINUTE) / 1000,
+        "Someone Else",
+        "Elsewhere",
+    );
+    // The third's second holds two near scrobbles: neither can be told to
+    // be its own.
+    for (key, title) in [(&b"third-a"[..], "Paper Kite"), (b"third-b", "Paper Kits")] {
+        scrobble_keyed(
+            &at,
+            account,
+            key,
+            (start + 20 * MINUTE) / 1000,
+            "Moss Arcade",
+            title,
+        );
+    }
+    assert!(at.library.release_hold(account).unwrap());
+    // The first is its echo's, and is not sent again; the others are sent.
+    assert_eq!(
+        at.library.delivery_counts(account).unwrap(),
+        [("accepted".to_owned(), 1), ("pending".to_owned(), 2)]
+    );
+    let sent: Vec<i64> = at
+        .library
+        .take_due_deliveries(account, 0, 50)
+        .unwrap()
+        .into_iter()
+        .map(|due| due.timestamp_s)
+        .collect();
+    assert_eq!(
+        sent,
+        [(start + 10 * MINUTE) / 1000, (start + 20 * MINUTE) / 1000]
+    );
+    let played = |key: &[u8]| {
+        at.library
+            .read({
+                let key = key.to_vec();
+                move |connection| {
+                    Ok(connection.query_row(
+                        "SELECT count(*) FROM play_event_observation x
+                         JOIN history_observation o ON o.id = x.observation_id
+                         JOIN play_event_observation y ON y.play_event_id = x.play_event_id
+                         JOIN history_observation l ON l.id = y.observation_id
+                         WHERE o.source_key = ?1 AND l.kind = 'listen'",
+                        [key],
+                        |row| row.get::<_, i64>(0),
+                    )?)
+                }
+            })
+            .unwrap()
+    };
+    assert_eq!(played(b"first"), 1, "the echo joins its play");
+
+    // A listen that reaches the hub after the import, as from a satellite,
+    // whose scrobble Last.fm took with its artist corrected, is its echo's
+    // too, and is never sent.
+    let late = start + 5 * MINUTE;
+    scrobble_keyed(
+        &at,
+        account,
+        b"late",
+        late / 1000,
+        "Moss Arcades",
+        "Lanternfish",
+    );
+    at.send(&at.listen(4, 1, late, 250_000), PlayRule::CURRENT);
+    assert_eq!(played(b"late"), 1, "the late listen joins its echo");
+    assert_eq!(at.library.plan_deliveries(account, 0).unwrap(), 0);
     let incremental = at.library.derived_history().unwrap();
     at.rebuild(PlayRule::CURRENT, false);
     assert_eq!(at.library.derived_history().unwrap(), incremental);

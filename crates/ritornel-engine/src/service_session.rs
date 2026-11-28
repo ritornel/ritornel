@@ -55,25 +55,105 @@ pub struct ServiceSession {
     pub sign_in_again: bool,
 }
 
+/// The `server_setting` row that names the data directory scrobbling to
+/// `service` was turned on in: a JSON string, or JSON `null` in a backup's
+/// copy, which no data directory is. See "Copied and restored data
+/// directories" in docs/internals/history.md.
+fn place_key(service: &str) -> String {
+    format!("{service}.scrobbling_place")
+}
+
+fn forget_place(connection: &Connection, service: &str) -> Result<(), Error> {
+    connection.execute(
+        "DELETE FROM server_setting WHERE key = ?1",
+        [place_key(service)],
+    )?;
+    Ok(())
+}
+
+fn keep_place(connection: &Connection, service: &str, place: Option<&str>) -> Result<(), Error> {
+    connection.execute(
+        "INSERT INTO server_setting (key, value_json) VALUES (?1, ?2)
+         ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json",
+        (place_key(service), serde_json::to_string(&place)?),
+    )?;
+    Ok(())
+}
+
 /// Forgets the session at `service`. Whether there was one.
 pub(crate) fn remove_session(connection: &Connection, service: &str) -> Result<bool, Error> {
+    forget_place(connection, service)?;
     Ok(connection.execute("DELETE FROM service_session WHERE service = ?1", [service])? > 0)
 }
 
 /// Turns scrobbling to `service` on from `now_ms`, unless it is on, or off.
-/// Whether there is a session to turn it on or off for.
+/// Turned on, it is bound to `place`, the data directory this server runs
+/// in; turned off, to none. Whether there is a session to turn it on or off
+/// for.
 pub(crate) fn set_scrobbling(
     connection: &Connection,
     service: &str,
     on: bool,
     now_ms: i64,
+    place: &str,
 ) -> Result<bool, Error> {
-    Ok(connection.execute(
+    let found = connection.execute(
         "UPDATE service_session
          SET scrobble_from_ms = CASE WHEN ?2 THEN coalesce(scrobble_from_ms, ?3) END
          WHERE service = ?1",
         rusqlite::params![service, on, now_ms],
-    )? > 0)
+    )? > 0;
+    if found && on {
+        keep_place(connection, service, Some(place))?;
+    } else {
+        forget_place(connection, service)?;
+    }
+    Ok(found)
+}
+
+/// Marks every session that scrobbles in `connection`, a backup's copy of
+/// `server.db`, as bound to no data directory, so that a server started on
+/// it turns scrobbling off ([`ServerStore::check_scrobbling_place`]). A
+/// file with no sessions table is left alone. Returns whether any session
+/// was marked.
+pub(crate) fn unbind_copy(connection: &Connection) -> Result<bool, Error> {
+    let is_server: bool = connection.query_row(
+        "SELECT count(*) = 2 FROM sqlite_schema
+         WHERE type = 'table' AND name IN ('service_session', 'server_setting')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !is_server {
+        return Ok(false);
+    }
+    let services: Vec<String> = connection
+        .prepare("SELECT service FROM service_session WHERE scrobble_from_ms IS NOT NULL")?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    for service in &services {
+        keep_place(connection, service, None)?;
+    }
+    Ok(!services.is_empty())
+}
+
+/// What a server starting in a data directory found of where scrobbling to
+/// a service was turned on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlaceCheck {
+    /// Scrobbling is off, or on in this data directory.
+    Same,
+    /// On, with no data directory recorded, as one from a build before
+    /// they were: this one is recorded now.
+    Recorded,
+    /// On, turned on in this other data directory, which this one was
+    /// copied or moved from: scrobbling is turned off.
+    Moved {
+        /// The data directory it was turned on in.
+        from: String,
+    },
+    /// On, in a data directory restored from a backup: scrobbling is
+    /// turned off.
+    Restored,
 }
 
 impl ServerStore {
@@ -145,15 +225,65 @@ impl ServerStore {
         self.transact(move |transaction, _, _| remove_session(transaction, &service))
     }
 
-    /// Turns scrobbling to `service` on, for plays from now on, or off.
-    /// Turned on while it is on, it keeps the time it was turned on.
-    /// Returns the session as it now is.
-    pub fn set_scrobbling(&self, service: &str, on: bool) -> Result<Option<ServiceSession>, Error> {
-        let owned = service.to_owned();
+    /// Turns scrobbling to `service` on, for plays from now on, bound to
+    /// the data directory `place`, or off. Turned on while it is on, it
+    /// keeps the time it was turned on. Returns the session as it now is.
+    pub fn set_scrobbling(
+        &self,
+        service: &str,
+        on: bool,
+        place: &str,
+    ) -> Result<Option<ServiceSession>, Error> {
+        let (owned, place) = (service.to_owned(), place.to_owned());
         self.transact(move |transaction, now_ms, _| {
-            set_scrobbling(transaction, &owned, on, now_ms).map(|_| ())
+            set_scrobbling(transaction, &owned, on, now_ms, &place).map(|_| ())
         })?;
         self.service_session(service)
+    }
+
+    /// Checks, as a server starts in the data directory `place`, that
+    /// scrobbling to `service` was turned on there. Turned on in another
+    /// one, which this one is a copy of or was moved from, or in a data
+    /// directory restored from a backup, it is turned off, so that two
+    /// servers never send as one session: the owner turns it on again. On
+    /// with no place recorded, as in a data directory from an older build,
+    /// it is bound to `place`.
+    pub fn check_scrobbling_place(&self, service: &str, place: &str) -> Result<PlaceCheck, Error> {
+        let (service, place) = (service.to_owned(), place.to_owned());
+        self.transact(move |transaction, _, _| {
+            let on: bool = transaction
+                .query_row(
+                    "SELECT scrobble_from_ms IS NOT NULL FROM service_session WHERE service = ?1",
+                    [&service],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .unwrap_or(false);
+            if !on {
+                return Ok(PlaceCheck::Same);
+            }
+            let stored: Option<String> = transaction
+                .query_row(
+                    "SELECT value_json FROM server_setting WHERE key = ?1",
+                    [place_key(&service)],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(stored) = stored else {
+                keep_place(transaction, &service, Some(&place))?;
+                return Ok(PlaceCheck::Recorded);
+            };
+            // A value that cannot be read is no place: off, as for a copy.
+            let bound: Option<String> = serde_json::from_str(&stored).unwrap_or_default();
+            if bound.as_deref() == Some(place.as_str()) {
+                return Ok(PlaceCheck::Same);
+            }
+            set_scrobbling(transaction, &service, false, 0, &place)?;
+            Ok(match bound {
+                Some(from) => PlaceCheck::Moved { from },
+                None => PlaceCheck::Restored,
+            })
+        })
     }
 
     /// Records that the service refused the session whose key is `key`,
@@ -187,6 +317,8 @@ mod tests {
     use super::*;
     use crate::testing::{CountingEntropy, FixedClock};
 
+    const PLACE: &str = "/invented/data";
+
     #[test]
     fn a_session_is_kept_scrobbling_is_turned_on_from_a_time_and_the_key_never_prints() {
         let clock = Arc::new(FixedClock::at(1_000));
@@ -208,12 +340,21 @@ mod tests {
         assert!(!format!("{kept:?}").contains("SENTINEL"));
 
         clock.set(5_000);
-        let on = store.set_scrobbling("lastfm", true).unwrap().unwrap();
+        let on = store
+            .set_scrobbling("lastfm", true, PLACE)
+            .unwrap()
+            .unwrap();
         assert_eq!(on.scrobble_from_ms, Some(5_000));
         clock.set(9_000);
-        let again = store.set_scrobbling("lastfm", true).unwrap().unwrap();
+        let again = store
+            .set_scrobbling("lastfm", true, PLACE)
+            .unwrap()
+            .unwrap();
         assert_eq!(again.scrobble_from_ms, Some(5_000));
-        let off = store.set_scrobbling("lastfm", false).unwrap().unwrap();
+        let off = store
+            .set_scrobbling("lastfm", false, PLACE)
+            .unwrap()
+            .unwrap();
         assert_eq!(off.scrobble_from_ms, None);
 
         store
@@ -241,6 +382,76 @@ mod tests {
     }
 
     #[test]
+    fn scrobbling_turned_on_in_one_data_directory_is_turned_off_in_a_copy_of_it() {
+        let clock = Arc::new(FixedClock::at(1_000));
+        let store =
+            ServerStore::open_in_memory(clock.clone(), Arc::new(CountingEntropy::default()))
+                .unwrap();
+        let check = |place| store.check_scrobbling_place("lastfm", place).unwrap();
+        // Signed out, and signed in with scrobbling off, nothing is checked.
+        assert_eq!(check("/elsewhere"), PlaceCheck::Same);
+        let account = Id::from_bytes([7; 16]);
+        store
+            .save_service_session("lastfm", account, "someone", &ServiceKey::new("KEY"), false)
+            .unwrap();
+        assert_eq!(check("/elsewhere"), PlaceCheck::Same);
+
+        // Turned on here, every start here goes on scrobbling.
+        clock.set(5_000);
+        store.set_scrobbling("lastfm", true, PLACE).unwrap();
+        for _ in 0..2 {
+            assert_eq!(check(PLACE), PlaceCheck::Same);
+        }
+        let on = store.service_session("lastfm").unwrap().unwrap();
+        assert_eq!(on.scrobble_from_ms, Some(5_000));
+
+        // Started in a copy, or after a move, it is turned off, and stays
+        // off there until it is turned on again, from then on.
+        assert_eq!(
+            check("/copy"),
+            PlaceCheck::Moved {
+                from: PLACE.to_owned()
+            }
+        );
+        assert_eq!(
+            store
+                .service_session("lastfm")
+                .unwrap()
+                .unwrap()
+                .scrobble_from_ms,
+            None
+        );
+        assert_eq!(check("/copy"), PlaceCheck::Same);
+        clock.set(9_000);
+        store.set_scrobbling("lastfm", true, "/copy").unwrap();
+        assert_eq!(check("/copy"), PlaceCheck::Same);
+        assert_eq!(
+            store
+                .service_session("lastfm")
+                .unwrap()
+                .unwrap()
+                .scrobble_from_ms,
+            Some(9_000)
+        );
+
+        // On with no place, as a data directory an older build turned it on
+        // in, it is bound to where it starts.
+        store
+            .transact(|transaction, _, _| forget_place(transaction, "lastfm"))
+            .unwrap();
+        assert_eq!(check(PLACE), PlaceCheck::Recorded);
+        assert_eq!(check(PLACE), PlaceCheck::Same);
+        assert!(
+            store
+                .service_session("lastfm")
+                .unwrap()
+                .unwrap()
+                .scrobble_from_ms
+                .is_some()
+        );
+    }
+
+    #[test]
     fn signing_in_again_to_the_same_account_keeps_scrobbling_on_and_another_account_does_not() {
         let clock = Arc::new(FixedClock::at(1_000));
         let store =
@@ -255,7 +466,7 @@ mod tests {
         };
         sign_in(someone, "someone", "KEY_1");
         clock.set(5_000);
-        store.set_scrobbling("lastfm", true).unwrap();
+        store.set_scrobbling("lastfm", true, PLACE).unwrap();
         store.refuse_service_session("lastfm", "KEY_1").unwrap();
 
         // The same account, with a new key: on as before, from when it was
@@ -275,8 +486,8 @@ mod tests {
         assert_eq!(other.scrobble_from_ms, None);
         // Off by the listener's choice, it stays off through a sign-in to
         // the same account.
-        store.set_scrobbling("lastfm", true).unwrap();
-        store.set_scrobbling("lastfm", false).unwrap();
+        store.set_scrobbling("lastfm", true, PLACE).unwrap();
+        store.set_scrobbling("lastfm", false, PLACE).unwrap();
         assert_eq!(sign_in(another, "another", "KEY_4").scrobble_from_ms, None);
     }
 }

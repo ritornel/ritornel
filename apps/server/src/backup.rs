@@ -46,6 +46,7 @@ use ritornel_contract::local::Preparing;
 use ritornel_contract::{BackupReason, Id};
 use ritornel_engine::backup::{
     Database, MigrationState, Pending, copy_database, hold_sending, pending_migrations, recorded_id,
+    unbind_scrobbling,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -126,6 +127,13 @@ To look inside without changing anything: sqlite3 -readonly library.db
 }
 
 /// What the README adds when the library copied has a Last.fm account.
+const UNBOUND: &str = "
+This server scrobbles to Last.fm. A server started on this backup, wherever
+it is put back, has scrobbling off until you turn it on again with
+`ritornelctl lastfm scrobbling on`: the server it was taken from may still be
+scrobbling as the same account.
+";
+
 const HELD: &str = "
 This library has a Last.fm account. A server started on it scrobbles nothing
 to Last.fm until that account has imported from there, which it does by
@@ -809,7 +817,7 @@ pub(crate) fn is_inside(path: &Path, root: &Path) -> bool {
     resolved(path).starts_with(resolved(root))
 }
 
-fn resolved(path: &Path) -> PathBuf {
+pub(crate) fn resolved(path: &Path) -> PathBuf {
     use std::path::Component;
     // The longest part of the path that is there, as the system resolves
     // it, and then the rest.
@@ -958,7 +966,7 @@ fn fill(
     about: About,
 ) -> Result<(), BackupError> {
     let mut files = Vec::new();
-    let mut held = false;
+    let (mut held, mut unbound) = (false, false);
     for (name, source) in [
         ("server.db", dir.server_db()),
         ("library.db", dir.library_db()),
@@ -986,6 +994,10 @@ fn fill(
         if name == "library.db" {
             // Put back, it holds plays Last.fm may have taken since.
             held = hold_sending(&copy, at_ms).map_err(|error| BackupError::Copy(name, error))?;
+        } else {
+            // Put back, it scrobbles nothing until the owner says so: the
+            // server it was taken from may still be scrobbling.
+            unbound = unbind_scrobbling(&copy).map_err(|error| BackupError::Copy(name, error))?;
         }
         // SQLite makes a file anyone may read, and server.db holds this
         // server's signing key.
@@ -1016,6 +1028,9 @@ fn fill(
     let text = serde_json::to_string_pretty(&manifest).unwrap_or_default();
     write_synced(&into.join("backup.json"), text.as_bytes())?;
     let mut readme = readme(dir.root(), about);
+    if unbound {
+        readme.push_str(UNBOUND);
+    }
     if held {
         readme.push_str(HELD);
     }

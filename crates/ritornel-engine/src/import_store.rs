@@ -614,6 +614,81 @@ fn gone(connection: &Connection, endpoint: i64, batch: &Batch) -> Result<u64, Er
         .count() as u64)
 }
 
+/// The keys of the batch's records that are scrobbles the library holds
+/// already under another key, because the source changed what one names
+/// after it was stored, as Last.fm does when it fills in an album: a
+/// scrobble's key hashes its album. In each second, a record the library
+/// does not hold, naming the artist and title of an import there that the
+/// batch no longer lists, under another album, is that import, one for
+/// one, and is not stored again, so one scrobble stays one play. An import
+/// a full read set aside as a shifted read's duplicate (`set_aside`, or
+/// before) is not listed because it was never there, and stands for no
+/// record.
+fn relisted(
+    connection: &Connection,
+    endpoint: i64,
+    batch: &Batch,
+    set_aside: &[i64],
+) -> Result<HashSet<Vec<u8>>, Error> {
+    type Named = (i64, String, String);
+    let keys: HashSet<&[u8]> = batch
+        .records
+        .iter()
+        .map(|record| record.source_key.as_slice())
+        .collect();
+    let mut statement = connection.prepare_cached(
+        "SELECT o.id, o.source_key, i.played_at_utc_ms, i.artist, i.title, i.album
+         FROM observation_import i
+         JOIN history_observation o ON o.id = i.observation_id
+         WHERE o.endpoint_id = ?1 AND i.played_at_utc_ms >= ?2 AND i.played_at_utc_ms < ?3
+           AND NOT EXISTS (SELECT 1 FROM correction_target t
+                           JOIN observation_correction c ON c.observation_id = t.correction_id
+                           JOIN history_observation co ON co.id = c.observation_id
+                           WHERE t.target_observation_id = o.id AND c.verb = 'exclude'
+                             AND json_extract(co.payload_json, '$.reason') = ?4)
+         ORDER BY o.id",
+    )?;
+    let mut unlisted: HashMap<Named, Vec<Option<String>>> = HashMap::new();
+    let mut held = HashSet::new();
+    let mut rows = statement.query(rusqlite::params![
+        endpoint,
+        batch.span.from_ms,
+        batch.span.to_ms,
+        SHIFTED_READ
+    ])?;
+    while let Some(row) = rows.next()? {
+        let (observation, key): (i64, Vec<u8>) = (row.get(0)?, row.get(1)?);
+        if !keys.contains(key.as_slice()) && !set_aside.contains(&observation) {
+            unlisted
+                .entry((row.get(2)?, row.get(3)?, row.get(4)?))
+                .or_default()
+                .push(row.get(5)?);
+        }
+        held.insert(key);
+    }
+    let mut found = HashSet::new();
+    for record in &batch.records {
+        if held.contains(&record.source_key) {
+            continue;
+        }
+        let named = (
+            record.played_at_ms,
+            record.track.artist.clone(),
+            record.track.title.clone(),
+        );
+        // The same names and album under a new key is another scrobble of
+        // that second, as its place among them says.
+        let Some(left) = unlisted.get_mut(&named) else {
+            continue;
+        };
+        if let Some(at) = left.iter().position(|album| *album != record.track.album) {
+            left.swap_remove(at);
+            found.insert(record.source_key.clone());
+        }
+    }
+    Ok(found)
+}
+
 /// What an import set aside as a duplicate says, in its correction.
 pub(crate) const DUPLICATE_NOTE: &str = "set aside by a full sync: the source lists as many \
      scrobbles in this second as its first read stored, with fewer of this one, as a read \
@@ -790,15 +865,17 @@ pub(crate) fn ingest_imports(
     write: &Write<'_>,
     account: Id,
     batch: &Batch,
+    set_aside: &[i64],
     rule: ritornel_domain::history::PlayRule,
 ) -> Result<u64, Error> {
     let connection = write.connection();
     let rows = rows_of(connection, account)?;
-    let held = stored_keys(
+    let mut held = stored_keys(
         connection,
         rows.endpoint,
         batch.records.iter().map(|record| &record.source_key),
     )?;
+    held.extend(relisted(connection, rows.endpoint, batch, set_aside)?);
     let mut observations = BTreeSet::new();
     let mut new_items = Vec::new();
     for record in &batch.records {
@@ -1134,16 +1211,16 @@ impl LibraryStore {
                     rows.endpoint,
                     batch.records.iter().map(|record| &record.source_key),
                 )?;
-                let rechecked = if full {
-                    let found = recheck(connection, rows.endpoint, &batch)?;
-                    found.set_aside.len() + found.revoke.len()
+                let found = if full {
+                    recheck(connection, rows.endpoint, &batch)?
                 } else {
-                    0
+                    Recheck::default()
                 };
+                let relisted = relisted(connection, rows.endpoint, &batch, &found.set_aside)?;
                 Ok((
-                    batch.records.len() - held.len(),
+                    batch.records.len() - held.len() - relisted.len(),
                     gone(connection, rows.endpoint, &batch)?,
-                    rechecked,
+                    found.set_aside.len() + found.revoke.len(),
                 ))
             })?
         };
@@ -1171,7 +1248,7 @@ impl LibraryStore {
                 } else {
                     Recheck::default()
                 };
-                let new = ingest_imports(write, account, &batch, rule)?;
+                let new = ingest_imports(write, account, &batch, &found.set_aside, rule)?;
                 crate::history_store::exclude(
                     write,
                     &found.set_aside,

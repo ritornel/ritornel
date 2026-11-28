@@ -547,3 +547,87 @@ fn what_begins_to_play_is_shown_as_playing_now_only_while_scrobbling_is_on() {
         assert!(!written.contains(secret), "a secret in the log");
     }
 }
+
+/// Copies a stopped server's data directory, as `cp -R` does.
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let to = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &to);
+        } else {
+            std::fs::copy(entry.path(), &to).unwrap();
+        }
+    }
+}
+
+#[test]
+fn a_copied_or_restored_data_directory_scrobbles_nothing_until_scrobbling_is_turned_on_there() {
+    let scratch = scratch();
+    let data_dir = scratch.data_dir();
+    let place = scratch.0.join("backups");
+    std::fs::create_dir_all(&place).unwrap();
+    let fake = FakeLastfm::start("someone", Vec::new());
+    let since = |dir: &Path| json(dir, &["lastfm", "status"])["scrobblingSince"].clone();
+
+    let server = start(
+        &data_dir,
+        &fake,
+        &[("RITORNEL_BACKUP_DIR", place.to_str().unwrap())],
+    );
+    ok(&data_dir, &["library", "create"]);
+    ok(&data_dir, &["lastfm", "signin"]);
+    json(&data_dir, &["lastfm", "scrobbling", "on"]);
+    let on = since(&data_dir);
+    assert!(on.is_number(), "{on}");
+    let backed_up = json(&data_dir, &["backup"]);
+    let backup = PathBuf::from(backed_up["backup"]["path"].as_str().unwrap());
+    let readme = std::fs::read_to_string(backup.join("README.txt")).unwrap();
+    assert!(
+        readme.contains("ritornelctl lastfm scrobbling on"),
+        "{readme}"
+    );
+    server.stop();
+
+    // Started again where it was turned on, it scrobbles as before.
+    let server = start(&data_dir, &fake, &[]);
+    assert_eq!(since(&data_dir), on);
+    server.stop();
+
+    // A copy of the data directory has the same server and session, and
+    // scrobbles nothing until it is turned on there.
+    let copy = scratch.0.join("copy");
+    copy_dir(&data_dir, &copy);
+    let server = start(&copy, &fake, &[]);
+    assert_eq!(since(&copy), Value::Null);
+    assert!(logs(&copy).contains("copied or moved from"));
+    json(&copy, &["lastfm", "scrobbling", "on"]);
+    assert!(since(&copy).is_number());
+    server.stop();
+    let server = start(&copy, &fake, &[]);
+    assert!(
+        since(&copy).is_number(),
+        "turned on there, it stays on there"
+    );
+    server.stop();
+
+    // The data directory it was copied from goes on as it was.
+    let server = start(&data_dir, &fake, &[]);
+    assert_eq!(since(&data_dir), on);
+    server.stop();
+
+    // Put back from the backup, even where it was taken, it scrobbles
+    // nothing until it is turned on again.
+    for name in ["server.db", "library.db"] {
+        for sidecar in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(data_dir.join(format!("{name}{sidecar}")));
+        }
+        std::fs::copy(backup.join(name), data_dir.join(name)).unwrap();
+    }
+    let server = start(&data_dir, &fake, &[]);
+    assert_eq!(since(&data_dir), Value::Null);
+    assert!(logs(&data_dir).contains("put back from a backup"));
+    server.stop();
+    assert!(fake.scrobbled().is_empty() && fake.now_playing().is_empty());
+}

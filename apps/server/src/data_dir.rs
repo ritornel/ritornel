@@ -86,6 +86,16 @@ impl DataDir {
         &self.root
     }
 
+    /// The directory as the system resolves it now, links followed, as
+    /// text: what scrobbling turned on here is bound to, so that a copy of
+    /// the directory, or the directory moved, is told apart from it. See
+    /// "Copied and restored data directories" in docs/internals/history.md.
+    pub(crate) fn place(&self) -> String {
+        crate::platform::plain_path(&crate::backup::resolved(&self.root))
+            .to_string_lossy()
+            .into_owned()
+    }
+
     pub(crate) fn lock_file(&self) -> PathBuf {
         self.root.join(local::SERVER_LOCK)
     }

@@ -401,9 +401,22 @@ mod enabled {
                 params_json: serde_json::to_string(params).unwrap_or_default(),
                 session: self.local_credential.session(),
             };
+            // A full sync asked for while an incremental one is queued or
+            // running is not dropped: that job reads the whole history.
+            let full = params.full;
             let (started, created) = stores
                 .server()
-                .start_job(command, LastfmSync::NAME, new)
+                .start_job_upgrading(command, LastfmSync::NAME, new, move |active| {
+                    let active = serde_json::from_str::<LastfmSyncParams>(active).ok()?;
+                    if !full || active.full {
+                        return None;
+                    }
+                    serde_json::to_string(&LastfmSyncParams {
+                        full: true,
+                        ..active
+                    })
+                    .ok()
+                })
                 .map_err(refused)?;
             if created {
                 self.publish_stored_job(stores, &started);
@@ -539,6 +552,7 @@ mod enabled {
                     SettingChange::Scrobbling {
                         service: SERVICE.to_owned(),
                         on: params.on,
+                        place: self.dir.place(),
                     },
                 )
                 .map_err(|error| match error {
@@ -922,6 +936,85 @@ mod tests {
         hello(&core, "desktop");
         assert_eq!(tick(&core, false), Auto::NotDue);
         assert_eq!(schedule(&core, &cli)["last"]["ended"], T0);
+    }
+
+    #[test]
+    fn a_full_sync_asked_for_while_one_runs_reads_the_whole_history_in_that_job() {
+        use ritornel_lastfm::fake::{FakeLastfm, FakeScrobble};
+        let now_s = || {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        };
+        let fake = FakeLastfm::start(
+            "someone",
+            vec![FakeScrobble::new(
+                now_s() - 86_400,
+                "Calla Brandt",
+                "Glasshouse",
+                "Low Tide",
+            )],
+        );
+        let clock = Arc::new(SetClock::at(T0));
+        let (core, _scratch) = server_at(&clock, fake.base_url());
+        let cli = hello(&core, "cli");
+        call(&core, &cli, "library.create", key(0xc0)).unwrap();
+        sign_in(&core);
+        set_zone(&core, &cli);
+        let sync = |byte: u8, full: bool| {
+            let mut params = key(byte);
+            params["full"] = json!(full);
+            call(&core, &cli, "lastfm.sync", params).unwrap()["job"]["jobId"].clone()
+        };
+        let run = || {
+            core.with_stores(|stores| {
+                stores
+                    .server()
+                    .claim_job(ritornel_contract::Id::from_bytes([0xb0; 16]))
+            })
+            .unwrap()
+            .unwrap()
+            .unwrap()
+        };
+        // A first sync reads everything there is, and leaves a cursor.
+        sync(0x51, false);
+        let first = run();
+        crate::lastfm::run_sync(&core, first, &Arc::default());
+
+        // A scrobble from long before the cursor turns up, as one a full
+        // read alone finds.
+        fake.add([FakeScrobble::new(
+            now_s() - 60 * 86_400,
+            "Calla Brandt",
+            "Glasshouse",
+            "High Water",
+        )]);
+        // An incremental sync is running when a full one is asked for: the
+        // full one is that job, and is not dropped.
+        let incremental = sync(0x52, false);
+        let running = run();
+        assert_eq!(sync(0x53, true), incremental);
+        assert!(!running.params_json.contains("\"full\":true"));
+        let row = running.public_id;
+        crate::lastfm::run_sync(&core, running, &Arc::default());
+        let ended = core
+            .with_stores(|stores| stores.server().job(row).unwrap().unwrap())
+            .unwrap();
+        assert_eq!(ended.state, JobState::Succeeded);
+        assert!(
+            ended.params_json.contains("\"full\":true"),
+            "{}",
+            ended.params_json
+        );
+        let stored = core
+            .with_library(|server, library| {
+                let account = server.service_session(SERVICE).unwrap().unwrap().account;
+                library.imported_count(account).unwrap()
+            })
+            .unwrap();
+        assert_eq!(stored, 2, "the full read found the old scrobble");
+        assert_eq!(syncs(&core).len(), 2);
     }
 
     #[test]

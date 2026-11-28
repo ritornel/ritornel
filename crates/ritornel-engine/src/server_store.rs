@@ -46,6 +46,9 @@ pub enum SettingChange {
         service: String,
         /// On or off.
         on: bool,
+        /// The data directory this server runs in, which scrobbling
+        /// turned on is bound to.
+        place: String,
     },
     /// Signing out of a service.
     SignOut {
@@ -386,8 +389,14 @@ impl ServerStore {
             let found = match &change {
                 SettingChange::Watching(on) => set_watching(transaction, *on).map(|()| true)?,
                 SettingChange::Awake(awake) => set_awake(transaction, *awake).map(|()| true)?,
-                SettingChange::Scrobbling { service, on } => {
-                    if !crate::service_session::set_scrobbling(transaction, service, *on, now_ms)? {
+                SettingChange::Scrobbling { service, on, place } => {
+                    if !crate::service_session::set_scrobbling(
+                        transaction,
+                        service,
+                        *on,
+                        now_ms,
+                        place,
+                    )? {
                         return Err(Error::NotFound("no session at the service"));
                     }
                     true

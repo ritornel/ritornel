@@ -85,6 +85,10 @@ pub(crate) struct Lastfm {
     /// session.
     #[cfg(feature = "lastfm")]
     turn: Turn,
+    /// What became of the last batch sent, when it could not be recorded:
+    /// the scrobbler records it before it sends anything more.
+    #[cfg(feature = "lastfm")]
+    unsettled: std::sync::Mutex<Vec<(i64, ritornel_engine::Settled)>>,
 }
 
 /// Where a sign-in has got to.
@@ -162,6 +166,7 @@ impl Lastfm {
                 playing: Slots::default(),
                 paused: std::sync::Mutex::default(),
                 turn: Turn::default(),
+                unsettled: std::sync::Mutex::default(),
             }
         }
         #[cfg(not(feature = "lastfm"))]
@@ -824,15 +829,7 @@ mod enabled {
         let finish = |state: JobState, failure: Option<String>, summary: Option<&SyncSummary>| {
             let finished = core.with_stores(|stores| {
                 if let Some(summary) = summary {
-                    stores.server().save_progress(
-                        row,
-                        Progress {
-                            checkpoint_json: serde_json::to_string(summary).ok(),
-                            done: i64::try_from(summary.read).unwrap_or(i64::MAX),
-                            total: summary.source_total.and_then(|t| i64::try_from(t).ok()),
-                            ..Progress::default()
-                        },
-                    )?;
+                    stores.server().save_progress(row, summed(summary))?;
                 }
                 stores.server().finish_job(row, state, failure)
             });
@@ -887,7 +884,9 @@ mod enabled {
                     None,
                 );
             }
-            Some(Err(failed)) => return finish(JobState::Failed, Some(failed.to_string()), None),
+            Some(Err(failed)) => {
+                return finish(JobState::Failed, Some(failed.to_string()), None);
+            }
             None => return,
         };
         // Asked for one account, while another is signed in now: it would
@@ -972,7 +971,37 @@ mod enabled {
                             lastfm_total = ?summary.source_total,
                             "the Last.fm history is synced"
                         );
-                        finish(JobState::Succeeded, None, Some(&summary));
+                        // A full sync asked for while this one ran: the job
+                        // reads the whole history again rather than end.
+                        let ended = core.with_stores(|stores| {
+                            stores.server().save_progress(row, summed(&summary))?;
+                            stores.server().finish_succeeded_job(row, &job.params_json)
+                        });
+                        match ended {
+                            Some(Ok(Ok(job))) => {
+                                info!(job_id = %job_id, state = job.state.as_str(), "a job ended");
+                                core.publish_job(&job);
+                            }
+                            Some(Ok(Err(upgraded))) => {
+                                info!(
+                                    job_id = %job_id,
+                                    "a full sync was asked for while this one ran: it reads the \
+                                     whole history now"
+                                );
+                                run_sync(
+                                    core,
+                                    Job {
+                                        params_json: upgraded,
+                                        ..job
+                                    },
+                                    shutdown,
+                                );
+                            }
+                            Some(Err(failed)) => {
+                                error!(job_id = %job_id, error = %failed, "a job's end could not be saved")
+                            }
+                            None => {}
+                        }
                     }
                     Some(Err(failed)) => {
                         finish(JobState::Failed, Some(failed.to_string()), Some(&summary))
@@ -981,6 +1010,16 @@ mod enabled {
                 }
             }
             Err(failed) => finish(JobState::Failed, Some(failed.to_string()), Some(&summary)),
+        }
+    }
+
+    /// A sync's counters, as its job's progress keeps them.
+    fn summed(summary: &SyncSummary) -> Progress {
+        Progress {
+            checkpoint_json: serde_json::to_string(summary).ok(),
+            done: i64::try_from(summary.read).unwrap_or(i64::MAX),
+            total: summary.source_total.and_then(|t| i64::try_from(t).ok()),
+            ..Progress::default()
         }
     }
 
@@ -1094,6 +1133,7 @@ mod enabled {
                     .unwrap_or_else(std::sync::PoisonError::into_inner) =
                     Some((account, std::time::Instant::now() + wait));
             },
+            unsettled: &lastfm.unsettled,
         });
     }
 
@@ -1131,6 +1171,10 @@ mod enabled {
         pub(crate) paused: &'a dyn Fn(Id) -> bool,
         /// Sends nothing for this account for this long.
         pub(crate) pause: &'a dyn Fn(Id, std::time::Duration),
+        /// What became of a batch that could not be recorded: recorded
+        /// before anything more is sent. Its plays stay `sending` until it
+        /// is, and are never sent again.
+        pub(crate) unsettled: &'a std::sync::Mutex<Vec<(i64, Settled)>>,
     }
 
     /// Sends what is due, a batch at a time, until nothing is due. Before
@@ -1147,6 +1191,19 @@ mod enabled {
             let Some(_turn) = sending.turn.batch() else {
                 return;
             };
+            {
+                let mut unsettled = lock(sending.unsettled);
+                if !unsettled.is_empty() {
+                    if !(sending.settle)(unsettled.clone()) {
+                        return;
+                    }
+                    info!(
+                        settled = unsettled.len(),
+                        "what became of scrobbles sent earlier is recorded now"
+                    );
+                    unsettled.clear();
+                }
+            }
             let Some(session) = (sending.session)() else {
                 return;
             };
@@ -1255,7 +1312,10 @@ mod enabled {
                 .iter()
                 .filter(|(_, s)| matches!(s, Settled::Accepted { .. }))
                 .count();
-            if !(sending.settle)(settled) {
+            // Kept to record again, rather than left `sending` until the
+            // server starts again.
+            if !(sending.settle)(settled.clone()) {
+                *lock(sending.unsettled) = settled;
                 return;
             }
             info!(sent = plays.len(), accepted, "plays scrobbled to Last.fm");
@@ -1612,6 +1672,7 @@ mod enabled {
                 now: &|| 0,
                 paused: &|_| false,
                 pause: &|_, _| {},
+                unsettled: &std::sync::Mutex::default(),
             });
             sent.into_inner()
         }
@@ -1651,6 +1712,7 @@ mod enabled {
                     paused.get().is_some_and(|(held, _)| held == account) && !over.get()
                 },
                 pause: &|account, wait| paused.set(Some((account, wait))),
+                unsettled: &std::sync::Mutex::default(),
             };
             send_due(&sending);
             // The limit is reached: nothing more is sent, however often it
@@ -1699,6 +1761,7 @@ mod enabled {
                 now: &|| 1_000,
                 paused: &|account| account == another,
                 pause: &|_, _| {},
+                unsettled: &std::sync::Mutex::default(),
             });
             assert_eq!(sent.get(), 1);
         }
@@ -1724,11 +1787,72 @@ mod enabled {
                 now: &|| 1_000,
                 paused: &|_| paused.get().is_some(),
                 pause: &|_, wait| paused.set(Some(wait)),
+                unsettled: &std::sync::Mutex::default(),
             });
             assert_eq!(sent.get(), 1);
             assert_eq!(paused.get(), Some(REFUSED_WAIT));
             // A request refused is not the session refused.
             assert!(refused.borrow().is_empty());
+        }
+
+        #[test]
+        fn what_could_not_be_recorded_is_recorded_before_anything_more_is_sent() {
+            let (sent, taken) = (Cell::new(0), Cell::new(0_i64));
+            let (recorded, failing) = (RefCell::new(Vec::new()), Cell::new(true));
+            let unsettled = std::sync::Mutex::default();
+            let turn = super::Turn::default();
+            let sending = Sending {
+                turn: &turn,
+                session: &|| Some(session("KEY_A", true)),
+                stopping: &|| false,
+                held: &|_| false,
+                take: &|_, _| {
+                    taken.set(taken.get() + 1);
+                    (taken.get() <= 2).then(|| batch(taken.get() * 100))
+                },
+                send: &|_: &SessionKey, plays: &[ToScrobble]| -> Result<Sent, Unsent> {
+                    sent.set(sent.get() + 1);
+                    Ok(plays
+                        .iter()
+                        .map(|play| Outcome::Accepted {
+                            artist: play.artist.clone(),
+                            title: play.title.clone(),
+                        })
+                        .collect())
+                },
+                settle: &|batch| {
+                    if failing.get() {
+                        return false;
+                    }
+                    recorded
+                        .borrow_mut()
+                        .push(batch.iter().map(|(row, _)| *row).collect::<Vec<_>>());
+                    true
+                },
+                refuse: &|_| {},
+                now: &|| 1_000,
+                paused: &|_| false,
+                pause: &|_, _| {},
+                unsettled: &unsettled,
+            };
+            // The first batch's answers cannot be recorded: nothing more
+            // goes, and they are kept.
+            send_due(&sending);
+            assert_eq!((sent.get(), taken.get()), (1, 1));
+            assert_eq!(unsettled.lock().unwrap().len(), 50);
+            // Still failing, nothing is sent, nor taken.
+            send_due(&sending);
+            assert_eq!((sent.get(), taken.get()), (1, 1));
+            // Once they can be, they are recorded first, and only then is
+            // the next batch sent: no play is sent twice.
+            failing.set(false);
+            send_due(&sending);
+            assert_eq!(sent.get(), 2);
+            let recorded = recorded.into_inner();
+            assert_eq!(recorded.len(), 2);
+            assert_eq!(recorded[0], (100..150).collect::<Vec<_>>());
+            assert_eq!(recorded[1], (200..250).collect::<Vec<_>>());
+            assert!(unsettled.lock().unwrap().is_empty());
         }
 
         #[test]
@@ -1758,6 +1882,7 @@ mod enabled {
                 now: &|| 1_000,
                 paused: &|_| paused.get().is_some(),
                 pause: &|_, wait| paused.set(Some(wait)),
+                unsettled: &std::sync::Mutex::default(),
             });
             // One batch may have arrived and is never sent again; the
             // others were not taken, and wait.
@@ -1801,6 +1926,7 @@ mod enabled {
                 now: &|| 1_000,
                 paused: &|_| false,
                 pause: &|_, _| {},
+                unsettled: &std::sync::Mutex::default(),
             };
             // Nothing is even taken, so nothing waiting is withdrawn or
             // marked as sending.
@@ -1837,6 +1963,7 @@ mod enabled {
                 now: &|| 1_000,
                 paused: &|_| false,
                 pause: &|_, _| {},
+                unsettled: &std::sync::Mutex::default(),
             });
             assert_eq!(sent.get(), 1);
         }
@@ -1893,6 +2020,7 @@ mod enabled {
                         now: &|| 0,
                         paused: &|_| false,
                         pause: &|_, _| {},
+                        unsettled: &std::sync::Mutex::default(),
                     });
                 })
             };
