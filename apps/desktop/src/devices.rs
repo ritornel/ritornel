@@ -20,7 +20,7 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
@@ -45,9 +45,11 @@ use ritornel_contract::{
 };
 
 use crate::button::{Role, button};
+use crate::frost;
 use crate::input::{Field, FieldEvent};
 use crate::link::{Link, LinkEvent};
 use crate::marks::Mark;
+use crate::moves;
 use crate::net::{Net, no_library};
 use crate::theme::{self, Status};
 use crate::wall::viewport_of;
@@ -63,6 +65,15 @@ const GUTTER: f32 = 40.;
 const MEASURE: f32 = 1320.;
 /// How many rows of a plan or a run are read at once.
 const ROWS: u32 = 500;
+/// Switching between device tabs in the column: a quick sequential dissolve
+/// out and gentle rise in using `moves.rs`'s curves, with no overlap so shared
+/// headings and controls never ghost over one another.
+const DEVICE_LEAVE_MS: f32 = 75.;
+const DEVICE_ARRIVE_MS: f32 = 200.;
+const DEVICE_HOP: f32 = 5.;
+/// Switching Sync, Music or Plays on the same device: a short fade and settle.
+const VIEW_FADE_MS: f32 = 160.;
+const VIEW_HOP: f32 = 4.;
 
 /// A view of a device's page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +102,7 @@ impl Adding {
 }
 
 /// The rows shown, and what they were read for.
+#[derive(Clone)]
 struct Rows {
     key: RowsKey,
     read: SyncActions,
@@ -104,6 +116,119 @@ struct RowsKey {
     run: bool,
     kind: Option<SyncActionKind>,
     failed: bool,
+}
+
+impl RowsKey {
+    /// Same device, mode and filter, even while a refreshed plan's rows are
+    /// still in flight.
+    fn same_scope(&self, other: &Self) -> bool {
+        self.device == other.device
+            && self.run == other.run
+            && self.kind == other.kind
+            && self.failed == other.failed
+    }
+}
+
+/// A device-tab transition: the outgoing device dissolves cleanly to zero
+/// before the incoming device rises into place, waiting unseen until the new
+/// device's data is ready (up to `moves::READY_WITHIN`).
+#[derive(Debug, Clone, Copy)]
+struct DeviceSwitch {
+    started: Instant,
+    ready: Option<Instant>,
+    still: bool,
+}
+
+impl DeviceSwitch {
+    fn settled(now: Instant) -> Self {
+        Self {
+            started: now,
+            ready: Some(now),
+            still: true,
+        }
+    }
+
+    fn begin(now: Instant, still: bool) -> Self {
+        Self {
+            started: now,
+            ready: None,
+            still,
+        }
+    }
+
+    fn mark_ready(&mut self, ready: bool, now: Instant) {
+        if self.ready.is_some() {
+            return;
+        }
+        let waited = now.saturating_duration_since(self.started);
+        if !ready && waited < moves::READY_WITHIN {
+            return;
+        }
+        if self.still {
+            self.ready = Some(now);
+            return;
+        }
+        // Start arriving the moment the outgoing dissolve finishes, or right
+        // away if data arrived after it already finished.
+        let leave = Duration::from_millis(DEVICE_LEAVE_MS as u64);
+        self.ready = Some(if waited <= leave {
+            self.started + leave
+        } else {
+            now
+        });
+    }
+
+    /// Outgoing page opacity (`None` once gone). Under Reduce Motion the old
+    /// page holds steady while the new one loads so nothing flashes blank.
+    fn leaving_at(&self, now: Instant) -> Option<f32> {
+        if self.still {
+            return self.ready.is_none().then_some(1.);
+        }
+        let ms = moves::since(self.started, now);
+        (ms < DEVICE_LEAVE_MS).then(|| 1. - moves::ease_in(moves::progress(ms, DEVICE_LEAVE_MS)))
+    }
+
+    /// Incoming page opacity and vertical settle offset.
+    fn arriving_at(&self, now: Instant) -> (f32, f32) {
+        let Some(ready) = self.ready else {
+            return (0., 0.);
+        };
+        if self.still {
+            return (1., 0.);
+        }
+        if now < ready {
+            return (0., DEVICE_HOP);
+        }
+        let eased =
+            moves::arrive_curve(moves::progress(moves::since(ready, now), DEVICE_ARRIVE_MS));
+        (eased, DEVICE_HOP * (1. - eased))
+    }
+
+    fn moving(&self, now: Instant) -> bool {
+        match self.ready {
+            None => true,
+            Some(_) if self.still => false,
+            Some(ready) => now < ready || moves::since(ready, now) < DEVICE_ARRIVE_MS,
+        }
+    }
+}
+
+/// One device's page as last drawn: kept warm so returning to a device draws
+/// at once, and held briefly to dissolve out when leaving it.
+#[derive(Clone)]
+struct DeviceSnapshot {
+    detail: SyncDeviceDetail,
+    rows: Option<Rows>,
+    formats: Option<SyncFormats>,
+    unmanaged: Option<SyncUnmanaged>,
+    view: View,
+    view_chosen: bool,
+    filter: Option<SyncActionKind>,
+    only_failed: bool,
+    opened: HashMap<String, Vec<SyncActionRow>>,
+    reviewing: bool,
+    top: f32,
+    height: f32,
 }
 
 pub(crate) struct DevicesPage {
@@ -148,6 +273,15 @@ pub(crate) struct DevicesPage {
     wanted: HashSet<Id>,
     reading: Option<Task<()>>,
     reading_rows: Option<Task<()>>,
+    /// The last drawn state of each device visited, kept warm so switching
+    /// tabs never flashes blank while the server refreshes it.
+    cache: HashMap<Id, DeviceSnapshot>,
+    /// The device page just left, dissolving out before the next rises in.
+    leaving: Option<DeviceSnapshot>,
+    /// The timing of the device-tab switch under way.
+    switch: DeviceSwitch,
+    /// When the sub-view (Sync / Music / Plays) last changed on this device.
+    view_since: Option<Instant>,
     pub top: f32,
     elastic: crate::elastic::Elastic,
     height: Rc<Cell<f32>>,
@@ -417,6 +551,10 @@ impl DevicesPage {
             wanted: HashSet::new(),
             reading: None,
             reading_rows: None,
+            cache: HashMap::new(),
+            leaving: None,
+            switch: DeviceSwitch::settled(Instant::now()),
+            view_since: None,
             top: 0.,
             elastic: crate::elastic::Elastic::default(),
             height: Rc::new(Cell::new(0.)),
@@ -437,7 +575,14 @@ impl DevicesPage {
     }
 
     pub(crate) fn ready(&self) -> bool {
-        self.list.is_some() || self.failed || self.unheld || self.net.is_none()
+        self.failed
+            || self.unheld
+            || self.net.is_none()
+            || match &self.list {
+                Some(devices) if devices.is_empty() => true,
+                Some(_) => self.device_ready(),
+                None => false,
+            }
     }
 
     /// Scrolls the page by `dy` at once, as a script's jump does.
@@ -473,6 +618,10 @@ impl DevicesPage {
     /// A `devices` event: the device shown takes its run from it at once
     /// and is read again; any other changes the column.
     fn heard(&mut self, event: &ritornel_contract::SyncDevicesEvent, cx: &mut Context<Self>) {
+        if Some(event.device_id) != self.chosen {
+            // Drop any stale cached snapshot for an off-screen device that changed.
+            self.cache.remove(&event.device_id);
+        }
         if self.freshness.heard(false).is_none() {
             return;
         }
@@ -508,9 +657,10 @@ impl DevicesPage {
                     Ok(Ok(list)) => {
                         page.failed = false;
                         page.unheld = false;
-                        let still = page
-                            .chosen
-                            .filter(|id| list.devices.iter().any(|device| device.device_id == *id));
+                        let live: HashSet<Id> =
+                            list.devices.iter().map(|device| device.device_id).collect();
+                        page.cache.retain(|id, _| live.contains(id));
+                        let still = page.chosen.filter(|id| live.contains(id));
                         let chosen = still.or_else(|| list.devices.first().map(|d| d.device_id));
                         if chosen != page.chosen {
                             page.choose(chosen, cx);
@@ -521,6 +671,7 @@ impl DevicesPage {
                     Ok(Err(error)) if no_library(&error) => {
                         page.unheld = true;
                         page.list = None;
+                        page.cache.clear();
                     }
                     _ => page.failed = page.list.is_none(),
                 }
@@ -529,22 +680,107 @@ impl DevicesPage {
         }));
     }
 
+    /// Captures the currently shown device's page state, when loaded.
+    fn snapshot(&self) -> Option<DeviceSnapshot> {
+        let detail = self.detail.clone()?;
+        Some(DeviceSnapshot {
+            detail,
+            rows: self.rows.clone(),
+            formats: self.formats.clone(),
+            unmanaged: self.unmanaged.clone(),
+            view: self.view,
+            view_chosen: self.view_of == self.chosen,
+            filter: self.filter,
+            only_failed: self.only_failed,
+            opened: self.opened.clone(),
+            reviewing: self.reviewing,
+            top: self.top,
+            height: self.height.get(),
+        })
+    }
+
+    /// Whether the chosen device has enough data to appear without popping in.
+    fn device_ready(&self) -> bool {
+        let Some(detail) = self.detail.as_ref() else {
+            return false;
+        };
+        match self.view {
+            View::Sync => {
+                Self::rows_key_for(detail, self.filter, self.only_failed).is_none_or(|key| {
+                    self.rows
+                        .as_ref()
+                        .is_some_and(|rows| rows.key.same_scope(&key))
+                })
+            }
+            View::Music => self.formats.is_some(),
+            View::Plays => true,
+        }
+    }
+
+    fn mark_ready(&mut self, now: Instant) {
+        let ready = self.device_ready();
+        self.switch.mark_ready(ready, now);
+    }
+
     fn choose(&mut self, device: Option<Id>, cx: &mut Context<Self>) {
+        let previous = self.chosen;
+        let switching = previous.is_some() && previous != device;
+        let still = crate::platform::reduce_motion();
+        let now = Instant::now();
+
+        if let Some(snap) = self.snapshot() {
+            self.cache
+                .insert(snap.detail.device.device_id, snap.clone());
+            if switching && self.switch.arriving_at(now).0 > 0.05 {
+                self.leaving = Some(snap);
+            }
+        }
+
         self.chosen = device;
-        self.detail = None;
-        self.rows = None;
-        self.opened.clear();
-        self.formats = None;
-        self.unmanaged = None;
         self.problem = None;
         self.forgetting = false;
-        self.reviewing = false;
         self.renaming = false;
         self.adding = None;
         self.found = None;
-        self.filter = None;
-        self.only_failed = false;
-        self.top = 0.;
+        self.view_since = None;
+        self.elastic = crate::elastic::Elastic::default();
+
+        if let Some(cached) = device.and_then(|id| self.cache.get(&id).cloned()) {
+            self.detail = Some(cached.detail);
+            self.rows = cached.rows;
+            self.formats = cached.formats;
+            self.unmanaged = cached.unmanaged;
+            self.view = cached.view;
+            self.view_of = cached.view_chosen.then_some(device).flatten();
+            self.filter = cached.filter;
+            self.only_failed = cached.only_failed;
+            self.opened = cached.opened;
+            self.reviewing = cached.reviewing;
+            self.top = cached.top;
+            self.height.set(cached.height);
+        } else {
+            self.detail = None;
+            self.rows = None;
+            self.opened.clear();
+            self.formats = None;
+            self.unmanaged = None;
+            self.reviewing = false;
+            self.filter = None;
+            self.only_failed = false;
+            self.top = 0.;
+            self.height.set(0.);
+        }
+
+        if switching {
+            self.switch = DeviceSwitch::begin(now, still);
+            self.mark_ready(now);
+            if self.switch.leaving_at(now).is_none() {
+                self.leaving = None;
+            }
+        } else {
+            self.leaving = None;
+            self.switch = DeviceSwitch::settled(now);
+        }
         cx.notify();
     }
 
@@ -580,6 +816,7 @@ impl DevicesPage {
                     }
                     page.detail = Some(detail);
                     page.read_rows(cx);
+                    page.mark_ready(Instant::now());
                     cx.notify();
                 }
             });
@@ -590,6 +827,7 @@ impl DevicesPage {
                         && let Ok(Ok(formats)) = formats
                     {
                         page.formats = Some(formats);
+                        page.mark_ready(Instant::now());
                         cx.notify();
                     }
                 });
@@ -598,10 +836,11 @@ impl DevicesPage {
         .detach();
     }
 
-    /// What the rows shown are of: the run under way or just ended, or the
-    /// plan.
-    fn rows_key(&self) -> Option<RowsKey> {
-        let detail = self.detail.as_ref()?;
+    fn rows_key_for(
+        detail: &SyncDeviceDetail,
+        filter: Option<SyncActionKind>,
+        only_failed: bool,
+    ) -> Option<RowsKey> {
         let device = detail.device.device_id;
         let (of, run) = match (&detail.plan, &detail.run) {
             (_, Some(run)) if run.running => (run.run_id.to_string(), true),
@@ -613,9 +852,16 @@ impl DevicesPage {
             device,
             of,
             run,
-            kind: self.filter,
-            failed: self.only_failed,
+            kind: filter,
+            failed: only_failed,
         })
+    }
+
+    /// What the rows shown are of: the run under way or just ended, or the
+    /// plan.
+    fn rows_key(&self) -> Option<RowsKey> {
+        let detail = self.detail.as_ref()?;
+        Self::rows_key_for(detail, self.filter, self.only_failed)
     }
 
     fn read_rows(&mut self, cx: &mut Context<Self>) {
@@ -666,6 +912,7 @@ impl DevicesPage {
                         page.opened.insert(group, rows);
                     }
                     page.want_pictures(cx);
+                    page.mark_ready(Instant::now());
                     cx.notify();
                 }
             });
@@ -974,10 +1221,15 @@ impl DevicesPage {
 
     /// Chooses a view by hand, as a click on the control does.
     pub(crate) fn show(&mut self, view: View, cx: &mut Context<Self>) {
-        self.view = view;
+        if self.view != view {
+            self.view = view;
+            self.view_since = (!crate::platform::reduce_motion()).then(Instant::now);
+        }
         self.view_of = self.chosen;
         if view == View::Music && self.unmanaged.is_none() {
             self.read_unmanaged(cx);
+        } else if view == View::Sync && self.rows.is_none() {
+            self.read_rows(cx);
         }
         cx.notify();
     }
@@ -1212,7 +1464,13 @@ impl DevicesPage {
 
     /// The top of a device's page: its drawing, name, state and facts, the
     /// three figures of its next sync, and what can be done.
-    fn top(&self, detail: &SyncDeviceDetail, solo: bool, cx: &mut Context<Self>) -> Div {
+    fn top(
+        &self,
+        detail: &SyncDeviceDetail,
+        active: bool,
+        solo: bool,
+        cx: &mut Context<Self>,
+    ) -> Div {
         let device = &detail.device;
         let (state, mark) = state_of(device);
         let key = device
@@ -1418,7 +1676,7 @@ impl DevicesPage {
                 .child(crate::icons::icon("dots", 15., theme::ink())),
         );
 
-        let name: AnyElement = if self.renaming {
+        let name: AnyElement = if active && self.renaming {
             div()
                 .h(px(42.))
                 .flex()
@@ -1498,7 +1756,7 @@ impl DevicesPage {
     }
 
     /// The views of the page, in the app's segmented control.
-    fn views(&self, detail: &SyncDeviceDetail, cx: &mut Context<Self>) -> Div {
+    fn views(&self, detail: &SyncDeviceDetail, current: View, cx: &mut Context<Self>) -> Div {
         let mut views = vec![(View::Sync, "Sync"), (View::Music, "Music")];
         // A folder records no plays, so it has no Plays.
         if detail.capabilities.plays != SyncPlaysKind::None {
@@ -1522,7 +1780,7 @@ impl DevicesPage {
                 .rounded(px(8.))
                 .whitespace_nowrap()
                 .on_click(cx.listener(move |page, _, _, cx| page.show(view, cx)));
-            control = control.child(if self.view == view {
+            control = control.child(if current == view {
                 base.bg(theme::raised())
                     .text_color(theme::ink())
                     .font_weight(FontWeight(600.))
@@ -1920,7 +2178,8 @@ impl DevicesPage {
     }
 
     /// Sync: what happens next, or what is happening.
-    fn sync_view(&self, detail: &SyncDeviceDetail, window: &Window, cx: &mut Context<Self>) -> Div {
+    fn sync_view(&self, snap: &DeviceSnapshot, window: &Window, cx: &mut Context<Self>) -> Div {
+        let detail = &snap.detail;
         let mut view = div().flex().flex_col();
         let running = detail.run.as_ref().filter(|run| run.running);
         if let Some(run) = running {
@@ -1997,7 +2256,7 @@ impl DevicesPage {
                 + counts.blocked.tracks;
             if all > 0 {
                 let mut filters = div().flex().items_center().gap(px(4.)).mb(px(8.));
-                filters = filters.child(chip("All", all, None, self.filter.is_none()));
+                filters = filters.child(chip("All", all, None, snap.filter.is_none()));
                 for (label, count, kind) in [
                     ("Add", counts.add.tracks, SyncActionKind::Add),
                     ("Replace", counts.replace.tracks, SyncActionKind::Replace),
@@ -2014,22 +2273,24 @@ impl DevicesPage {
                             label,
                             count,
                             Some(kind),
-                            self.filter == Some(kind),
+                            snap.filter == Some(kind),
                         ));
                     }
                 }
                 view = view.child(filters);
             }
         }
-        let shown = self
-            .rows
-            .as_ref()
-            .filter(|rows| Some(&rows.key) == self.rows_key().as_ref());
+        let expected = Self::rows_key_for(detail, snap.filter, snap.only_failed);
+        let shown = snap.rows.as_ref().filter(|rows| {
+            expected
+                .as_ref()
+                .is_some_and(|key| rows.key.same_scope(key))
+        });
         match shown {
             Some(rows) if !rows.read.rows.is_empty() => {
                 for row in &rows.read.rows {
                     view = view.child(self.row(row, false, window, cx));
-                    if let Some(tracks) = row.group_id.as_ref().and_then(|g| self.opened.get(g)) {
+                    if let Some(tracks) = row.group_id.as_ref().and_then(|g| snap.opened.get(g)) {
                         for track in tracks {
                             view = view.child(self.row(track, true, window, cx));
                         }
@@ -2125,10 +2386,12 @@ impl DevicesPage {
     /// Music: what goes on, and in what form.
     fn music_view(
         &self,
-        detail: &SyncDeviceDetail,
+        snap: &DeviceSnapshot,
+        active: bool,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> Div {
+        let detail = &snap.detail;
         let mut view = div().flex().flex_col();
 
         // What goes on: the sources, in order.
@@ -2350,13 +2613,13 @@ impl DevicesPage {
                     .child(chips),
             );
         }
-        if let Some(adding) = self.adding {
+        if active && let Some(adding) = self.adding {
             view = view.child(self.finder(adding, window, cx));
         }
 
         // Already on it: what Ritornel did not write, left alone.
         if detail.unmanaged.files > 0 {
-            let open = self.unmanaged.as_ref().filter(|_| self.reviewing);
+            let open = snap.unmanaged.as_ref().filter(|_| snap.reviewing);
             view = view.child(
                 div()
                     .mt(px(16.))
@@ -2435,7 +2698,7 @@ impl DevicesPage {
         }
         let current = detail.settings.format;
         let (name, how) = format_name(current);
-        let takes = self
+        let takes = snap
             .formats
             .as_ref()
             .and_then(|formats| formats.formats.iter().find(|option| option.current))
@@ -2446,7 +2709,7 @@ impl DevicesPage {
             .collect::<Vec<_>>()
             .join(" · ");
         let (label, format) = Self::menu_button("format", "Format", name, Some(aside));
-        let options: Vec<SyncFormatOption> = self
+        let options: Vec<SyncFormatOption> = snap
             .formats
             .as_ref()
             .map(|formats| formats.formats.clone())
@@ -2752,15 +3015,125 @@ impl DevicesPage {
         }
         panel
     }
+
+    /// One device's body: top, notices, views, room bar and the view shown.
+    #[allow(clippy::too_many_arguments)]
+    fn device_body(
+        &self,
+        snap: &DeviceSnapshot,
+        active: bool,
+        solo: bool,
+        content: f32,
+        view_fade: (f32, f32),
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let detail = &snap.detail;
+        let mut body = div()
+            .w(px(content))
+            .flex()
+            .flex_col()
+            .child(self.top(detail, active, solo, cx));
+        if active && let Some(problem) = &self.problem {
+            body = body.child(div().mt(px(14.)).child(Self::notice(
+                Status::Fail,
+                "That didn't work",
+                problem.clone(),
+            )));
+        }
+        if active && self.forgetting {
+            let name = detail.device.name.clone();
+            body = body.child(
+                div().mt(px(14.)).child(
+                    Self::notice(
+                        Status::Need,
+                        format!("Forget {name}?"),
+                        "Its files stay as they are and are no longer Ritornel's. Its past syncs stay in the library's record.",
+                    )
+                    .child(
+                        button("forget-cancel", "Cancel", Role::Secondary).on_click(
+                            cx.listener(|page, _, _, cx| {
+                                page.forgetting = false;
+                                cx.notify();
+                            }),
+                        ),
+                    )
+                    .child(
+                        button("forget-confirm", "Forget", Role::Destructive).on_click(
+                            cx.listener(|page, _, _, cx| {
+                                page.forgetting = false;
+                                if let (Some(device), Ok(key)) =
+                                    (page.chosen, ritornel_client::idempotency_key())
+                                {
+                                    page.command::<DevicesForget>(
+                                        SyncDeviceCommandParams {
+                                            idempotency_key: key,
+                                            device_id: device,
+                                        },
+                                        cx,
+                                    );
+                                }
+                            }),
+                        ),
+                    ),
+                ),
+            );
+        }
+        if let Some(problem) = &detail.device.connection.problem {
+            let (title, text) = match problem.as_str() {
+                "root_unbound" => (
+                    "Its folder isn't known on this computer",
+                    "It was added on another computer, or the library has moved. Add its folder again here to go on syncing it.",
+                ),
+                _ => (
+                    "Its folder isn't there",
+                    "Plug its drive in, or put the folder back, and it carries on from where it was.",
+                ),
+            };
+            body = body.child(
+                div()
+                    .mt(px(14.))
+                    .child(Self::notice(Status::Need, title, text)),
+            );
+        }
+        body = body.child(div().mt(px(22.)).child(self.views(detail, snap.view, cx)));
+        if let Some(room) = self.room(detail).filter(|_| snap.view != View::Plays) {
+            body = body.child(div().mt(px(22.)).child(room));
+        }
+        body = body.child(div().h(px(26.)));
+        let sub = match snap.view {
+            View::Sync => self.sync_view(snap, window, cx),
+            View::Music => self.music_view(snap, active, window, cx),
+            View::Plays => div()
+                .py(px(40.))
+                .flex()
+                .justify_center()
+                .text_size(px(14.))
+                .text_color(theme::dim())
+                .child("No plays have been read from it yet."),
+        };
+        let (view_opacity, view_hop) = view_fade;
+        let sub = if active && (view_opacity < 1. || view_hop > 0.) {
+            div()
+                .relative()
+                .top(px(view_hop))
+                .opacity(view_opacity)
+                .child(sub)
+        } else {
+            sub
+        };
+        body.child(sub)
+    }
 }
 
 impl Render for DevicesPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let now = Instant::now();
         let (window_width, viewport) = viewport_of(window);
         let width = window_width - crate::upnext::rail(cx);
         let max = (self.height.get() - viewport).max(0.);
         self.top = self.top.clamp(0., max);
-        let animating = self.elastic.step(Instant::now());
+        let mut animating = self.elastic.step(now);
         let top = self.top + self.elastic.shown();
 
         let devices = self.list.clone().unwrap_or_default();
@@ -2768,27 +3141,86 @@ impl Render for DevicesPage {
         let left = if solo { GUTTER } else { BESIDE_COLUMN };
         let content = (width - left - GUTTER).min(MEASURE);
 
-        let mut body = div().w(px(content)).flex().flex_col();
-        if self.list.is_none()
+        self.mark_ready(now);
+
+        let mut layers: Vec<AnyElement> = Vec::new();
+        if let Some(gone) = self.leaving.clone() {
+            match self.switch.leaving_at(now) {
+                Some(leave_opacity) => {
+                    animating = true;
+                    let gone_id = gone.detail.device.device_id;
+                    let gone_body =
+                        self.device_body(&gone, false, solo, content, (1., 0.), window, cx);
+                    layers.push(
+                        div()
+                            .id(SharedString::from(format!("device-leaving-{gone_id}")))
+                            .absolute()
+                            .left_0()
+                            .top(px(-gone.top))
+                            .w(px(width))
+                            .opacity(leave_opacity)
+                            .child(frost::faded(
+                                leave_opacity,
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .child(div().h(px(20.)).flex_none())
+                                    .child(div().pl(px(left)).child(gone_body))
+                                    .child(div().h(px(56.)).flex_none()),
+                            ))
+                            .into_any_element(),
+                    );
+                }
+                None => self.leaving = None,
+            }
+        }
+
+        let (view_opacity, view_hop) = match self.view_since {
+            Some(since) => {
+                let t = moves::progress(moves::since(since, now), VIEW_FADE_MS);
+                if t >= 1. {
+                    self.view_since = None;
+                    (1., 0.)
+                } else {
+                    animating = true;
+                    let eased = moves::ease_out(t);
+                    (eased, VIEW_HOP * (1. - eased))
+                }
+            }
+            None => (1., 0.),
+        };
+
+        let mut active_opacity = 1f32;
+        let mut active_hop = 0f32;
+        let mut page_id = SharedString::from("device-page-blank");
+        let body = if self.list.is_none()
             && let Some(step) = self.link.read(cx).preparing
         {
             let (title, text) = crate::link::preparing_words(step);
-            body = body.child(crate::blank::Blank::new(title, text).render(viewport));
+            div()
+                .w(px(content))
+                .flex()
+                .flex_col()
+                .child(crate::blank::Blank::new(title, text).render(viewport))
         } else if self.unheld {
-            body = body.child(
+            div().w(px(content)).flex().flex_col().child(
                 crate::blank::Blank::new(
                     "No library yet.",
                     "Add your music in Settings, and what you sync it to will be here.",
                 )
                 .render(viewport),
-            );
+            )
         } else if self.failed {
             let mut blank = crate::blank::Blank::new(
                 "Your devices could not be read.",
                 "The server didn't answer. It is asked again when it does.",
             );
             blank.failed = true;
-            body = body.child(blank.render(viewport));
+            div()
+                .w(px(content))
+                .flex()
+                .flex_col()
+                .child(blank.render(viewport))
         } else if self.list.is_some() && devices.is_empty() {
             let page = cx.entity().downgrade();
             let mut blank = crate::blank::Blank::new(
@@ -2801,7 +3233,10 @@ impl Render for DevicesPage {
                     let _ = page.update(cx, |page, cx| page.choose_folder(window, cx));
                 }),
             ));
-            body = body
+            let mut empty = div()
+                .w(px(content))
+                .flex()
+                .flex_col()
                 .child(div().h(px(42.)).mb(px(6.)).child(crate::tracked::tracked(
                     "Devices",
                     30.,
@@ -2812,7 +3247,7 @@ impl Render for DevicesPage {
                 )))
                 .child(blank.render(viewport));
             if let Some(problem) = &self.problem {
-                body = body.child(
+                empty = empty.child(
                     div()
                         .mt(px(18.))
                         .flex()
@@ -2822,96 +3257,33 @@ impl Render for DevicesPage {
                         .child(problem.clone()),
                 );
             }
-        } else if let Some(detail) = self.detail.clone() {
-            body = body.child(self.top(&detail, solo, cx));
-            if let Some(problem) = &self.problem {
-                body = body.child(div().mt(px(14.)).child(Self::notice(
-                    Status::Fail,
-                    "That didn't work",
-                    problem.clone(),
-                )));
+            empty
+        } else {
+            let (opacity, hop) = self.switch.arriving_at(now);
+            animating |= self.switch.moving(now);
+            active_opacity = opacity;
+            active_hop = hop;
+            if let Some(snap) = self.snapshot() {
+                page_id =
+                    SharedString::from(format!("device-page-{}", snap.detail.device.device_id));
+                self.device_body(
+                    &snap,
+                    true,
+                    solo,
+                    content,
+                    (view_opacity, view_hop),
+                    window,
+                    cx,
+                )
+            } else {
+                div().w(px(content)).flex().flex_col()
             }
-            if self.forgetting {
-                let name = detail.device.name.clone();
-                body = body.child(
-                    div().mt(px(14.)).child(
-                        Self::notice(
-                            Status::Need,
-                            format!("Forget {name}?"),
-                            "Its files stay as they are and are no longer Ritornel's. Its past syncs stay in the library's record.",
-                        )
-                        .child(
-                            button("forget-cancel", "Cancel", Role::Secondary).on_click(
-                                cx.listener(|page, _, _, cx| {
-                                    page.forgetting = false;
-                                    cx.notify();
-                                }),
-                            ),
-                        )
-                        .child(
-                            button("forget-confirm", "Forget", Role::Destructive).on_click(
-                                cx.listener(|page, _, _, cx| {
-                                    page.forgetting = false;
-                                    if let (Some(device), Ok(key)) =
-                                        (page.chosen, ritornel_client::idempotency_key())
-                                    {
-                                        page.command::<DevicesForget>(
-                                            SyncDeviceCommandParams {
-                                                idempotency_key: key,
-                                                device_id: device,
-                                            },
-                                            cx,
-                                        );
-                                    }
-                                }),
-                            ),
-                        ),
-                    ),
-                );
-            }
-            if let Some(problem) = &detail.device.connection.problem {
-                let (title, text) = match problem.as_str() {
-                    "root_unbound" => (
-                        "Its folder isn't known on this computer",
-                        "It was added on another computer, or the library has moved. Add its folder again here to go on syncing it.",
-                    ),
-                    _ => (
-                        "Its folder isn't there",
-                        "Plug its drive in, or put the folder back, and it carries on from where it was.",
-                    ),
-                };
-                body = body.child(
-                    div()
-                        .mt(px(14.))
-                        .child(Self::notice(Status::Need, title, text)),
-                );
-            }
-            body = body.child(div().mt(px(22.)).child(self.views(&detail, cx)));
-            if let Some(room) = self.room(&detail).filter(|_| self.view != View::Plays) {
-                body = body.child(div().mt(px(22.)).child(room));
-            }
-            body = body.child(div().h(px(26.)));
-            body = body.child(match self.view {
-                View::Sync => self.sync_view(&detail, window, cx),
-                View::Music => self.music_view(&detail, window, cx),
-                View::Plays => div()
-                    .py(px(40.))
-                    .flex()
-                    .justify_center()
-                    .text_size(px(14.))
-                    .text_color(theme::dim())
-                    .child("No plays have been read from it yet."),
-            });
-        }
+        };
 
         let height = Rc::clone(&self.height);
         let head = Rc::new(Cell::new(0f32));
         let start = Rc::clone(&head);
-        let page = div()
-            .absolute()
-            .left_0()
-            .top(px(-top))
-            .w(px(width))
+        let page_inner = div()
             .flex()
             .flex_col()
             .child(
@@ -2933,6 +3305,16 @@ impl Render for DevicesPage {
                 .h(px(0.))
                 .w_full(),
             );
+        let page = div()
+            .id(page_id)
+            .absolute()
+            .left_0()
+            .top(px(-top + active_hop))
+            .w(px(width))
+            .opacity(active_opacity)
+            .child(frost::faded(active_opacity, page_inner));
+        layers.push(page.into_any_element());
+
         if animating {
             window.request_animation_frame();
         }
@@ -2942,7 +3324,7 @@ impl Render for DevicesPage {
             .size_full()
             .overflow_hidden()
             .on_scroll(cx.listener(Self::on_scroll))
-            .child(page)
+            .children(layers)
             .when(!solo, |shown| shown.child(self.column(&devices, cx)))
     }
 }
@@ -2961,5 +3343,82 @@ mod tests {
         assert_eq!(about(20_000), "< 1 min");
         assert_eq!(about(4 * 60_000), "4 min");
         assert_eq!(about(3 * 3_600_000 + 5 * 60_000), "3 h 5 min");
+    }
+
+    #[test]
+    fn device_switch_never_overlaps_leaving_and_arriving_and_respects_reduce_motion() {
+        let start = Instant::now();
+        let mut fast = DeviceSwitch::begin(start, false);
+        fast.mark_ready(false, start + Duration::from_millis(20));
+        assert!(fast.ready.is_none());
+        fast.mark_ready(true, start + Duration::from_millis(25));
+        // Outgoing dissolves cleanly while incoming stays at 0 — zero overlap.
+        let at_40 = start + Duration::from_millis(40);
+        assert!(fast.leaving_at(at_40).is_some_and(|a| a > 0. && a < 1.));
+        assert_eq!(fast.arriving_at(at_40).0, 0.);
+        // After DEVICE_LEAVE_MS outgoing is gone and incoming rises smoothly.
+        let at_120 = start + Duration::from_millis(120);
+        assert!(fast.leaving_at(at_120).is_none());
+        let (opacity, hop) = fast.arriving_at(at_120);
+        assert!(opacity > 0.1 && opacity < 1. && hop > 0. && hop < DEVICE_HOP);
+        // Settled cleanly after DEVICE_LEAVE_MS + DEVICE_ARRIVE_MS.
+        let settled = start + Duration::from_millis(320);
+        assert_eq!(fast.arriving_at(settled), (1., 0.));
+        assert!(!fast.moving(settled));
+
+        // When data arrives after the dissolve already finished, rise begins immediately.
+        let mut slow = DeviceSwitch::begin(start, false);
+        let arrived = start + Duration::from_millis(140);
+        slow.mark_ready(true, arrived);
+        assert!(slow.arriving_at(arrived + Duration::from_millis(40)).0 > 0.1);
+
+        // Past READY_WITHIN, it shows even if data has not yet landed.
+        let mut timed_out = DeviceSwitch::begin(start, false);
+        timed_out.mark_ready(false, start + moves::READY_WITHIN);
+        assert!(timed_out.ready.is_some());
+
+        // Under Reduce Motion, old page holds steady while loading and swaps in one frame.
+        let mut still = DeviceSwitch::begin(start, true);
+        assert_eq!(
+            still.leaving_at(start + Duration::from_millis(20)),
+            Some(1.)
+        );
+        assert_eq!(
+            still.arriving_at(start + Duration::from_millis(20)),
+            (0., 0.)
+        );
+        still.mark_ready(true, start + Duration::from_millis(30));
+        assert_eq!(still.leaving_at(start + Duration::from_millis(30)), None);
+        assert_eq!(
+            still.arriving_at(start + Duration::from_millis(30)),
+            (1., 0.)
+        );
+        assert!(!still.moving(start + Duration::from_millis(30)));
+    }
+
+    #[test]
+    fn rows_key_same_scope_bridges_plan_revisions_without_crossing_filters() {
+        let base = RowsKey {
+            device: Id::from_bytes([1; 16]),
+            of: "rev-1".to_owned(),
+            run: false,
+            kind: None,
+            failed: false,
+        };
+        let refreshed = RowsKey {
+            of: "rev-2".to_owned(),
+            ..base.clone()
+        };
+        let filtered = RowsKey {
+            kind: Some(SyncActionKind::Add),
+            ..base.clone()
+        };
+        let other_device = RowsKey {
+            device: Id::from_bytes([2; 16]),
+            ..base.clone()
+        };
+        assert!(base.same_scope(&refreshed));
+        assert!(!base.same_scope(&filtered));
+        assert!(!base.same_scope(&other_device));
     }
 }
