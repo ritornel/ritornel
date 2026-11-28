@@ -48,6 +48,9 @@ pub use client::Client;
 pub use command::idempotency_key;
 pub use credential::Credential;
 pub use error::{Error, NotRunning};
-pub use http::{Answer, descriptor, download, get, get_media, health, post, ticket};
+pub use http::{
+    Answer, Stream, descriptor, download, download_over, get, get_media, get_media_over, get_over,
+    health, post, post_over, ticket,
+};
 /// The wire types, so that a program needs only this crate to use them.
 pub use ritornel_contract as contract;

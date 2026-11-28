@@ -1003,6 +1003,35 @@ async fn status_of(endpoint: SocketAddr, path: &str, credential: Option<&Credent
 }
 
 #[tokio::test]
+async fn a_job_is_cancelled_only_by_a_session_that_could_start_it() {
+    use ritornel_client::contract::methods::TranscodePrune;
+    use ritornel_client::contract::transcode::TranscodePruneParams;
+    bounded(async {
+        let running = start().await;
+        let (outgoing, incoming) = running.server.connect_in_memory(TokenRole::Owner);
+        let owner = Client::over_memory(outgoing, incoming);
+        owner.hello(&hello()).await.unwrap();
+        owner.create_library(key()).await.unwrap();
+        let job = owner
+            .call::<TranscodePrune>(&TranscodePruneParams {
+                idempotency_key: key(),
+            })
+            .await
+            .unwrap()
+            .job;
+        // A personal session may cancel what it may start, but a prune of
+        // the transcode cache needs server:manage, which it lacks.
+        let (outgoing, incoming) = running.server.connect_in_memory(TokenRole::Personal);
+        let personal = Client::over_memory(outgoing, incoming);
+        personal.hello(&hello()).await.unwrap();
+        let (code, _, _) = refused(personal.cancel_job(key(), job.job_id).await);
+        assert_eq!(code, ErrorCode::Forbidden);
+        owner.cancel_job(key(), job.job_id).await.unwrap();
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn a_limited_session_may_not_ask_for_the_status_or_change_anything() {
     bounded(async {
         let running = start().await;
@@ -1291,6 +1320,100 @@ async fn a_connection_that_sends_no_whole_request_is_closed_when_its_time_is_up(
         ritornel_client::descriptor(running.endpoint())
             .await
             .unwrap();
+    })
+    .await;
+}
+
+/// `GET /v1/descriptor` on `connection`, and whether it was answered.
+async fn descriptor_answered(connection: &mut (impl AsyncReadExt + AsyncWriteExt + Unpin)) -> bool {
+    let asked = connection
+        .write_all(b"GET /v1/descriptor HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
+        .await;
+    let mut answer = Vec::new();
+    // A connection the server cut off may end in a reset.
+    let _ = connection.read_to_end(&mut answer).await;
+    asked.is_ok() && answer.starts_with(b"HTTP/1.1 200 OK")
+}
+
+#[tokio::test]
+async fn a_handshake_and_the_first_request_share_one_deadline() {
+    bounded(async {
+        // Long enough that each case below misses or meets it by seconds,
+        // which a handshake on loopback never takes.
+        let header_wait = Duration::from_secs(8);
+        let running = start_with(Bounds {
+            header_wait,
+            ..Bounds::default()
+        })
+        .await;
+        let endpoint = running.endpoint();
+        let key = hex::decode_array::<32>(&running.server.public_key()).unwrap();
+        // A connection that begins its handshake once `before` has gone
+        // by since it was made, then asks once `after` more has.
+        let late = |before: Duration, after: Duration| async move {
+            let tcp = TcpStream::connect(endpoint).await.unwrap();
+            // sleep: the test spends part of the server's deadline on
+            // purpose, and no event marks the time going by.
+            tokio::time::sleep(before).await;
+            // Within its own time, the handshake always succeeds.
+            let mut tls = ritornel_server::test_support::handshake_with_hub(tcp, key)
+                .await
+                .unwrap();
+            // sleep: as above, after the handshake.
+            tokio::time::sleep(after).await;
+            descriptor_answered(&mut tls).await
+        };
+        let (stalled, in_time, too_late, at_once) = tokio::join!(
+            async {
+                // A handshake begun and never finished is closed, with
+                // nothing said.
+                let mut stalled = TcpStream::connect(endpoint).await.unwrap();
+                stalled.write_all(&[0x16]).await.unwrap();
+                read_until_closed(&mut stalled).await
+            },
+            // Within the deadline, the handshake and the request together:
+            // asked at a half of it.
+            late(header_wait / 4, header_wait / 4),
+            // Each within a deadline of its own, but not both within one:
+            // the handshake at a half of it, the request at a quarter past
+            // it, three quarters before a second deadline would end.
+            late(header_wait / 2, header_wait * 3 / 4),
+            async {
+                let mut tls = ritornel_server::test_support::dial_hub(endpoint, key)
+                    .await
+                    .unwrap();
+                descriptor_answered(&mut tls).await
+            },
+        );
+        assert_eq!(stalled, "");
+        assert!(in_time, "a request within the deadline was not answered");
+        assert!(!too_late, "a request after the deadline was answered");
+        assert!(at_once, "a request over TLS was not answered");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_stop_does_not_wait_on_a_handshake_that_never_ends() {
+    bounded(async {
+        // Long waits, so that only the stop can end the connection.
+        let running = start_with(Bounds {
+            header_wait: Duration::from_secs(60),
+            stop_grace: Duration::from_secs(60),
+            ..Bounds::default()
+        })
+        .await;
+        let mut stalled = TcpStream::connect(running.endpoint()).await.unwrap();
+        stalled.write_all(&[0x16]).await.unwrap();
+        // The handshake has begun when the descriptor is answered after it.
+        ritornel_client::descriptor(running.endpoint())
+            .await
+            .unwrap();
+        let stopping = Instant::now();
+        running.server.stop().await.unwrap();
+        let took = stopping.elapsed();
+        assert!(took < Duration::from_secs(30), "the stop took {took:?}");
+        assert_eq!(read_until_closed(&mut stalled).await, "");
     })
     .await;
 }

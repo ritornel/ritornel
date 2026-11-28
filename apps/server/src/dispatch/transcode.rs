@@ -96,8 +96,9 @@ impl Core {
         &self,
         stores: &Stores,
         p: TranscodeParams,
+        show_paths: bool,
     ) -> Result<JobStarted, RpcError> {
-        self.enqueue_transcode::<TranscodeStart>(stores, &p, p.idempotency_key, || {
+        self.enqueue_transcode::<TranscodeStart>(stores, &p, p.idempotency_key, show_paths, || {
             self.batch_request(&p)
         })
     }
@@ -140,6 +141,7 @@ impl Core {
         stores: &Stores,
         p: &M::Params,
         key: Id,
+        show_paths: bool,
         request: impl FnOnce() -> Result<String, RpcError>,
     ) -> Result<JobStarted, RpcError> {
         let command = Command {
@@ -152,7 +154,7 @@ impl Core {
                 status: ReceiptStatus::Accepted,
                 revision: None,
             },
-            job: super::calls::job(job),
+            job: super::calls::job_for(job, show_paths),
         };
         // A retry can arrive after a startup profile was renamed or removed.
         if let Some(job) = stores

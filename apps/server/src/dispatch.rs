@@ -136,7 +136,7 @@ pub(crate) struct Core {
     /// What a presented credential is checked against.
     local_credential: Verifier,
     /// What the descriptor's proof is signed with.
-    signer: ritornel_engine::Signer,
+    signer: Arc<ritornel_engine::Signer>,
     /// The invites this hub has made and not seen used.
     invites: crate::link::Invites,
     /// The link sessions this hub has issued, checked as the local
@@ -298,7 +298,6 @@ impl Core {
                 identity.name.clone(),
                 runtime.clone(),
                 Arc::clone(&clock),
-                Arc::clone(&entropy),
                 bounds.hub_call_wait,
             ))),
             _ => None,
@@ -317,7 +316,7 @@ impl Core {
             cover_pool: CoverPool::start(COVER_THREADS),
             job_events: Mutex::default(),
             local_credential,
-            signer,
+            signer: Arc::new(signer),
             invites: crate::link::Invites::default(),
             players,
             moves: Default::default(),
@@ -403,6 +402,12 @@ impl Core {
         self.link_sessions
             .peer(token)
             .map(|peer| (peer.grant, Some(peer)))
+    }
+
+    /// What this server signs with: its identity key, for the TLS its
+    /// listener offers satellites.
+    pub(crate) fn signer(&self) -> Arc<ritornel_engine::Signer> {
+        Arc::clone(&self.signer)
     }
 
     /// On a satellite, its link to its hub.
@@ -904,6 +909,15 @@ impl Core {
                 format!("{} requires {}", row.name, missing.join(", ")),
             ));
         }
+        // A satellite's link carries only what a satellite sends, whatever
+        // its permissions. Checked before anything it asks is acted on, or
+        // keeps this hub awake.
+        if session.peer().is_some() && !link::from_a_link(row.name, params.as_ref()) {
+            return Err(RpcError::new(
+                ErrorCode::Forbidden,
+                format!("{} is not a call a satellite's link carries", row.name),
+            ));
+        }
         // What a linked server asks keeps this hub awake for a while.
         if let Some(peer) = session.peer()
             && crate::awake::is_activity(row.name)
@@ -1002,18 +1016,21 @@ impl Core {
                 self.wake_watch();
                 added
             }),
-            methods::TranscodeStart::NAME => {
-                run::<methods::TranscodeStart>(params, |p| self.start_transcode(stores, p))
-            }
+            methods::TranscodeStart::NAME => run::<methods::TranscodeStart>(params, |p| {
+                self.start_transcode(stores, p, show_paths)
+            }),
             methods::TranscodePrune::NAME => run::<methods::TranscodePrune>(params, |p| {
                 self.enqueue_transcode::<methods::TranscodePrune>(
                     stores,
                     &p,
                     p.idempotency_key,
+                    show_paths,
                     || Ok("{}".into()),
                 )
             }),
-            ScanStart::NAME => run::<ScanStart>(params, |params| self.scan_start(stores, &params)),
+            ScanStart::NAME => run::<ScanStart>(params, |params| {
+                self.scan_start(stores, &params, show_paths)
+            }),
             LibrarySetWatching::NAME => run::<LibrarySetWatching>(params, |params| {
                 self.library_set_watching(stores, &params)
             }),
@@ -1033,7 +1050,7 @@ impl Core {
                 run::<JobsGet>(params, |params| self.jobs_get(stores, &params, show_paths))
             }
             JobsCancel::NAME => {
-                run::<JobsCancel>(params, |params| self.jobs_cancel(stores, &params))
+                run::<JobsCancel>(params, |params| self.jobs_cancel(stores, &params, session))
             }
             LibraryStats::NAME => run::<LibraryStats>(params, |_| self.library_stats(stores)),
             IdentityDryRun::NAME => {
@@ -1223,24 +1240,24 @@ impl Core {
             LastfmSignOut::NAME => {
                 run::<LastfmSignOut>(params, |params| self.lastfm_sign_out(stores, &params))
             }
-            LastfmSync::NAME => {
-                run::<LastfmSync>(params, |params| self.lastfm_sync(stores, &params))
-            }
+            LastfmSync::NAME => run::<LastfmSync>(params, |params| {
+                self.lastfm_sync(stores, &params, show_paths)
+            }),
             LastfmSetScrobbling::NAME => run::<LastfmSetScrobbling>(params, |params| {
                 self.lastfm_set_scrobbling(stores, &params)
             }),
             ImportsStage::NAME => {
                 run::<ImportsStage>(params, |params| self.imports_stage(stores, &params))
             }
-            ImportsDryRun::NAME => {
-                run::<ImportsDryRun>(params, |params| self.imports_dry_run(stores, &params))
-            }
-            ImportsApply::NAME => {
-                run::<ImportsApply>(params, |params| self.imports_apply(stores, &params))
-            }
-            ImportsUndo::NAME => {
-                run::<ImportsUndo>(params, |params| self.imports_undo(stores, &params))
-            }
+            ImportsDryRun::NAME => run::<ImportsDryRun>(params, |params| {
+                self.imports_dry_run(stores, &params, show_paths)
+            }),
+            ImportsApply::NAME => run::<ImportsApply>(params, |params| {
+                self.imports_apply(stores, &params, show_paths)
+            }),
+            ImportsUndo::NAME => run::<ImportsUndo>(params, |params| {
+                self.imports_undo(stores, &params, show_paths)
+            }),
             ImportsGet::NAME => {
                 run::<ImportsGet>(params, |params| self.imports_get(stores, &params))
             }

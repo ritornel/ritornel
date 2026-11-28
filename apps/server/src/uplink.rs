@@ -27,10 +27,10 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use ritornel_client::contract::{
     CONTRACT_VERSION, ClientKind, ErrorCode, Event, HelloParams, HubStatus, Id, Permission,
-    PresenceHello, RpcError, Topic,
+    PresenceHello, RpcError, ServerRole, Topic,
 };
 use ritornel_client::{Client, Credential};
-use ritornel_engine::{Clock, Entropy, HubLink};
+use ritornel_engine::{Clock, HubLink};
 use serde_json::Value;
 use tokio::runtime::Handle;
 use tracing::{info, warn};
@@ -90,7 +90,6 @@ pub(crate) struct Uplink {
     name: tokio::sync::watch::Sender<String>,
     runtime: Handle,
     clock: Arc<dyn Clock>,
-    entropy: Arc<dyn Entropy>,
     /// The longest a call waits for the hub's answer:
     /// [`HUB_CALL_WAIT`](crate::bounds::HUB_CALL_WAIT), but for a test.
     call_wait: std::time::Duration,
@@ -123,7 +122,6 @@ impl Uplink {
         name: String,
         runtime: Handle,
         clock: Arc<dyn Clock>,
-        entropy: Arc<dyn Entropy>,
         call_wait: std::time::Duration,
     ) -> Self {
         Self {
@@ -131,7 +129,6 @@ impl Uplink {
             name: tokio::sync::watch::Sender::new(name),
             runtime,
             clock,
-            entropy,
             call_wait,
             reach: Mutex::default(),
             hub_permissions: Mutex::default(),
@@ -233,9 +230,9 @@ impl Uplink {
         Credential::new(self.link.token.expose())
     }
 
-    /// The route the hub last proved it holds its key on, while it
-    /// answers there: where the link session may be sent outside a
-    /// connection, for media. `None` until a connection has been made, and
+    /// The route where the hub last answered a handshake signed with its
+    /// key, while it answers there: where media is fetched outside a
+    /// socket, over a TLS connection of its own. `None` until a connection has been made, and
     /// while the hub does not answer.
     pub(crate) fn route(&self) -> Option<SocketAddr> {
         let reach = lock(&self.reach);
@@ -323,23 +320,29 @@ impl Uplink {
         *lock(&self.hub_permissions) = None;
     }
 
-    /// Opens a connection to the hub at `address`, once it has proved it
-    /// holds the hub's key.
+    /// Opens a connection to the hub at `address`, over TLS pinned to the
+    /// hub's key, so the link session is sent to the hub alone.
     async fn open(&self, address: SocketAddr, presence: bool) -> Result<Client, String> {
-        link::reach(
-            address,
-            self.link.hub,
-            &self.link.hub_public_key,
-            &*self.entropy,
-        )
-        .await?;
+        let stream = self.dial(address).await?;
         let credential = self.credential();
         if presence {
-            Client::connect_peer(address, &credential).await
+            Client::connect_peer_over(stream, address, &credential).await
         } else {
-            Client::connect(address, &credential).await
+            Client::connect_over(stream, address, &credential).await
         }
         .map_err(|error| error.to_string())
+    }
+
+    /// A TLS connection to the hub at `address`, once it has proved it
+    /// holds the hub's key: what anything of the link's is sent over, the
+    /// socket and media alike.
+    pub(crate) async fn dial(
+        &self,
+        address: SocketAddr,
+    ) -> Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>, String> {
+        crate::tls::dial(address, self.link.hub_public_key, link::CONNECT_WAIT)
+            .await
+            .map_err(|error| error.to_string())
     }
 
     /// The permissions this satellite's link session holds at its hub, when known.
@@ -358,7 +361,33 @@ impl Uplink {
                 contract_version: CONTRACT_VERSION,
             })
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| match &error {
+                // The hub says which version it speaks, so the satellite
+                // can say which of the two to update.
+                ritornel_client::Error::Call(refused)
+                    if refused.kind() == ErrorCode::Unsupported =>
+                {
+                    refused
+                        .data
+                        .details
+                        .get("contractVersion")
+                        .and_then(Value::as_u64)
+                        .and_then(|version| u32::try_from(version).ok())
+                        .map_or_else(
+                            || error.to_string(),
+                            |hub| link::versions_differ(hub, CONTRACT_VERSION),
+                        )
+                }
+                _ => error.to_string(),
+            })?;
+        // The handshake proved the key; the hub's own word says it is still
+        // the hub of this link.
+        if descriptor.server.server_id != self.link.hub {
+            return Err("another server answered there, not the hub the link names".to_owned());
+        }
+        if descriptor.server.role != ServerRole::Hub {
+            return Err("that server is no longer a library's hub".to_owned());
+        }
         *lock(&self.hub_permissions) = Some(descriptor.permissions);
         Ok(())
     }

@@ -1,5 +1,5 @@
 # The contract version, and a digest of the wire it was set for. Written by
 # `mise run contract`. scripts/check-contract.py refuses a wire that differs
 # from main's under main's version: raise CONTRACT_VERSION, once, for it.
-version 7
+version 8
 digest 30fb5639cc262b00

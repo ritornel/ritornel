@@ -63,6 +63,7 @@ use serde::Serialize;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::{JoinHandle, JoinSet};
+use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
 
 use crate::dispatch::{Core, MAX_MESSAGE_BYTES};
@@ -152,8 +153,10 @@ impl Listening {
     ) -> Result<Self, Error> {
         let endpoint = listener.local_addr().map_err(Error::Runtime)?;
         let (stopping, stopped) = watch::channel(false);
+        let tls = crate::tls::acceptor(core.signer())
+            .map_err(|error| Error::Runtime(std::io::Error::other(error)))?;
         let router = router(core, Arc::new(tickets));
-        let task = tokio::spawn(accept(listener, listen, router, stopped, bounds));
+        let task = tokio::spawn(accept(listener, listen, router, tls, stopped, bounds));
         Ok(Self {
             endpoint,
             stopping,
@@ -206,6 +209,7 @@ async fn accept(
     listener: TcpListener,
     listen: Listen,
     router: Router,
+    tls: TlsAcceptor,
     mut stopping: watch::Receiver<bool>,
     bounds: Bounds,
 ) {
@@ -232,12 +236,16 @@ async fn accept(
             Ok((_, peer)) if !listen.admits(peer.ip()) => {
                 debug!(%peer, "a connection from outside the private network is closed");
             }
-            Ok((stream, _)) => {
+            Ok((stream, peer)) => {
+                // From now, not from whenever the task first runs.
+                let deadline = tokio::time::Instant::now() + bounds.header_wait;
                 connections.spawn(serve(
                     stream,
+                    peer,
                     router.clone(),
+                    tls.clone(),
                     stopping.clone(),
-                    bounds.header_wait,
+                    (deadline, bounds.header_wait),
                     admitted,
                 ));
             }
@@ -255,15 +263,115 @@ async fn accept(
     }
 }
 
+/// Whether a connection is TLS: what [`require_credential`] asks before
+/// it takes a link session's token or a satellite joining.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Secure(bool);
+
 /// Serves one connection until it ends, holding its place among the
 /// admitted connections until then.
+///
+/// Its first byte says what it is: a TLS handshake, which a satellite
+/// opens with to reach its hub, or plain HTTP, which this machine's
+/// clients and the private network's speak. The connection has until
+/// `deadline`, `header_wait` from being accepted, to send a whole first
+/// request, its handshake included, and Hyper's own `header_wait` for each
+/// request after that.
 async fn serve(
     stream: TcpStream,
+    peer: SocketAddr,
     router: Router,
+    tls: TlsAcceptor,
     mut stopping: watch::Receiver<bool>,
-    header_wait: Duration,
+    (deadline, header_wait): (tokio::time::Instant, Duration),
     _admitted: OwnedSemaphorePermit,
 ) {
+    let opened = async {
+        let mut first = [0; 1];
+        match stream.peek(&mut first).await {
+            // Closed before it said anything.
+            Ok(0) | Err(_) => None,
+            Ok(_) if first[0] == crate::tls::HANDSHAKE => match tls.accept(stream).await {
+                Ok(session) => Some(Opened::Tls(Box::new(session))),
+                Err(failed) => {
+                    debug!(%peer, error = %failed, "a TLS handshake failed");
+                    None
+                }
+            },
+            Ok(_) => Some(Opened::Plain(stream)),
+        }
+    };
+    let opened = tokio::select! {
+        () = stopped(&mut stopping) => return,
+        opened = tokio::time::timeout_at(deadline, opened) => opened,
+    };
+    let Ok(Some(opened)) = opened else { return };
+    match opened {
+        Opened::Tls(session) => {
+            serve_http(
+                *session,
+                Secure(true),
+                router,
+                deadline,
+                stopping,
+                header_wait,
+            )
+            .await;
+        }
+        Opened::Plain(stream) => {
+            serve_http(
+                stream,
+                Secure(false),
+                router,
+                deadline,
+                stopping,
+                header_wait,
+            )
+            .await;
+        }
+    }
+}
+
+/// A connection, once its first byte has said what it is.
+enum Opened {
+    Tls(Box<tokio_rustls::server::TlsStream<TcpStream>>),
+    Plain(TcpStream),
+}
+
+/// Serves HTTP on a connection until it ends. Until its first request
+/// reaches the routes, it is cut off at `deadline`.
+async fn serve_http<S>(
+    stream: S,
+    secure: Secure,
+    router: Router,
+    deadline: tokio::time::Instant,
+    mut stopping: watch::Receiver<bool>,
+    header_wait: Duration,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    // Whether the first request has reached the routes, after which the
+    // deadline no longer applies.
+    let asked = Arc::new(AtomicBool::new(false));
+    let seen = Arc::clone(&asked);
+    let router = router
+        .layer(middleware::from_fn(move |request: Request, next: Next| {
+            let seen = Arc::clone(&seen);
+            async move {
+                if !seen.load(Ordering::Relaxed) {
+                    // Past the deadline it is not served, however the
+                    // timer that ends the connection rounds.
+                    if tokio::time::Instant::now() >= deadline {
+                        return StatusCode::REQUEST_TIMEOUT.into_response();
+                    }
+                    seen.store(true, Ordering::Relaxed);
+                }
+                next.run(request).await
+            }
+        }))
+        .layer(Extension(secure));
     let mut http = http1::Builder::new();
     // The deadline needs the timer: without one it would never fire.
     http.timer(TokioTimer::new())
@@ -273,13 +381,26 @@ async fn serve(
         .serve_connection(TokioIo::new(stream), TowerToHyperService::new(router))
         .with_upgrades();
     tokio::pin!(connection);
+    let mut waiting_for_first = true;
     // A connection that fails has failed for its own client alone, and
     // there is nobody to tell.
-    tokio::select! {
-        _ = connection.as_mut() => {}
-        () = stopped(&mut stopping) => {
-            connection.as_mut().graceful_shutdown();
-            let _ = connection.await;
+    loop {
+        tokio::select! {
+            // The deadline is looked at first, so a first request that is
+            // overdue when this task runs is not served for being ready.
+            biased;
+            () = tokio::time::sleep_until(deadline), if waiting_for_first => {
+                if !asked.load(Ordering::Relaxed) {
+                    return;
+                }
+                waiting_for_first = false;
+            }
+            () = stopped(&mut stopping) => {
+                connection.as_mut().graceful_shutdown();
+                let _ = connection.await;
+                return;
+            }
+            _ = connection.as_mut() => return,
         }
     }
 }
@@ -334,17 +455,33 @@ async fn require_credential(
     mut request: Request,
     next: Next,
 ) -> Response {
-    // The descriptor is public, and a satellite joining presents the
-    // invite's secret in its body, which is checked there.
-    if (request.method() == Method::GET && request.uri().path() == route::DESCRIPTOR)
-        || (request.method() == Method::POST && request.uri().path() == route::LINK)
-    {
+    let secure = request
+        .extensions()
+        .get::<Secure>()
+        .is_some_and(|secure| secure.0);
+    // The descriptor is public.
+    if request.method() == Method::GET && request.uri().path() == route::DESCRIPTOR {
+        return next.run(request).await;
+    }
+    // A satellite joining presents the invite's secret in its body, which
+    // is checked there ([`join`]).
+    if request.method() == Method::POST && request.uri().path() == route::LINK {
         return next.run(request).await;
     }
     // Each check is a comparison in memory. It reads no file and no
     // database, so a request costs an async worker nothing it could wait on.
     let by_header = bearer(request.headers())
         .and_then(|token| core.authenticate(&token))
+        // A link session's token is taken over TLS alone, which is all a
+        // satellite speaks. Over plain HTTP it is refused like any unknown
+        // token, and the satellite that sent it runs an older release.
+        .filter(|(_, peer)| match peer {
+            Some(peer) if !secure => {
+                info!(satellite = %peer.server, "a satellite's link session came without TLS: it runs an older release");
+                false
+            }
+            _ => true,
+        })
         .map(|(grant, peer)| (grant, peer, Presented::Header));
     let admitted = by_header
         .or_else(|| {
@@ -594,7 +731,17 @@ const LINK_BODY_WAIT: Duration = Duration::from_secs(5);
 /// A satellite joining: `POST /v1/link`, with the invite's secret in a
 /// [`LinkRequest`](ritornel_contract::LinkRequest). It is answered with the
 /// link session's token, or refused with why.
-async fn join(State(core): State<Arc<Core>>, request: Request) -> Response {
+///
+/// It is taken over TLS alone. A join over plain HTTP comes from a
+/// satellite of an older release, and its secret has travelled where
+/// anyone between could read it: the invite it names is withdrawn, so that
+/// whoever read the secret cannot join with it, and the satellite is told
+/// to update and join with a new one.
+async fn join(
+    State(core): State<Arc<Core>>,
+    Extension(secure): Extension<Secure>,
+    request: Request,
+) -> Response {
     // A server names no origin, and a page in a browser is not let try.
     if request.headers().contains_key(header::ORIGIN) {
         return (StatusCode::FORBIDDEN, "a page may not link a server\n").into_response();
@@ -613,7 +760,37 @@ async fn join(State(core): State<Arc<Core>>, request: Request) -> Response {
         )
             .into_response();
     };
-    let Ok(asked) = serde_json::from_slice::<ritornel_contract::LinkRequest>(&body) else {
+    if !secure.0 {
+        // Only the secret is looked for, so a body that is otherwise not a
+        // join still has its invite withdrawn.
+        #[derive(serde::Deserialize)]
+        struct Named {
+            secret: String,
+        }
+        let withdrawn = serde_json::from_slice::<Named>(&body)
+            .ok()
+            .and_then(|named| hex::decode(&named.secret))
+            .is_some_and(|secret| core.withdraw_invite(&secret));
+        warn!(
+            withdrawn,
+            "a satellite of an older release sent its join without TLS"
+        );
+        let why = if withdrawn {
+            "this hub takes a join over TLS alone, and runs a newer release than this \
+             server. The invite was sent where others could read it, so it no longer \
+             works: update this server, then join with a new invite from \
+             `ritornelctl link invite` on the hub\n"
+        } else {
+            "this hub takes a join over TLS alone, and runs a newer release than this \
+             server: update this server, then join with a new invite from \
+             `ritornelctl link invite` on the hub\n"
+        };
+        // A conflict, as for another contract version, so a satellite of an
+        // older release shows this rather than calling the invite spent.
+        return (StatusCode::CONFLICT, why).into_response();
+    }
+    let asked = serde_json::from_slice::<ritornel_contract::LinkRequest>(&body);
+    let Ok(asked) = asked else {
         return (StatusCode::BAD_REQUEST, "that is not a request to link\n").into_response();
     };
     // It writes both databases.
@@ -677,18 +854,29 @@ async fn art(
     if let Ok(Ok(bytes)) = tokio::task::spawn_blocking(move || std::fs::read(read)).await {
         return jpeg(bytes);
     }
-    // A satellite has no pictures: it asks its hub, on the route the hub
-    // last proved itself on, and keeps what it is given beside the covers
-    // it would have made.
+    // A satellite has no pictures: it asks its hub, over TLS pinned to the
+    // hub's key on the route where the hub last answered, and keeps what it
+    // is given beside the covers it would have made.
     if let Some(uplink) = core.uplink() {
         let Some(route) = uplink.route() else {
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         };
         let path = format!("{}/{art}/{size}", route::ART);
         let credential = uplink.credential();
-        return match ritornel_client::get_media(route, &path, Some(&credential), MAX_COVER_BYTES)
+        // Over TLS pinned to the hub's key, as everything of the link is.
+        let fetched = match uplink.dial(route).await {
+            Ok(stream) => ritornel_client::get_media_over(
+                stream,
+                route,
+                &path,
+                Some(&credential),
+                MAX_COVER_BYTES,
+            )
             .await
-        {
+            .map_err(|error| error.to_string()),
+            Err(why) => Err(why),
+        };
+        return match fetched {
             Ok(answer) if answer.status == 200 => {
                 let body = answer.body.clone();
                 // Written beside it and moved into place, so a reader never

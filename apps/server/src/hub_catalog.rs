@@ -176,14 +176,22 @@ impl HubCatalog {
         let started = std::time::Instant::now();
         let mut cancel = cancel.clone();
         let pulled = self.uplink.block_on(async {
-            tokio::select! {
-                pulled = ritornel_client::download(
+            // Over TLS pinned to the hub's key, as everything of the link is.
+            let pull = async {
+                let stream = self.uplink.dial(route_to).await?;
+                ritornel_client::download_over(
+                    stream,
                     route_to,
                     &path,
                     &credential,
                     &part,
                     copy.size_bytes,
-                ) => Some(pulled),
+                )
+                .await
+                .map_err(|error| error.to_string())
+            };
+            tokio::select! {
+                pulled = pull => Some(pulled),
                 _ = cancel.wait_for(|cancelled| *cancelled) => None,
             }
         });

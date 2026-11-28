@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
+use crate::Stream;
 use ritornel_contract::methods::{
     EventsSubscribe, EventsUnsubscribe, JobsCancel, JobsGet, JobsList, LibraryCreate, LibraryStats,
     ListClose, ListLocate, ListOpen, ListSectionsCall, ListWindowCall, MediaTokenCall, Method,
@@ -17,7 +18,6 @@ use ritornel_contract::{
     SourcesAddParams, Subscriptions, Topic, TopicsParams, ViewParams,
 };
 use serde_json::Value;
-use tokio::net::TcpStream;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 
@@ -118,10 +118,11 @@ impl Client {
     }
 
     /// As [`connect`](Self::connect), over a connection that is already
-    /// made. Nothing has been sent on it yet, and the credential is the
-    /// first thing that is.
-    pub(crate) async fn upgrade(
-        stream: TcpStream,
+    /// made to `endpoint`, such as a TLS session the caller has checked.
+    /// Nothing has been sent on it yet, and the credential is the first
+    /// thing that is.
+    pub async fn connect_over(
+        stream: impl Stream,
         endpoint: SocketAddr,
         credential: &Credential,
     ) -> Result<Self, Error> {
@@ -147,8 +148,21 @@ impl Client {
         endpoint: SocketAddr,
         credential: &Credential,
     ) -> Result<Self, Error> {
+        Self::connect_peer_over(crate::http::connect(endpoint).await?, endpoint, credential).await
+    }
+
+    /// As [`connect_peer`](Self::connect_peer), over a connection that is
+    /// already made to `endpoint`. Nothing has been sent on it yet.
+    pub async fn connect_peer_over(
+        stream: impl Stream,
+        endpoint: SocketAddr,
+        credential: &Credential,
+    ) -> Result<Self, Error> {
         let (send, receive) = mpsc::channel(16);
-        let mut client = Self::start(Transport::connect(endpoint, credential).await?, Some(send));
+        let mut client = Self::start(
+            Transport::upgrade(stream, endpoint, credential).await?,
+            Some(send),
+        );
         client.requests = Some(receive);
         Ok(client)
     }
