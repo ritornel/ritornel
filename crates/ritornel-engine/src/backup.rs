@@ -357,13 +357,13 @@ pub fn hold_sending(copy: &Path, taken_at_ms: i64) -> Result<bool, Error> {
     Ok(held)
 }
 
-/// Binds every session that scrobbles in `copy`, a backup's copy of
-/// `server.db`, to no data directory: a server started on it, wherever it
-/// is put back, turns scrobbling off until the owner turns it on again, as
-/// the server the backup was taken from may still be sending as the same
-/// session. The `server.db` copied is not changed. The copy is synced
-/// again, as [`copy_database`] leaves it. Returns whether any session was
-/// bound so.
+/// Turns scrobbling off for every session that scrobbles in `copy`, a
+/// backup's copy of `server.db`, and binds it to no data directory: a
+/// server started on it, wherever it is put back and whatever its build,
+/// sends nothing until the owner turns scrobbling on again, as the server
+/// the backup was taken from may still be sending as the same session. The
+/// `server.db` copied is not changed. The copy is synced again, as
+/// [`copy_database`] leaves it. Returns whether any session was marked.
 pub fn unbind_scrobbling(copy: &Path) -> Result<bool, Error> {
     let connection = Location::File(copy.to_owned()).open(OpenFlags::SQLITE_OPEN_READ_WRITE)?;
     let unbound = crate::service_session::unbind_copy(&connection)?;
